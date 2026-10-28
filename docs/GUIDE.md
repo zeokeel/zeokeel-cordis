@@ -3,7 +3,7 @@
 从零开始：安装、写插件、注册服务、处理依赖、管理生命周期、做测试。本文所有示例都对应
 [`examples/`](../examples/) 下的可运行代码，建议边读边跑。
 
-- 版本：v0.4.4（Rust 1.85+，edition 2021）
+- 版本：v0.5.0（Rust 1.85+，edition 2021）
 - 规范：[`spec/CORDIS-CORE.md`](../spec/CORDIS-CORE.md)（英文，编号用例）
 - 设计：[`DESIGN.md`](DESIGN.md)；API 速查：`cargo doc --open`
 
@@ -30,6 +30,7 @@
 17. [错误速查](#17-错误速查)
 18. [FAQ 与常见坑](#18-faq-与常见坑)
 19. [可选 L2 防线（supervision）](#19-可选-l2-防线supervision-feature配额心跳能力自省)
+20. [v0.5.0 扩展点：时钟、生命周期广播、结构化错误](#20-v050-扩展点时钟生命周期广播结构化错误)
 
 ---
 
@@ -41,13 +42,13 @@ cargo add zeokeel-cordis
 
 ```toml
 [dependencies]
-zeokeel-cordis = "0.4.4"
+zeokeel-cordis = "0.5.0"
 serde_json = "1"   # 插件配置用 serde_json::Value
 ```
 
 > crates.io 包名 `zeokeel-cordis` 与库目标名 `zeokeel_cordis` 一致：代码里统一 `use zeokeel_cordis::...`；
 > 需要跟仓库最新代码时可用 git 依赖：
-> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.4.4" }`。
+> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.5.0" }`。
 
 - MSRV：Rust **1.85+**
 - 同步宿主不需要异步运行时；异步宿主可选 tokio，但内核本身不依赖 tokio
@@ -538,6 +539,10 @@ let fibers = root.registry().replace(
 ```
 
 - `restart` / `update` / `dispose` 是**阻塞边界**：在异步宿主里优先用 `*_async` 变体；
+- **`Ok` 不等于 `Active`**：`restart`/`update`（以及 `replace_plugin`/`replace_plugin_async`）
+  返回 `Ok` 只表示操作本身完成；如果之后的 reload/重新激活失败，fiber 会落到 `Failed` 且
+  **结构化错误保留在 `fiber.error_detail()`**（兼容字符串在 `fiber.error()`）。请用
+  `state()`/`error_detail()` 判断结果，而不是只看返回值；
 - 生命周期操作互斥，跨线程并发会得到 `LifecycleBusy`；`Fiber::replace_plugin` 也占用同一把
   生命周期槽（v0.4.2）；
 - `update` 的顺序是：`internal/config` → schema 校验 → `internal/update`，只有 waterfall
@@ -582,6 +587,8 @@ root.dispose_all()?; // 逐个 dispose 所有 fiber + 根 fiber，收集首个�
 let idle: bool = root.registry().is_idle();
 
 // 等整棵树静默（无 Loading/Unloading、无 pending_ops）
+// Registry::when_idle() 返回 crate 根 re-export 的 `IdleWait<'_>`（`zeokeel_cordis::IdleWait`）；
+// `Context::when_idle()` 是它的 async 便捷封装
 root.when_idle().await; // 配合 `block_on` 用于同步代码
 ```
 
@@ -662,6 +669,11 @@ let disposer = ctx.log_exporter(Arc::new(TracingExporter))?;
   `LogExporter` 自定义导出；
 - `LoggerService::set_level` 可在运行时调级；
 - 导出器 panic 会被隔离（记录后继续）。
+- **时间戳可注入（v0.5.0）**：`LogRecord::ts_unix_ms` 默认来自 `SystemClock`。在 root fiber
+  的 context 上 `ctx.set_clock(Arc::new(你的 Clock))` 后，**之后新建的** `ctx.logger()` 门面
+  会用注入时钟（适合确定性测试/回放，只影响新记录）；已获取的 logger facade 仍持有创建时
+  快照的旧 clock——切换 clock 后请重新 `ctx.logger()`。裸 `LoggerService` API 始终使用
+  `SystemClock`。
 
 ---
 
@@ -698,7 +710,7 @@ ctx.on_internal_status(...)?;
 // 查询
 root.registry().size();
 root.registry().fibers();
-root.registry().counter();
+root.registry().fiber_count();
 root.registry().keys();
 for fiber in root.registry().fibers() {
     println!("{} {:?} effects={:?}", fiber.name(), fiber.state(), fiber.get_effects());
@@ -711,6 +723,22 @@ for fiber in root.registry().fibers() {
 
 内部钩子是「中间件式」的 typed 通道（不是字符串事件），适合宿主集成：审计、每插件限流、
 配置来源注入、加载拦截等。
+
+生命周期广播更适合宿主级观测（v0.5.0）：
+
+```rust
+// 每次 fiber 状态迁移触发一次；Disposer 是唯一所有者：drop 即退订
+// （要跨安装它的 fiber 的生命周期继续监听，请保存 Disposer，在需要时显式 dispose）
+let sub = root.on_lifecycle(Arc::new(|event: &LifecycleEvent| {
+    println!("#{} {} {:?} -> {:?}", event.fiber_id, event.name, event.from, event.to);
+}))?;
+// ... 进程退出前 sub.dispose();
+```
+
+> **`InternalBus` 所有权（v0.5.0 明确）**：`Events::internal()`/`InternalBus` 是 advanced
+> surface——注册的回调由**调用者**拥有，**不随 fiber 卸载移除**，需显式 `Disposer`；
+> 常规插件请用 fiber-owned 的 `Context::on_internal_*`。`Context::on_lifecycle` 是建立在
+> `internal/status` raw hook 上的非 fiber 绑定封装。
 
 > **注册窗口（v0.4.3）**：`ctx.plugin*` 的注册→激活窗口计入 in-flight，而
 > `internal/plugin` create hook 正是在该窗口内执行。v0.4.3 起 `when_idle()` **只排除调用
@@ -754,6 +782,7 @@ fn plugin_activation_and_cleanup() {
 | `UnknownService(name)` | `require` 的服务不存在 | 检查 `inject`/提供者 |
 | `InvalidPlugin(msg)` | 插件非法（名称/层级/替换目标） | 见消息 |
 | `PluginFailed(msg)` | 激活失败（`apply` 返回 Err），或 replace/reload 的 panic 被遏制（v0.4.2；msg 含 `reload panicked`） | 看 `fiber.error()` / msg |
+| `Plugin { plugin, kind, message }` | 插件返回的结构化失败（v0.5.0；`kind` 由插件分类，如 `config`/`network`/`auth`）| 用 `CordisError::plugin(..)` 构造；`fiber.error_detail()` 读取原样错误 |
 | `Disposed` | fiber/上下文已销毁 | 不要复用已 dispose 的句柄 |
 | `Validation(err)` | 配置 schema 校验失败 | 修正配置或 schema |
 | `ServiceWriteForbidden(name)` | 试图 `set` 别人提供的服务 | 通过提供者 API 修改 |
@@ -834,16 +863,80 @@ for stalled in root.stalled_fibers(Duration::from_secs(5)) {
 
 要点：
 
+- 本节 API 都只在启用 **`supervision` feature** 时存在（默认构建不可用）：
+  `Fiber::heartbeat()`、`Fiber::last_activity_ms()`、`Fiber::idle_for()`、
+  `Registry::stalled_fibers()`、`FiberQuota`/`IsolationCapabilities`/`StalledFiber`；
 - 配额在**注册时**检查，超限走正常失败/回滚路径，不会留下半注册资源；
 - **配额按活资源计数（v0.4.3）**：effects/listeners/child fibers 释放后立即归还配额槽
   （effects 死条目会被清理；listener 槽在用户 disposer / `once` 自动移除 / fiber 卸载
   任一路径恰好释放一次；child 按 live 弱引用统计）；
-- **`max_effects` 建议 ≥2**：内核自身占用内部 effect（root 的 logger provide effect、
-  每个动态加载子 fiber 的 ownership effect），配额统计的是含内部 ownership effect 的
-  live effects；`max_effects = 1` 会让内核自身无法加载插件；
+- **`max_effects` 只统计用户 effect（v0.5.0，Q11）**：内核内部 effect（root 的 logger
+  provide effect、动态加载子 fiber 的 ownership effect）不占配额，因此 `max_effects(1)`
+  仍可正常加载插件，只限制宿主/插件通过 `ctx.effect*` 注册的 effect；
 - 心跳是**协作式**的：插件不调用 `heartbeat` 也不会被内核打断，只会被 supervisor 观察到；
 - watchdog 只报告「有 in-flight 操作且静默」的 fiber（含根 fiber），不做任何强制动作；
 - 需要"杀进程/杀线程/超时中断"时，用 L3 进程隔离 / L4 WASM，见 `KERNEL-ISOLATION.md`。
+
+## 20. v0.5.0 扩展点：时钟、生命周期广播、结构化错误
+
+### 20.1 可注入时钟（确定性时间）
+
+```rust
+use std::sync::Arc;
+use zeokeel_cordis::{Clock, Context};
+
+struct FakeClock; // 测试里可手动推进
+impl Clock for FakeClock {
+    fn now_unix_ms(&self) -> u64 { 1_700_000_000_000 }
+    fn now_monotonic_ms(&self) -> u64 { 42 }
+}
+
+let root = Context::root();
+// 只能在 root fiber 上的 context 设置；root-derived scope 共享同一树 clock 槽
+root.set_clock(Arc::new(FakeClock))?;
+assert_eq!(root.clock().now_monotonic_ms(), 42);
+```
+
+- 应在 root 创建后、加载任何插件前**一次性**设置，**不要在运行期切换 clock**；
+  单调源必须在树运行期间保持单调（否则 idle 时长会跳变）；
+- 只影响**新**观测（日志时间戳、L2 活动/`idle_for`）；`ctx.logger()` facade 在创建时快照
+  当前 clock，切换后要**重新获取 facade**；裸 `LoggerService` API 始终使用 `SystemClock`；
+- 非 root fiber 上的 context 调用 `set_clock` 会返回 `InvalidPlugin`。
+
+### 20.2 生命周期广播
+
+`Context::on_lifecycle(LifecycleListener)` 为每次 fiber 状态迁移回调一次
+`LifecycleEvent { fiber_id, name, from, to }`；多订阅者独立、listener panic 被遏制。
+**Drop `Disposer` 等同 dispose 退订**（单所有者安全网）；要跨安装 fiber 的生命周期继续
+监听，请保存 `Disposer` 并在需要时显式 dispose。适合宿主 metrics、关闭协调与测试断言；
+如果只需要 raw hook，用 `Context::on_internal_status`。
+
+### 20.3 结构化插件错误
+
+```rust
+use zeokeel_cordis::CordisError;
+
+let error = CordisError::plugin("my-plugin", "network", "upstream timeout");
+// 在 Plugin::apply 中返回该错误；内核原样传播：
+//   CordisError::Plugin { plugin, kind, message }
+```
+
+- 激活、`Fiber::await_settled`、`restart`/`update`、`Registry::replace` 都保留该变体；
+  `Fiber::error_detail()` 返回结构化错误，`Fiber::error()` 返回展示用字符串；
+- `kind` 由插件自定义分类（如 `"config"` / `"network"` / `"auth"`），内核不解释它。
+
+### 20.4 0.5.0 迁移提示
+
+- `Fiber::last_activity()`（`Instant`）→ `Fiber::last_activity_ms()`（毫秒，
+  **`supervision` feature**；默认构建不可用）；要 `Duration` 用 `Fiber::idle_for()`
+  （同 feature）；`Fiber::heartbeat()` 与 `Registry::stalled_fibers()` 同样 gated；
+- 内部类型不再可触达：`FiberRef`/`FiberData`/`PluginKind`/`IdleOrRecoverableWait`/
+  `Registry::counter()` 均为 `pub(crate)`；用 `Fiber`/`Context`/`Registry`/`PluginRuntime`
+  的公开方法；插件匹配请直接对 `Plugin`/`AsyncPlugin` trait 编程；
+- `FiberQuota::max_effects` 只统计用户 effect（Q11），`max_effects(1)` 可正常加载插件；
+- 完整迁移清单见 [CHANGELOG](../CHANGELOG.md) 0.5.0。
+
+---
 
 ## 延伸阅读
 

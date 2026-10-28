@@ -5,7 +5,7 @@
 > 下面 L2–L4 只是写给 embedder 的**建议方案**（在 crate 之外实现），不是本 crate 的
 > 实现范围。内核自身只承诺 §3 所列的 in-process fault containment。
 
-> 适用版本：v0.4.4（v0.2.0 基线 + v0.3.0 加固 + v0.4.2/0.4.3/0.4.4 的遏制与语义修正）。
+> 适用版本：v0.5.0（v0.2.0 基线 + v0.3.0 加固 + v0.4.2–v0.4.4 的遏制与语义修正 + v0.5.0 的 API/时钟扩展）。
 > 本文回答一个问题：**"插件崩溃会不会拖垮内核？"** 答案分两半——**可捕获的 panic
 > 不会；Rust 进程内不可恢复的故障会**。本文给出实测证据、我们据此作出的承诺，以及
 > 要做到"Linux 内核级"所必需的外层隔离方案。
@@ -107,14 +107,23 @@ Cordis 在进程内提供的是 **unwinding panic 的故障遏制（fault contai
 | `dispose_all` 同时有 Err 与 panic | panic 优先：记录 error 后重抛首个 payload（0.4.2） |
 | `Drop` 中的 cleanup panic | 记录/尽力清理；unwind 期间的双 panic 会 abort（见下） |
 
-**不能承诺**（进程内物理上做不到）：
+**设计边界（物理/语言层，进程内不可消除）**：
 
-- `panic=abort` / `-C panic=abort` 构建：任何 panic 直接 abort；`catch_unwind` 失效。
+以下不是待修缺陷，而是 Rust/OS 进程内模型的设计边界；它们的处理方式是宿主侧隔离
+（L3 进程 / L4 WASM），不是内核未完成的工作：
+
+- `panic=abort` / `-C panic=abort` 构建：任何 panic 直接 abort；`catch_unwind` 失效
+  （本仓库用编译期守卫拒绝该构建）。
 - 栈溢出（插件自身递归/深 Drop）、OOM/allocator abort、`process::abort/exit`、SIGSEGV
-  （插件 `unsafe` UB）、双重 panic（Drop 中 panic）。注意：**依赖链卸载本身已不再是栈溢出
-  来源**（v0.4.3 改为两阶段迭代级联，见 §3 承诺与 §5.5）。
+  （插件 `unsafe` UB）、双重 panic（Drop 中 panic）。**依赖链卸载本身已不是栈溢出来源**
+  （v0.4.3 起两阶段迭代级联，见 §3 承诺与 §5.5）。
 - 死循环、死锁、线程/fd/内存无上限泄漏——没有安全的方式在进程内终止 Rust 线程。
 - 插件 `unsafe` 代码的内存破坏：同一地址空间内无法隔离。
+- **取消在飞的 async future 不可恢复**：取消发生在某个 async cleanup 正在执行时，该 future
+  本身无法"续跑"（Rust 没有 cancel-safe await）；内核保证的是未启动 cleanup 恰好执行一次、
+  且不留下永久 `Unloading`（A-9/F1–F5/S7）。
+- **跨线程环形注册等待**：两个线程互相等待对方的注册/激活窗口时无法自动检测环依赖，宿主
+  必须避免同步注册环。
 
 ## 4. 使用契约（embedder 必须遵守）
 
@@ -149,6 +158,18 @@ Cordis 在进程内提供的是 **unwinding panic 的故障遏制（fault contai
     进行中时延迟到下一次根操作。
   - 取消边界：若取消恰好撞上正在执行的 async cleanup，该在飞 future 不可恢复（A-9 既有
     边界），但不会留下永久 `Unloading`；恢复前 `is_idle()` 仍为 `false`（严格）。
+- **时间源在 root 安装（v0.5.0）**：`Context::set_clock` **只能在 root fiber 上的 context
+  设置**（root-derived scope 共享同一树 clock 槽）；应在 root 创建后、加载任何插件前
+  **一次性设置**，不要在运行期切换。`ctx.logger()` facade 在创建时快照当前 clock（切换后
+  重新获取 facade），裸 `LoggerService` API 始终用 `SystemClock`；只影响新观测。单调源在树
+  运行期间不得跳变，否则 `idle_for`/watchdog 的时长会跳变（内核不隐藏这一点）。
+- **生命周期订阅是显式所有权（v0.5.0）**：`Context::on_lifecycle` 的订阅**不是 fiber-owned**，
+  返回的 `Disposer` 是唯一所有者——**drop `Disposer` 等同 dispose 退订**（单所有者安全网）；
+  要跨安装 fiber 的生命周期继续监听，请保存 `Disposer` 并在需要时显式 dispose。listener
+  panic 被遏制并记录，其他订阅者继续运行。
+- **结构化插件错误原样传播（v0.5.0）**：`CordisError::Plugin{plugin,kind,message}` 会穿过
+  激活、`await_settled`、restart/update 与 replace；`Fiber::error_detail()` 保留结构化错误
+  （`Fiber::error()` 仍返回展示字符串）。
 - **注册窗口的其它边界（v0.4.2/0.4.3 不变）**：create hook 内新 fiber 仍是 `Pending` 且没有 fiber 级
   in-flight 操作，因此 `fiber.await_settled()` 会**立即返回 `Ok(())`**；
   `Registry::stalled_fibers()`/`Context::stalled_fibers()` 也**看不到**注册窗口（只检查
@@ -217,7 +238,7 @@ RUSTFLAGS="-C panic=abort" cargo check --lib   # 必须失败
 | 能力 | API | 说明 |
 |---|---|---|
 | 能力自省 | `IsolationCapabilities::detect()` | panic 策略 / 遏制能力 / unsafe / 进程 & WASM（恒 false，属 embedder）|
-| 资源配额 | `FiberQuota` + `Context::set_quota` / `Registry::set_quota` | effects / listeners / child fibers 上限，超限 `QuotaExceeded` 并回滚；**按活资源计数**（v0.4.3，S1）：effects 释放后清死条目、listener 槽在用户 disposer/`once` 自动移除/fiber 卸载任一路径恰好释放一次、child 按 live 弱引用统计。**最小可用值：`max_effects` 建议 ≥2**——内核自身占用内部 effect（root 的 logger provide effect、每个动态加载子 fiber 的 ownership effect），配额统计的正是**含内部 ownership effect 的 live effects**；`max_effects = 1` 会让内核自身无法加载插件 |
+| 资源配额 | `FiberQuota` + `Context::set_quota` / `Registry::set_quota` | effects / listeners / child fibers 上限，超限 `QuotaExceeded` 并回滚；**按活资源计数**（v0.4.3，S1）：effects 释放后清死条目、listener 槽在用户 disposer/`once` 自动移除/fiber 卸载任一路径恰好释放一次、child 按 live 弱引用统计。**Q11（v0.5.0）：`max_effects` 只统计用户 effect**——内核内部 effect（root logger provide、动态子 fiber 的 ownership effect）不占配额，`max_effects(1)` 仍可正常加载插件 |
 | 心跳 | `Fiber::heartbeat()` / `Context::heartbeat()` | 长任务上报活动 |
 | watchdog 观测 | `Registry::stalled_fibers(timeout)` / `Context::stalled_fibers(timeout)` | 返回 `StalledFiber { fiber, idle_for }`，**不强杀**；只看 fiber 级 in-flight，**不覆盖**注册窗口（v0.4.2）|
 | 静默等待 | `Registry::when_idle()` / `Context::when_idle()` | 关闭/健康检查；覆盖注册→激活窗口（FIX-11b），v0.4.3 起**排除调用线程自身的注册**（create hook 内可安全等待，不自锁）；**两侧公共 API 均 recovery-aware，等待期持续重试恢复被取消级联 park 的 `Unloading` 帧**（F1/F5；RAII 闩锁 + ReparkGuard 不丢帧，F4）；同步 `refresh()` 刻意不恢复；`is_idle()` 仍严格；跨线程环形注册依赖仍可能互等 |
@@ -229,7 +250,7 @@ CI 另加 `cargo audit`（RustSec）作业，对依赖做供应链漏洞门禁�
 
 1. ~~启动时断言 `panic=unwind`~~ → **已升级为编译期强制**（v0.3.0+，见 §5.5）；
    ✅ `IsolationCapabilities::detect()` 已提供运行时自省。
-2. ✅ 观测：`when_idle()`、`Fiber::last_activity()`/`idle_for()`、`Fiber::heartbeat()`、
+2. ✅ 观测：`when_idle()`、`Fiber::last_activity_ms()`/`idle_for()`、`Fiber::heartbeat()`、
    `Registry::stalled_fibers(timeout)` 已提供（§5.6）。
 3. 协作取消：`Context::checkpoint() -> Result<(), Cancelled>`、`Fiber::cancel()`、
    `dispose_cancelling(Duration)`。
@@ -251,7 +272,7 @@ CI 另加 `cargo audit`（RustSec）作业，对依赖做供应链漏洞门禁�
 - 内核内遏制测试：`tests/containment.rs`（11 个边界用例）、`tests/hardening.rs`
   （CORE-028…039）、v0.3 新增的退化测试，v0.4.2/v0.4.3 的加固回归套件
   `tests/regression_core.rs` / `tests/regression_semantics.rs` / `tests/l2_defenses.rs`，
-  以及 v0.4.4 的架构护栏 `tests/kernel_boundary.rs`（10 个测试 = 4 个真实断言 + 6 个自测）
+  以及架构护栏 `tests/kernel_boundary.rs`（当前 **11 个测试** = 4 个真实断言 + 7 个自测）
   （部分需要内部状态的用例以 `src/fiber.rs` 内的 unit test 断言，见 CHANGELOG）。
   深依赖链回归：`regression_core::r1_deep_plugin_chain_activates_on_a_2mib_thread`
   （2 MiB 线程上的深层 plugin 链激活 + 迭代卸载；加载深度受 `MAX_PLUGIN_DEPTH = 256` 限制）
@@ -259,8 +280,16 @@ CI 另加 `cargo audit`（RustSec）作业，对依赖做供应链漏洞门禁�
   默认测试线程，验证 dependents-before-provider 的迭代卸载顺序）。显式的「2 MiB 线程 /
   depth 800」对照验证来自轮 4 探针：0.4.3 debug+release 均 PASS，0.4.2 对照 debug 约 480
   层即 abort。
+- 扩展验证（CI 独立作业）：`cross-platform`（windows-latest / macos-latest 跑 default +
+  supervision + kernel boundary）、`msrv-clippy`（Rust 1.85 clippy，允许
+  `mutex_integer`/`needless_lifetimes` 两种版本级 lint 差异）、`coverage`
+  （`cargo llvm-cov --all-features`，fail-under-lines **85.5**，实测基线 86.57%）、
+  `miri`（lib 28/28 UB-clean + `miri_leaks` 1/1 leak-clean）、`deny`
+  （`cargo deny check`）、`actionlint`（pinned image `1.7.12`）、`cargo audit`；
+  发布流水线还执行 `cargo deny`、unfinished-markers 检查与**可复现 SBOM** 双次生成比对，
+  并把 CycloneDX 1.5 SBOM 作为 GitHub Release 资产。
 - 结论复跑：`cargo test`（默认构建）与 `cargo test --features supervision`
-  （启用 L2 API 的全部用例）；两套都应全绿（v0.4.4：415 / 426）。
+  （启用 L2 API 的全部用例）；两套都应全绿（v0.5.0：446 / 461）。
 
 ## 8. 与 Linux 内核类比（为什么这个答案是诚实的）
 

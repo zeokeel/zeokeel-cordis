@@ -1,9 +1,9 @@
 # 内核边界：内核 vs 插件层 vs 宿主
 
-> 适用版本：**v0.4.4**（v0.4.3 为语义基线）。本文是工程约束文档，不是语义规范；
+> 适用版本：**v0.5.0**（v0.4.x 为语义基线）。本文是工程约束文档，不是语义规范；
 > 语义以 [`spec/CORDIS-CORE.md`](../spec/CORDIS-CORE.md) 为准（本文不新增 CORE 用例）。
 >
-> 配套护栏：`tests/kernel_boundary.rs`（v3：**10 个测试**——4 个真实断言 + 6 个防绕过自测）
+> 配套护栏：`tests/kernel_boundary.rs`（v3：**11 个测试**——4 个真实断言 + 7 个防绕过自测）
 > + CI 的 `kernel boundary` 步骤。
 > **任何 PR 都必须通过这两处**，见 §6。
 >
@@ -139,6 +139,9 @@ fiber、effect、events、registry、config schema、exec 桥、logger 设施、
 | 横切拦截/审计/限流/配置来源 | `internal/*` typed hooks | 共 9 个中间件式通道：`internal/plugin`、`internal/status`、`internal/service`、`internal/config`、`internal/update`、`internal/get`、`internal/set`、`internal/listener`、`internal/dispatch`；只能按契约 veto/改写对应对象（事件广播用 `Events`/waterfall） |
 | 策略性包装/改写 | waterfall 中间件 | 同步/异步 waterfall 链；panic fail-closed（CORE-020） |
 | 资源配额/watchdog/能力自省 | L2 `supervision`（默认关闭） | `FiberQuota`、`set_quota`、`heartbeat`、`stalled_fibers`、`IsolationCapabilities`；**策略**由宿主决定（见 KERNEL-ISOLATION §5.6） |
+| 可注入时间源 | `Clock` / `SystemClock` | `Context::clock()` / `Context::set_clock(Arc<dyn Clock>)`：**只能在 root fiber 上的 context 设置**（root-derived scope 共享同一树 clock 槽）；应在 root 创建后、加载插件前一次性设置，**不要在运行期切换**。`ctx.logger()` facade 在创建时快照 clock——切换后需重新获取 facade；裸 `LoggerService` API 始终用 `SystemClock`；只影响新观测 |
+| 生命周期观测/广播 | `Context::on_lifecycle` + `LifecycleEvent`/`LifecycleListener` | 每次 fiber 状态迁移触发一次；多订阅独立、listener panic 遏制。**Drop `Disposer` 等同 dispose 退订**（单所有者安全网）；要跨安装 fiber 的生命周期继续监听，请保存 `Disposer` 并在需要时显式 dispose（宿主 metrics/关闭协调） |
+| 插件错误分类 | `CordisError::Plugin { plugin, kind, message }` / `CordisError::plugin(...)` + `Fiber::error_detail()` | 插件在 `apply`/`apply_async` 返回带 `kind` 的结构化错误；内核在激活/`await_settled`/restart/update/replace 中原样传播 |
 | 日志/指标导出 | `LogExporter` | `ctx.log_exporter(Arc::new(...))`；内核默认不安装 exporter，`TracingExporter` 是通用桥；指标命名属插件/宿主 |
 | 同步 API 用于异步宿主 | `BlockingExecutor` | `set_blocking_executor`；由宿主提供运行时桥，内核不选型、不拥有运行时 |
 | 配置来源（env/文件/远程） | 宿主 + `resolve_config` | 宿主解析后交给 `ctx.plugin(..., config)` / `resolve_config`；内核只做 schema 校验与合并 |
@@ -149,7 +152,7 @@ fiber、effect、events、registry、config schema、exec 桥、logger 设施、
 
 ## 6. 边界护栏（可执行，v3 防绕过）
 
-`tests/kernel_boundary.rs` 共 **10 个测试**：4 个**真实断言**（检查本仓库）+ 6 个**自测**
+`tests/kernel_boundary.rs` 共 **11 个测试**：4 个**真实断言**（检查本仓库）+ 7 个**自测**
 （证明护栏真的能抓绕过）。CI 的 `kernel boundary` 步骤会全部执行。
 
 ### 6.1 真实断言
@@ -161,12 +164,13 @@ fiber、effect、events、registry、config schema、exec 桥、logger 设施、
 | `sources_do_not_contain_business_vocabulary` | 递归扫描 `src/**`：① 代码 + 字符串按**标识符分词**（snake_case 与 CamelCase/PascalCase 拆分后小写）匹配 HARD 列表（payment/invoice/tenant/customer/checkout/warehouse/database/redis/kafka/rabbitmq/http/server/client）——`payment_gateway`、`PaymentService` 都会命中；② **公开文档**（`///`、`//!`、`/**...*/`、`/*!...*/`、`#[doc = "..."]`）单独用 `FORBIDDEN_DOC_WORDS` 扫描（同 HARD 列表但**去掉 http/server/client**——内核文档需要描述 embedder 边界，允许这些词）；③ 文件名 stem 检查；普通注释与尾部 `#[cfg(test)]` 模块在代码词扫描前拆出 |
 | `kernel_keeps_forbid_unsafe_and_a_bounded_public_surface` | 注释剥离后 `src/lib.rs` 中**真实存在** `#![forbid(unsafe_code)]`；公共项计数（**含 `pub use`/`pub mod`**）≤ **420**（`PUBLIC_ITEM_CAP`，tripwire） |
 
-### 6.2 自测（防绕过证明，6 个）
+### 6.2 自测（防绕过证明，7 个）
 
 | 测试 | 覆盖的绕过 |
 | --- | --- |
 | `guard_parses_table_dependencies_and_package_renames` | 表语法 `[target.'cfg(unix)'.dependencies.tokio]`、`package = "tokio"` 重命名都必须被抓到（含 runtime 与 dev 的区分） |
 | `guard_sees_flat_target_sections_and_single_quoted_renames` | `[target.'cfg(unix)'.dependencies]` **平铺 section** 的依赖必须被解析；单引号 `serde_json = { package = 'tokio', ... }` 必须解析为真实包名 `tokio` |
+| `guard_limits_sources_to_one_trailing_test_module` | 每个源文件最多一个 `#[cfg(test)]` 模块且必须位于文件末尾；多个测试模块会被拒绝（否则测试代码被当生产代码扫描，或生产代码藏在测试模块之后） |
 | `guard_expands_grouped_use_and_spaced_paths` | `use std::{fs, net, process::Command};` 展开为 `std::fs`/`std::net`/`std::process::Command`；`use std :: process :: Command;` 归一化后仍命中 |
 | `guard_tokenizes_snake_case_and_camel_case_identifiers` | `payment_gateway`、`PaymentService` 等复合标识符必须拆词命中（纯子串检查会漏） |
 | `guard_collects_doc_comments_and_doc_attributes` | `///`、`//!`、`/** ... */`、`#[doc = "..."]` 的文本都要被收集（公开文档是契约的一部分） |
@@ -205,8 +209,10 @@ fiber、effect、events、registry、config schema、exec 桥、logger 设施、
 ### 6.4 CI 强制
 
 - `.github/workflows/ci.yml` 的 `rust` 作业有专门步骤：
-  `cargo test --locked --test kernel_boundary`（**10 个测试** = 4 个真实断言 + 6 个自测）；
-- `cargo test --locked`（rust 作业与 MSRV 作业）会同样执行该集成测试；
+  `cargo test --locked --test kernel_boundary`（**11 个测试** = 4 个真实断言 + 7 个自测）；
+- `cargo test --locked`（rust 作业、MSRV 作业与 cross-platform 作业）会同样执行该集成测试；
+  独立验证套件 `tests/api_surface.rs`（公共 API 契约）、`tests/property.rs`（确定性随机
+  状态机）、`tests/miri_leaks.rs`（Miri 泄漏场景）也纳入 cargo test / Miri 门禁；
 - **PR 必须通过**：不得 `#[ignore]`、不得删除/弱化断言来"绕过"；修改
   `tests/kernel_boundary.rs`、词表/匹配规则或 `PUBLIC_ITEM_CAP` 需要评审并配
   CHANGELOG 说明。
@@ -235,7 +241,32 @@ fiber、effect、events、registry、config schema、exec 桥、logger 设施、
 
 ---
 
-## 8. 常见误判（FAQ）
+## 8. API 极简性 / 公开 API 策略
+
+公共 API 只收**通用机制**，不收便利封装、业务词汇或内部表示。规则：
+
+1. **公共面即契约**：`pub` 项是 semver 契约；`pub(crate)` 与私有字段不是。v0.5.0 起内部
+   状态类型不再公开——`fiber::FiberRef`、`fiber::FiberData`、`registry::PluginKind`、
+   `registry::IdleOrRecoverableWait` 均为 `pub(crate)`；`Registry::counter()` 同样内部化。
+   需要状态时用 `Fiber` / `Context` / `Registry` / `PluginRuntime` 的公开方法
+   （`Fiber::{state, get_effects, name, id, parent, last_activity_ms, error_detail}`、
+   `Registry::{size, get, keys, fibers, fiber_count}` 等）。
+2. **增长判据**：新增公共 API 必须同时满足：①通用（任何宿主可用）；②不泄漏内部表示；
+   ③有契约测试与 rustdoc（`tests/api_surface.rs` + `cargo doc -D warnings`）；④通过
+   `tests/kernel_boundary.rs` 的公共面上限 `PUBLIC_ITEM_CAP = 420`（tripwire）。PR 必须
+   说明通用性，并在 CHANGELOG 记录。
+3. **破坏性收敛**：`0.y` 线按 SemVer，minor 允许破坏性；但必须同时给出 **migration**
+   清单（CHANGELOG `Changed` + 迁移说明）与文档更新。优先 deprecate 一个版本；0.5.0 直接
+   移除的那批类型在 0.4.x 已声明「`pub(crate)` helpers 与私有字段不属于契约」，属于未承诺
+   公共面的收敛。
+4. **扩展点优先**：能通过 `Plugin`/effect、`internal/*` hooks、`events`/waterfall、
+   L2 supervision、`Clock`、`LifecycleListener`、`LogExporter`、`BlockingExecutor`
+   实现的能力，**不新增内核 API**。
+5. **对照建议（可选）**：涉及公共 API 的 PR 建议对比 `cargo public-api diff`（或
+   `cargo semver-checks`）；CI 以 `kernel_boundary` 的 cap 与 `tests/api_surface.rs`
+   契约用例兜底。
+
+## 9. 常见误判（FAQ）
 
 - **"把 HTTP server 放进内核，宿主更省事"** → 不。HTTP 属插件/宿主；内核只给生命周期、
   依赖注入与事件。宿主 crate 依赖 `axum` + 内核即可。
@@ -256,7 +287,7 @@ fiber、effect、events、registry、config schema、exec 桥、logger 设施、
 
 ---
 
-## 9. 延伸阅读
+## 10. 延伸阅读
 
 - 设计侧边界：[`DESIGN.md`](DESIGN.md) §7「范围边界：内核 vs 宿主」
 - 故障隔离（正交概念）：[`KERNEL-ISOLATION.md`](KERNEL-ISOLATION.md)

@@ -1,7 +1,9 @@
 # 贡献指南
 
-感谢参与 Cordis（Rust 内核）。本项目遵循 **v0.4.x 语义冻结**：不接受新增语义能力，
-只接受 bugfix、安全修复、性能改进（不改变语义）和文档修正。
+感谢参与 Cordis（Rust 内核）。本项目遵循 **SemVer 的 `0.y` 规则**：minor 版本可以包含
+破坏性 API 收敛（必须同步文档、migration 与 CHANGELOG），patch 只做 bugfix/安全/性能与
+文档修正。公共 API 的取舍原则见
+[`docs/KERNEL-BOUNDARY.md`](docs/KERNEL-BOUNDARY.md) §8「API 极简性 / 公开 API 策略」。
 
 参与前请阅读 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) 与 [SECURITY.md](SECURITY.md)；
 安全漏洞**不要**发公开 issue。
@@ -35,6 +37,26 @@ cargo build --release --locked               # panic=unwind + overflow-checks �
 `RUSTFLAGS="-C panic=abort" cargo check --lib --locked` **必须失败**（`src/lib.rs` 的
 `compile_error!` 守卫；CI 会反证）。
 
+CI 的扩展验证（本地可按需复跑）：
+
+```bash
+# 覆盖率门禁：fail-under-lines 86，实测基线 86.57%
+cargo llvm-cov --locked --all-features --fail-under-lines 85.5
+# Miri（nightly；单测允许脚手架泄漏，miri_leaks 场景开启泄漏检查）
+MIRIFLAGS="-Zmiri-disable-isolation -Zmiri-ignore-leaks" cargo +nightly miri test --lib
+MIRIFLAGS="-Zmiri-disable-isolation" cargo +nightly miri test --test miri_leaks
+# 供应链 / workflow / 依赖审计（actionlint 用 pinned docker image）
+cargo deny check
+docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12
+cargo audit
+# MSRV clippy（1.85；允许两种版本级 lint 差异：mutex_integer / needless_lifetimes）
+cargo +1.85.0 clippy --all-targets --locked -- -D warnings \
+  -A clippy::mutex_integer -A clippy::needless_lifetimes
+cargo +1.85.0 clippy --all-targets --locked --features supervision -- -D warnings \
+  -A clippy::mutex_integer -A clippy::needless_lifetimes
+# 跨平台：CI 在 windows-latest / macos-latest 上跑 default + supervision + kernel boundary
+```
+
 CI 同时跑默认与 `supervision` 两种 feature 配置；提交前请至少本地跑一遍这两种配置的
 test + clippy，以及 `fmt`、两种 doc 配置。**MSRV 作业（Rust 1.85.0）只跑 test（两种
 feature 配置）与 `doc --all-features`，不跑 clippy**——lint 集合随 stable 版本漂移，
@@ -57,7 +79,9 @@ CI 与发布命令统一使用 `--locked`，保证相同依赖解析可复现、
 4. 在 [CHANGELOG.md](CHANGELOG.md) 的 `Unreleased` 下记录；
 5. 涉及 panic/隔离行为的，同步 `docs/KERNEL-ISOLATION.md`。
 
-不要引入破坏性变更却不升版本；行为变化 = breaking change。
+不要引入破坏性变更却不升版本；行为变化 = breaking change。破坏性 API 收敛按 SemVer 走
+minor（0.y），并必须同时提供 CHANGELOG 的 **Changed + migration**、文档更新与契约测试
+（`tests/api_surface.rs`）。
 
 ## 提交规范
 
@@ -107,6 +131,21 @@ fiber、effect、events、registry、config schema 机制、exec 桥、logger �
 **任一条不满足** → 业务能力应做成 example、插件或独立 crate，或由宿主实现；不要为了
 "方便"加进内核。
 
+### API 增长与收敛判据
+
+- **公共 API 增长**必须同时满足：①通用（任何宿主可用）；②不泄漏内部表示；③有契约测试
+  与 rustdoc（`tests/api_surface.rs` + `cargo doc -D warnings`）；④通过
+  `tests/kernel_boundary.rs` 的公共面上限（`PUBLIC_ITEM_CAP = 420`）。PR 必须说明通用性，
+  并在 CHANGELOG 记录。
+- **内部类型不是公共契约**：v0.5.0 起 `fiber::FiberRef`、`fiber::FiberData`、
+  `registry::PluginKind`、`registry::IdleOrRecoverableWait`、`Registry::counter()` 均为
+  `pub(crate)`；不要新增可触达的内部状态类型，状态请用 `Fiber`/`Context`/`Registry`/
+  `PluginRuntime` 的公开方法。
+- **破坏性收敛**：优先 deprecation；直接移除必须走 minor 版本，并在 CHANGELOG 中给出
+  **migration 清单**与替代 API；优先通过扩展点（`Plugin`/effect、hooks、events/L2、
+  `Clock`、`LifecycleListener`、`LogExporter`、`BlockingExecutor`）而不是新增内核 API。
+- 涉及公共 API 的 PR 建议用 `cargo public-api diff`/`cargo semver-checks` 做对照（可选）。
+
 ### 运行时依赖与护栏（`tests/kernel_boundary.rs` v3）
 
 - 运行时依赖必须 ⊆ **`serde_json`、`tracing`、`futures-util`**。护栏会解析
@@ -130,8 +169,8 @@ fiber、effect、events、registry、config schema 机制、exec 桥、logger �
   CHANGELOG 说明；
 - `[dev-dependencies]` 与 `examples/` **不检查**（测试专用 / 不进入库产物），但不得把
   dev 依赖变成运行时依赖；
-- CI 的 `kernel boundary` 步骤（`cargo test --locked --test kernel_boundary`，**10 个测试**
-  = 4 个真实断言 + 6 个防绕过自测）以及全量 `cargo test --locked` 都会执行；
+- CI 的 `kernel boundary` 步骤（`cargo test --locked --test kernel_boundary`，**11 个测试**
+  = 4 个真实断言 + 7 个防绕过自测）以及全量 `cargo test --locked` 都会执行；
   **PR 必须通过，不得 `#[ignore]` 或弱化断言来绕过**。
 
 ## Pull Request 清单
@@ -144,12 +183,16 @@ fiber、effect、events、registry、config schema 机制、exec 桥、logger �
 - [ ] 依赖有变更时已提交更新后的 `Cargo.lock`
 - [ ] 语义变更已同步 spec + tests + docs + CHANGELOG
 - [ ] 变更满足内核边界三条判据（见 [`docs/KERNEL-BOUNDARY.md`](docs/KERNEL-BOUNDARY.md) 与上节「内核边界」）
+- [ ] 公共 API 有增长/收敛时：按 §8「API 极简性」说明通用性，更新 CHANGELOG（破坏性项附 migration）并补 `tests/api_surface.rs` 契约用例
 
 ## 发布流程（维护者）
 
 发布是 **tag 驱动**的：把 `vX.Y.Z` tag 推到远端后，`.github/workflows/release.yml`
 自动完成门禁校验与 crates.io 发布；**不要在本地直接 `cargo publish`**。
 
+0. **先 push `main` 并等 CI 全绿**（含 cross-platform / coverage / Miri / cargo-deny /
+   actionlint / MSRV-clippy）：发布 workflow 只重复核心硬门禁，其余平台与工具门禁以
+   `main` 的 CI 结果为准，tag 前不得跳过；
 1. 更新 `Cargo.toml` 的 `version` 与 `CHANGELOG.md`（把 `Unreleased` 移到对应版本段），
    提交为 `chore(release): X.Y.Z`，并确认 `Cargo.lock` 已随提交更新；
 2. 本地跑一遍与发布流水线等价的门禁（全部带 `--locked`，命令见上节「构建与测试」）：
@@ -161,7 +204,8 @@ fiber、effect、events、registry、config schema 机制、exec 桥、logger �
    - 校验发布来源必须是 tag、且 **tag 版本 == `Cargo.toml` version**（不一致直接失败）；
    - 重跑 fmt / clippy（两种 feature 配置）/ test（两种 feature 配置）/ doc（默认与
      `--all-features`）/ examples 构建 / `cargo package` / `cargo publish --dry-run` /
-     `cargo publish`；
+     `cargo publish`；并执行 `cargo deny`、unfinished-markers 检查与**可复现 SBOM** 双次
+     生成比对；
    - 发布成功后把 `target/package/zeokeel-cordis-X.Y.Z.crate` 的 **SHA-256** 上传到该 tag
      对应的 GitHub Release（不存在则创建；此步失败不影响 crates.io 上的发布结果）；
 5. GitHub Release 正文使用 `CHANGELOG.md` 对应版本段；若 Release 由 workflow 自动创建，

@@ -3,8 +3,8 @@
 Companion to `spec/CORDIS-CORE.md`. This file records how the Rust port relates to
 the JavaScript Cordis reference, what the Rust-only extensions add, which failures
 the kernel contains, and what the crate deliberately does not support. It is
-descriptive; the specification stays normative. Baseline: crate version `0.4.4`
-(tag `v0.4.4`).
+descriptive; the specification stays normative. Baseline: crate version `0.5.0`
+(tag `v0.5.0`).
 
 ## 1. Deliberate differences from the TypeScript reference
 
@@ -40,6 +40,12 @@ language-driven and permanent unless the spec says otherwise:
   receives an event only when the dispatching context's isolation map equals its
   own, unless the listener is `global`.
 - **No dynamic plugin loading / stable ABI** (see §5).
+- **Structured plugin errors, lifecycle broadcasts and an injectable clock are
+  Rust-only extension points (v0.5.0).** The TS reference handles failures by
+  throwing (no typed `plugin/kind/message` payload), has no generic lifecycle
+  broadcast, and time is read directly (no `Clock` seam). The Rust kernel keeps
+  those as explicit APIs so hosts can classify failures, observe transitions and
+  make time deterministic — all optional, none required by a plugin.
 
 ## 2. Rust-only extensions
 
@@ -148,8 +154,9 @@ language-driven and permanent unless the spec says otherwise:
   reports `CordisError::Rollback` if that rollback fails.
 - **Quiescence (CORE-049).** `Registry::is_idle` reports whether any lifecycle
   operation is in flight (no `Loading`/`Unloading` fiber, `pending_ops == 0`), and
-  `Registry::when_idle` / `Context::when_idle` resolve once the tree is quiescent.
-  The whole registration→activation window of `ctx.plugin*` (including the
+  `Registry::when_idle()` returns the crate-root `zeokeel_cordis::IdleWait<'_>`
+  future (`Context::when_idle()` is its async convenience wrapper); both resolve
+  once the tree is quiescent. The whole registration→activation window of `ctx.plugin*` (including the
   `internal/plugin` create hook) counts as in-flight. Since **v0.4.3** `when_idle`
   excludes the calling thread's **own** in-flight registrations (R3-A3), so a
   create hook can wait for the rest of the tree without deadlocking; `is_idle`
@@ -273,11 +280,10 @@ existing contracts and make the previously unstated edges below explicit. See
   exactly once by whichever path comes first: user disposer, `once`
   auto-removal, or fiber unload), and child fibers (live weak handles). Released
   slots are reusable immediately; exceeding a limit returns
-  `CordisError::QuotaExceeded` and rolls the activation back. The kernel itself
-  holds internal effects (the root logger provide effect, plus one ownership
-  effect per dynamically loaded child fiber), and the quota counts them:
-  **`max_effects` should be ≥2** — a quota of `1` starves the kernel itself and
-  no plugin can load.
+  `CordisError::QuotaExceeded` and rolls the activation back. Anti-starvation:
+  **since v0.5.0 (Q11) `max_effects` counts user effects only** — internal kernel
+  effects (root logger provide, dynamic child ownership effects) are excluded, so
+  `max_effects(1)` still loads plugins and only limits `ctx.effect*` callers.
 - **Strict injection gate.** `inject` and `ctx.service_available` require the
   provider to be `Active`; `ctx.get`/`get_named`/`get_any` stay non-strict (TS
   property-read semantics). Accessors and `internal/get` virtual services only
@@ -384,6 +390,58 @@ existing contracts and make the previously unstated edges below explicit. See
   `Rollback("… fiber already disposed …")` for a fiber that a concurrent
   `dispose` already removed; the rollback heals and continues.
 
+### 2.4 Added in v0.5.0 (API convergence + extensions)
+
+- **Reverse-dependency index (S1–S4).** Internal only: the kernel keeps a
+  provider → dependent index and reuses it in refresh/unload/cascade paths instead
+  of scanning all fibers. An **explicit** `refresh()`/`refresh_async()` still
+  re-evaluates the whole registry snapshot, including availability-gate flips;
+  internal `refresh_dependents` (after provide/withdraw/replace/update) takes the
+  reverse-index fast path and is semantically equivalent. No public API or
+  semantic change. Measured vs 0.4.x:
+  fanout 5k `create+dispose` −54% / `dispose` −74%, 1500-level deep-chain cascade
+  −97% / `dispose` −90%, fanout 1k `create+dispose` −50% (see CHANGELOG).
+- **Injectable clock.** `Clock` (`now_unix_ms` / `now_monotonic_ms`) with default
+  `SystemClock`; `Context::clock()` reads the tree clock. `Context::set_clock` can
+  only be called from a context whose fiber is the **root fiber** (root-derived
+  scopes share the same tree clock slot); install it once, right after
+  `Context::root` and before loading plugins — **do not swap the clock at
+  runtime**. Only new observations use it. `ctx.logger()` facades snapshot the
+  clock at creation, so a facade obtained before the swap keeps the old clock:
+  re-acquire the facade after changing it. The raw `LoggerService` API always
+  timestamps with `SystemClock`; L2 activity/`idle_for` (**`supervision` feature**
+  only) use the tree clock.
+- **Lifecycle broadcast.** `LifecycleEvent { fiber_id, name, from, to }`,
+  `LifecycleListener`, `Context::on_lifecycle` (thin wrapper over the
+  `internal/status` hook): one event per state transition, multiple subscribers,
+  listener panics contained. The subscription is **not fiber-owned**; the
+  returned `Disposer` is its single owner — **dropping the `Disposer`
+  unsubscribes just like `dispose`** (safety net). To keep observing across the
+  lifetime of the installing fiber, store the `Disposer` and dispose it
+  explicitly when done. Designed for embedder metrics/shutdown coordination.
+- **Structured plugin errors.** `CordisError::Plugin { plugin, kind, message }`
+  (+ `CordisError::plugin(...)`) lets plugins return classified failures
+  (`"config"`/`"network"`/…); propagated unchanged through activation,
+  `Fiber::await_settled`, restart/update and `Registry::replace`.
+  `Fiber::error_detail()` exposes the retained structured error.
+- **Public API convergence (breaking, migration in CHANGELOG).** Internal state
+  types `fiber::FiberRef`, `fiber::FiberData`, `registry::PluginKind`,
+  `registry::IdleOrRecoverableWait` and `Registry::counter()` became `pub(crate)`;
+  `Fiber::last_activity() -> Instant` was replaced by `last_activity_ms() -> u64`
+  (**`supervision` feature** only, like `Fiber::{heartbeat,idle_for}` and
+  `Registry::stalled_fibers`). Use `Fiber`/`Context`/`Registry`/`PluginRuntime`
+  methods and program against the `Plugin`/`AsyncPlugin` traits.
+- **`InternalBus` ownership is explicit.** `Events::internal()`/`InternalBus` is an
+  advanced surface: callbacks are caller-owned and **not** removed when a fiber
+  unloads; use `Context::on_internal_*` for fiber-owned hooks and
+  `Context::on_lifecycle` for a non-fiber-bound status observer.
+- **`Ok` from `restart`/`update`/`replace_plugin` does not mean `Active`.** Those
+  methods contain a post-operation reload/activation failure: the call returns
+  `Ok(())` while the fiber ends `Failed`, with the (optionally structured) error
+  retained in `Fiber::error_detail()` (`Fiber::error()` keeps the display
+  string). Check `Fiber::state()`/`error_detail()` rather than only the return
+  value. Validation/veto/lifecycle errors still return `Err`.
+
 ## 3. Panic and isolation policy (v0.4.2)
 
 The kernel contains **unwinding panics raised by plugin/embedder code it calls
@@ -464,12 +522,11 @@ still waits for the teardown.
   caller's own in-flight registrations (R3-A3). If two threads each wait for the
   other's registration/activation window, they can still wait forever — avoid
   synchronous registration cycles in hosts.
-- **Supervision quotas count live resources (v0.4.3).** `FiberQuota` limits apply
-  to live effects/listeners/children; released slots (unload, `once` auto-removal,
-  concurrent dispose) are reusable immediately, so the trigger point differs from
-  0.4.2's historical-accumulation behavior. Internal effects count too (root
-  logger provide + one ownership effect per dynamic child), so
-  **`max_effects` should be ≥2**.
+- **Supervision quotas count live resources (v0.4.3; Q11 fixed in v0.5.0).**
+  `FiberQuota` limits apply to live effects/listeners/children; released slots
+  (unload, `once` auto-removal, concurrent dispose) are reusable immediately.
+  Since v0.5.0 `max_effects` counts **user** effects only — internal kernel
+  effects are excluded, so `max_effects(1)` still loads plugins.
 
 - **Cancelled-cascade recovery (F1/F4/F5, v0.4.3).** A cancelled async cascade
   can park non-root dependents in `Unloading`; recovery happens through
@@ -492,11 +549,11 @@ still waits for the teardown.
   (`ReparkGuard`), re-admits them in `take_parked_unloads`, and makes
   `when_idle()` return only when idle **and** `!has_parked_unloads()`; each
   restored cleanup runs exactly once before the wait completes.
-- **Performance backlog (v0.4.3).** On a 5000-fiber fanout, create /
-  `dispose_all` are about **25–35% slower** than 0.4.2 (1k fibers are faster or
-  on par; RSS and correctness show no regression). A reverse-dependency index is
-  planned for **0.4.5** (moved out of 0.4.4; design review in progress); until
-  then very large fanouts should evaluate batch timing.
+- **Reverse-dependency index (v0.5.0).** The 0.4.3 fanout regression (5000-fiber
+  `create`/`dispose_all` ~25–35% slower than 0.4.2) is eliminated by the full
+  reverse-dependency index (S1–S4, internal only, no public API or semantic
+  change): fanout 5k `create+dispose` −54% / `dispose` −74%, 1500-level deep
+  chain cascade −97% / `dispose` −90%, fanout 1k `create+dispose` −50%.
 - **Degraded plugin keys are not individually addressable (C2).** Every plugin
   whose `Plugin::key()` panics shares one
   `PluginKey::Named("<panicked plugin>")` runtime, so `keys`/`replace`/`delete`

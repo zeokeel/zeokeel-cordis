@@ -1,18 +1,20 @@
 # Cordis Core — normative specification
 
-Status: **v0.4.4**. The Rust crate (repository root) is the reference implementation of
+Status: **v0.5.0**. The Rust crate (repository root) is the reference implementation of
 this document. A behavior that is not written here is not part of the contract.
 
-Editorial revision v0.4.4: the prose and the API surface below were re-checked against
-the `v0.4.4` crate. No CORE case is added, renumbered or removed — v0.4.2, v0.4.3 and
-v0.4.4 are patch releases that fix the implementation against requirements this document
-already implied, plus contracts stated outside it (`docs/CORDIS-RUST.md` §3 panic
-policy, `docs/DESIGN.md` I5 type-error reporting). v0.4.3 additionally makes explicit
-the deep-dependency-chain teardown order, the `when_idle` self-registration exclusion,
-Plugin metadata panic containment, live-resource quota accounting, nested-effect
-diagnostics filtering and the `AccessorWriteRejected` error. Where a release makes a
-previously unstated edge explicit it is marked "(v0.4.3)"/"(v0.4.4)" below; such a
-mark is a clarification of an existing case, not a new case.
+Editorial revision v0.5.0: the prose and the API surface below were re-checked against
+the `v0.5.0` crate. No CORE case is added, renumbered or removed — **all 51 cases
+(CORE-001…CORE-051) remain the contract**. v0.5.0 is a **minor release**: it converges
+the public API (internal state types leave the public contract; `Fiber::last_activity`
+becomes `last_activity_ms`, Q11 clarifies that `FiberQuota::max_effects` counts user
+effects only) and adds three general extension APIs — `Clock`/`SystemClock` injection,
+`LifecycleEvent`/`LifecycleListener`/`Context::on_lifecycle`, and
+`CordisError::Plugin`/`Fiber::error_detail`. v0.4.2–v0.4.4 remain patch releases that
+fixed the implementation against requirements this document already implied; their
+behavioral deltas are listed in `CHANGELOG.md` and summarised in §6. Where a release
+makes a previously unstated edge explicit it is marked "(v0.4.x)"/"(v0.5.0)" below;
+such a mark is a clarification of an existing case, not a new case.
 
 ## 1. Scope
 
@@ -220,6 +222,16 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   any leftover dependent stays `Active` and can be retried by a later
   dispose/refresh. This supersedes the former "deep chain dispose can overflow
   the stack" limitation.
+- **Lifecycle broadcasts (v0.5.0)**: `Context::on_lifecycle(listener)` subscribes a
+  **non-fiber-bound** listener (`LifecycleListener`) that receives one
+  `LifecycleEvent { fiber_id, name, from, to }` per fiber state transition.
+  Multiple subscribers run independently and listener panics are contained and
+  logged. The subscription is **not fiber-owned**: the returned `Disposer` is its
+  single owner — dropping the `Disposer` unsubscribes exactly like `dispose`
+  (single-owner safety net); to keep observing across the installing fiber's
+  lifetime, store the `Disposer` and dispose it explicitly when done. It is a
+  thin wrapper over the `internal/status` hook (CORE-021) and does not alter the
+  state-machine guarantees of CORE-044/045/047.
 - **Pending-dispose finalisation (v0.4.2)**: when a parent unload flags a busy
   child for disposal, every lifecycle entry point (`restart`, `restart_async`,
   `update`, `update_async`) finalises the pending dispose on **all** exit paths —
@@ -376,7 +388,7 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
 - `ctx.plugin(Arc<dyn Plugin>, config)` registers a fiber under a `PluginKey`:
   `Named(name)` by default, `Type(TypeId)` with `plugin_typed`. `plugin_async` /
   `plugin_async_typed` are the `AsyncPlugin` counterparts (CORE-035).
-- `Registry::size/get/has/delete/keys/values/entries/for_each/fibers/counter`
+- `Registry::size/get/has/delete/keys/values/entries/for_each/fibers`
   expose the live plugin map (CORE-022). These are **per-structure snapshots**:
   each call locks one map/list, so during concurrent lifecycle operations
   different calls can be transiently inconsistent (e.g. `keys()` lists a
@@ -397,7 +409,9 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   and `Registry::when_idle()` / `Context::when_idle()` resolve once the tree is
   quiescent (CORE-049). This is the pure-Rust building block a supervisor needs
   for shutdown/health; it does not provide preemption or forced cancellation.
-  Since v0.4.2 the whole registration→activation window of `ctx.plugin*` counts
+  `Registry::when_idle()` returns the crate-root `IdleWait<'_>` future
+  (`zeokeel_cordis::IdleWait`); `Context::when_idle()` is the async convenience
+  wrapper that awaits it. Since v0.4.2 the whole registration→activation window of `ctx.plugin*` counts
   as in-flight work: from the context entry point through the `internal/plugin`
   create hook and up to the end of activation. Since v0.4.3 (R3-A3/C4) the
   registry records which **thread created** each in-flight registration:
@@ -438,11 +452,12 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   released exactly once by whichever path comes first (user disposer, a `once`
   listener's auto-removal, or fiber unload), and child fibers are counted by live
   weak handles. Released slots are reusable immediately; exceeding a limit still
-  returns `CordisError::QuotaExceeded` and rolls the activation back. The kernel
-  itself holds internal effects (the root logger provide effect plus one
-  ownership effect per dynamically loaded child fiber) and the quota counts them:
-  **`max_effects` should be ≥2**; a quota of `1` starves the kernel itself and no
-  plugin can load.
+  returns `CordisError::QuotaExceeded` and rolls the activation back. Since
+  v0.5.0 (Q11) **`max_effects` counts user effects only** — internal kernel
+  effects (the root logger provide effect, the ownership effect of each
+  dynamically loaded child fiber) are excluded, so `max_effects(1)` still loads
+  plugins and only limits effects registered through `ctx.effect*` by
+  hosts/plugins.
 - **Cooperative cancellation (v0.3.0)**: `Fiber::cancel()`/`is_cancelled()` set
   a flag and `Context::checkpoint()` returns `Err(CordisError::Cancelled)` once
   set, so long-running plugin work can unwind through the normal failure/rollback
@@ -455,7 +470,13 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   failure rollback). `Fiber::replace_plugin` / `replace_plugin_async` do the
   same for a single fiber (CORE-048). A reload rejected by a busy fiber
   (`LifecycleBusy`) rolls the re-binding and the runtime move back, so a failed
-  replace leaves the registry and the fiber binding untouched. Since v0.4.2 the
+  replace leaves the registry and the fiber binding untouched. **`Ok` does not
+  mean `Active` (v0.5.0 clarification)**: a reload/activation failure after the
+  swap is contained at the fiber level — `Fiber::replace_plugin` (and
+  `restart`/`update`) returns `Ok(())` while the fiber lands in `Failed`, with the
+  structured error retained in `Fiber::error_detail()`; callers must check
+  `Fiber::state()`/`error_detail()` rather than only the return value.
+  Validation/veto/lifecycle errors still return `Err`. Since v0.4.2 the
   rollback also **restores the fibers that had already been reloaded**: every
   fiber switched to the new implementation is reloaded back with the old plugin
   before `replace` returns, so a failed replace leaves no mixed
@@ -498,7 +519,14 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   `TracingExporter` is the adapter that forwards records to `tracing`; the
   kernel's own diagnostic `tracing` events are an independent channel). An
   **invalid numeric level** in logger config is clamped to the safe end
-  (`Error`) since v0.4.3 (S2); string levels are unchanged.
+  (`Error`) since v0.4.3 (S2); string levels are unchanged. Since v0.5.0
+  `LogRecord::ts_unix_ms` comes from the tree's injectable clock; a `ctx.logger()`
+  facade snapshots the clock **at creation** (so a facade obtained before
+  `set_clock` keeps the old clock — re-acquire it after changing the clock),
+  while the raw `LoggerService` API always timestamps with `SystemClock`.
+  Only new observations are affected by a clock change; the clock should be set
+  once, right after `Context::root` and before loading plugins (not swapped at
+  runtime).
 - `Context::resolve_config` merges `ConfigSchema` layers base → root intercept →
   child intercept → head; `Plugin::config_schema` validation failures surface as
   `CordisError::Validation` and never replace the previous config (CORE-024).
@@ -549,7 +577,11 @@ fn apply_async<'a>(&'a self, ctx: Context, config: Value) -> BoxFuture<'a, Resul
   advancing in the registry's snapshot order. A forward-ordered dependency chain
   (provider registered before consumer) settles in one pass; a reverse-ordered
   chain advances about one level per pass, so an extremely deep chain may need
-  repeated `refresh()` calls before it is fully settled.
+  repeated `refresh()` calls before it is fully settled. An **explicit**
+  `refresh()`/`refresh_async()` re-evaluates the whole registry snapshot,
+  including availability-gate flips; the internal dependents refresh performed
+  after provide/withdraw/replace/update uses the reverse-dependency-index fast
+  path and is semantically equivalent to the full evaluation.
 - `Fiber::restart_async` / `Fiber::update_async` are the async lifecycle entry
   points; the synchronous `restart`/`update` return
   `CordisError::AsyncPluginNeedsAsync` for async fibers instead of blocking.
@@ -583,11 +615,17 @@ Core types:
 
 ```rust
 pub struct Context;
-pub struct Fiber;                 // wraps `pub type FiberRef = Arc<Mutex<FiberData>>`
+pub struct Fiber;                 // opaque handle (internals are `pub(crate)`)
 pub struct Registry;              // PluginKey → PluginRuntime map
 pub struct Events;                // event bus; `Context` forwards to it
 pub struct LoggerService;         // ring buffer + exporters
 pub struct Logger;                // named facade
+pub trait Clock;                  // now_unix_ms() / now_monotonic_ms()
+pub struct SystemClock;           // default Clock (wall time + process-monotonic)
+pub struct LifecycleEvent { pub fiber_id: u64, pub name: String,
+                            pub from: FiberState, pub to: FiberState }
+pub type LifecycleListener = Arc<dyn Fn(&LifecycleEvent) + Send + Sync>;
+pub struct IdleWait<'a>;          // `Registry::when_idle()` future, re-exported at the crate root
 pub struct ServiceKey<T: ?Sized + Send + Sync + 'static>;
 pub struct ServiceGate;           // availability gate with dependent refresh
 pub type ServiceValue = Arc<dyn Any + Send + Sync>;
@@ -631,7 +669,11 @@ already runs a lifecycle operation on the fiber). v0.4.2 adds
 original error and the rollback error). v0.4.3 adds
 `AccessorWriteRejected(name)` (a computed accessor's setter inspected the write
 and returned `false`; distinct from `ServiceWriteForbidden` and
-`AccessorReadOnly`).
+`AccessorReadOnly`). v0.5.0 adds
+`Plugin { plugin, kind, message }` (structured plugin failure; construct with
+`CordisError::plugin(plugin, kind, message)` and read it back from
+`Fiber::error_detail()`); it is propagated unchanged through activation,
+`Fiber::await_settled`, restart/update and `Registry::replace`.
 
 `impl Context` (grouped):
 
@@ -651,7 +693,13 @@ and returned `false`; distinct from `ServiceWriteForbidden` and
 - plugins: `plugin(Arc<dyn Plugin>, config)`, `plugin_typed(Arc<P>, config)`,
   `plugin_async(Arc<dyn AsyncPlugin>, config)`, `plugin_async_typed(Arc<P>, config)`,
   `inject(deps, callback)`;
-- lifecycle: `refresh()`, `refresh_async()`, `when_idle()`;
+- lifecycle: `refresh()`, `refresh_async()`, `when_idle()`, `on_lifecycle(listener)`
+  (non-fiber-bound broadcast, returns `Disposer`);
+- time source: `clock()`, `set_clock(Arc<dyn Clock>)` (only callable from the
+  **root fiber's** context; root-derived scopes share the same tree clock slot;
+  install once right after `Context::root`, before loading plugins; only new
+  observations use it; `ctx.logger()` facades snapshot the clock at creation, the
+  raw `LoggerService` uses `SystemClock`);
 - cooperative cancellation: `checkpoint()`;
 - events: `on`, `on_with(name, prepend, global, listener)`,
   `on_with_options(name, options, listener)`, `once`, `on_async`, `on_async_with`,
@@ -672,10 +720,15 @@ and returned `false`; distinct from `ServiceWriteForbidden` and
 `update_async_with_no_save(config, no_save)`, `replace_plugin(Arc<dyn Plugin>)`,
 `replace_plugin_async(Arc<dyn AsyncPlugin>)`, `cancel`, `is_cancelled`,
 `await_settled`, `settled`, `state`, `is_active`, `assert_active`, `context`,
-`config`, `raw_config`, `error`, `get_effects`, `uid`, `id`, `name`, `parent`.
-`impl Registry`: `new`, `counter`, `size`, `get(key)`, `has(key)`, `delete(key)`,
+`config`, `raw_config`, `error`, `error_detail`, `get_effects`, `uid`, `id`, `name`,
+`parent`; with the **`supervision` feature** also `heartbeat`, `last_activity_ms`,
+`idle_for` (L2 activity/watchdog surface, unavailable in the default build).
+`impl Registry`: `new`, `size`, `get(key)`, `has(key)`, `delete(key)`,
 `keys`, `values`, `entries`, `for_each`, `fibers`, `fiber_count`, `is_idle`,
-`when_idle`, `replace(old_key, new_plugin)`, `replace_async(old_key, new_plugin)`.
+`when_idle() -> IdleWait<'_>` (the future type is re-exported as
+`zeokeel_cordis::IdleWait`), `replace(old_key, new_plugin)`,
+`replace_async(old_key, new_plugin)`; with the **`supervision` feature** also
+`stalled_fibers(timeout) -> Vec<StalledFiber>`.
 `impl PluginRuntime`: `name`, `key`, `fibers`, `fiber_count`, `is_empty`.
 `exec`: `block_on`, `boxed`, `set_blocking_executor`, `yield_now`.
 
@@ -696,15 +749,22 @@ FIX-12…FIX-21, async-teardown retry/self-join S-1/S-2, `c4_when_idle_*`), and 
 state which the public API cannot construct are asserted by `#[cfg(test)]` unit
 tests inside `src/fiber.rs`.
 
+v0.5.0 adds **no CORE case**; its extension APIs and API convergence are covered by
+`tests/api_surface.rs` (19 public-API contract cases: clock injection, lifecycle
+broadcasts, structured plugin errors, `InternalBus` ownership, logger/meta/effect
+surface) plus `tests/property.rs` (deterministic randomized lifecycle state machine)
+and `tests/miri_leaks.rs` (leak-checked create/dispose scenario). The new test names
+are listed under the affected CORE rows above where they exercise that case.
+
 | ID | Requirement | Test(s) |
 | --- | --- | --- |
-| CORE-001 | Plugin activates, disposes and cleans up | `lifecycle::effects_run_in_reverse_order_once`, `lifecycle::event_bail_and_owner_disposal` |
+| CORE-001 | Plugin activates, disposes and cleans up | `lifecycle::effects_run_in_reverse_order_once`, `lifecycle::event_bail_and_owner_disposal`, `api_surface::api_fiber_is_active_tracks_lifecycle_states` |
 | CORE-002 | Child contexts inherit provider registrations | `service::service_is_visible_across_sibling_fibers` |
 | CORE-003 | `isolate` shadows a service for the child subtree only | `lifecycle::isolate_shadows_parent_service`, `context::isolate_without_label_creates_fresh_scopes` |
 | CORE-004 | Duplicate provide in one scope is rejected | `service::duplicate_service_is_rejected`, `service::default_scope_rejects_duplicates_but_isolate_shadows` |
 | CORE-005 | Missing `inject` keeps the fiber Pending | `lifecycle::plugin_waits_for_injected_service`, `regression_semantics::fix12b_panicking_inject_is_contained_and_keeps_services_working` |
 | CORE-006 | Gate flips activate and unload the dependent fiber | `service::service_check_gates_dependents` |
-| CORE-007 | Effects clean up in reverse registration order, exactly once | `async_conformance::sync_and_async_effects_share_reverse_registration_order`, `async_conformance::async_cleanup_runs_in_reverse_order_once` |
+| CORE-007 | Effects clean up in reverse registration order, exactly once | `async_conformance::sync_and_async_effects_share_reverse_registration_order`, `async_conformance::async_cleanup_runs_in_reverse_order_once`, `api_surface::api_attach_effect_owns_an_external_disposer`, `api_surface::api_effect_future_async_registers_async_cleanups` |
 | CORE-008 | A disposer runs exactly once | `async_conformance::async_disposer_is_single_shot` |
 | CORE-009 | Fiber dispose awaits async cleanups before returning | `async_conformance::sync_dispose_awaits_async_cleanups_before_returning` |
 | CORE-010 | Provider unload unregisters its services | `service::service_auto_register_and_dispose`, `service::provided_service_disposer_removes_service` |
@@ -718,21 +778,21 @@ tests inside `src/fiber.rs`.
 | CORE-018 | `prepend`/`global`/`once` event options | `events::event_options_prepend_and_global`, `events::event_once_fires_exactly_once`, `events::bail_ignores_null_and_false_values` |
 | CORE-019 | Context scope filter for events | `events::event_context_filter_matches_scopes`, `events::event_waterfall_respects_context_filter` |
 | CORE-020 | Waterfall middleware order and veto semantics (no `Bail` in this lane) | `events::event_waterfall_respects_context_filter`, `async_conformance::waterfall_*` (5 sync-lane cases), `async_conformance::async_waterfall_*` (2 async-lane cases) — 8 cases |
-| CORE-021 | Internal hooks (plugin/service/config/get/set/update/listener/dispatch) | `internal::*` (8 cases) |
+| CORE-021 | Internal hooks (plugin/service/config/get/set/update/listener/dispatch; 9 hooks) | `internal::*`, `api_surface::api_raw_internal_bus_is_not_fiber_owned` (raw `InternalBus` registrations are caller-owned, not fiber-owned) |
 | CORE-022 | Registry map API + runtime dedupe/reclaim | `registry::registry_map_api`, `registry::registry_reuses_runtime_for_same_plugin`, `registry::registry_typed_plugin_identity`, `registry::delete_runtime_with_no_fibers_is_rejected_gracefully` |
-| CORE-023 | Logger buffer/seq/threshold/exporters/intercept | `logger::*` (6 cases: incl. `logger::invalid_numeric_logger_level_clamps_to_error`, S2) |
+| CORE-023 | Logger buffer/seq/threshold/exporters/intercept; clock-driven timestamps (v0.5.0) | `logger::*` (6 cases: incl. `logger::invalid_numeric_logger_level_clamps_to_error`, S2), `api_surface::api_logger_is_enabled_follows_the_service_threshold`, `api_surface::api_logger_exporter_count_and_clear_buffer`, `api_surface::api_injectable_clock_drives_log_timestamps` |
 | CORE-024 | Config schema validation and merge precedence | `config::*` (5 cases) + `service::service_resolve_config_merges_intercepts` |
-| CORE-025 | Accessors, metadata, labeled isolates | `context::context_accessor_and_set`, `context::accessor_is_scoped_to_its_fiber`, `context::accessor_shadows_service_of_same_name`, `context::extend_meta_attaches_metadata`, `context::isolate_labeled_shares_scope`, `service::accessor_setter_rejection_uses_a_dedicated_error` |
+| CORE-025 | Accessors, metadata, labeled isolates | `context::context_accessor_and_set`, `context::accessor_is_scoped_to_its_fiber`, `context::accessor_shadows_service_of_same_name`, `context::extend_meta_attaches_metadata`, `context::isolate_labeled_shares_scope`, `service::accessor_setter_rejection_uses_a_dedicated_error`, `api_surface::api_context_meta_insert_any_round_trips` |
 | CORE-026 | Fiber diagnostics (`uid`/`parent`/`assert_active`/`await_settled`) | `fiber::fiber_uid_parent_and_assert_active`, `fiber::await_settled_rethrows_startup_errors`, `fiber::await_settled_waits_for_async_effect_cleanup` |
 | CORE-027 | Async effect bodies/streams and restart cleanup | `async_effect_body::*` (4 cases), `async_conformance::restart_async_drains_and_reapplies_async_effects`, `lifecycle::restart_reapplies_plugin_and_update_config` |
-| CORE-028 | Failed activation rolls back effects and services | `hardening::failed_apply_rolls_back_effects_and_services` |
+| CORE-028 | Failed activation rolls back effects and services | `hardening::failed_apply_rolls_back_effects_and_services`, `api_surface::api_structured_plugin_error_constructor_and_display`, `api_surface::api_structured_plugin_error_survives_sync_activation` |
 | CORE-029 | `apply` panic is isolated; fiber fails, caller does not panic | `hardening::panicking_apply_is_isolated_and_rolled_back` |
 | CORE-030 | Cleanup panic does not skip remaining cleanups (sync + async) | `hardening::cleanup_panic_does_not_skip_remaining_cleanups`, `async_conformance::async_cleanup_panic_does_not_skip_remaining_cleanups` |
 | CORE-031 | Listener panic does not abort sync dispatch | `hardening::event_listener_panic_does_not_abort_dispatch` |
 | CORE-032 | Unsized `ServiceKey<dyn Trait>` via `*_any` services | `hardening::trait_object_service_keys_work` |
 | CORE-033 | Root context/fiber graph has no strong reference cycle | `context::link_cycle_tests::root_context_graph_has_no_strong_cycle` |
 | CORE-034 | Sync disposal uses the embedder blocking executor | `executor::sync_disposal_uses_embedder_blocking_executor` |
-| CORE-035 | Async plugin activates and disposes through `*_async` APIs | `hardening::async_plugin_activates_and_disposes` |
+| CORE-035 | Async plugin activates and disposes through `*_async` APIs | `hardening::async_plugin_activates_and_disposes`, `api_surface::api_structured_plugin_error_survives_async_activation` |
 | CORE-036 | Async plugin failure rolls back (awaits async cleanups) | `hardening::async_plugin_failure_rolls_back` |
 | CORE-037 | Async plugin `inject` gating re-evaluated by `refresh_async` | `hardening::async_plugin_waits_for_inject_and_refresh_async` |
 | CORE-038 | Failed sync activation drains async cleanups during rollback (reverse order across lanes) | `hardening::failed_sync_activation_drains_async_cleanup_inline` |
@@ -741,14 +801,14 @@ tests inside `src/fiber.rs`.
 | CORE-041 | `ctx.set` is a revertible, classified mutation (dependents reactivate) | `semantics::set_is_revertible_and_classified`, `semantics::provider_version_change_reactivates_dependents` |
 | CORE-042 | Provider withdrawal precedes binding removal | `semantics::provider_withdrawal_precedes_binding_removal` |
 | CORE-043 | Concurrent async dispose joins the in-flight cleanup | `semantics::concurrent_async_dispose_joins_the_inflight_cleanup` |
-| CORE-044 | A disposed fiber is final (no restart/activation resurrection) | `redteam::rt12_restart_after_dispose_fails_safely`, `redteam::rt01_sync_dispose_during_apply_must_not_end_active` |
-| CORE-045 | Concurrent lifecycle calls are exclusive (`LifecycleBusy`) | `concurrency::concurrent_dispose_returns_lifecycle_busy`, `concurrency::reentrant_lifecycle_calls_are_allowed`, `redteam::rt13_dispose_during_restart_apply_cannot_leave_a_zombie` |
+| CORE-044 | A disposed fiber is final (no restart/activation resurrection); lifecycle broadcasts report transitions | `redteam::rt12_restart_after_dispose_fails_safely`, `redteam::rt01_sync_dispose_during_apply_must_not_end_active`, `api_surface::api_on_lifecycle_reports_transitions_and_supports_multiple_subscribers`, `api_surface::api_on_lifecycle_contains_listener_panics` |
+| CORE-045 | Concurrent lifecycle calls are exclusive (`LifecycleBusy`) | `concurrency::concurrent_dispose_returns_lifecycle_busy`, `concurrency::reentrant_lifecycle_calls_are_allowed`, `redteam::rt13_dispose_during_restart_apply_cannot_leave_a_zombie`, `property::randomized_lifecycle_interactions_preserve_invariants` |
 | CORE-046 | Cancelling an async disposal: an `AsyncDisposer` restores unstarted cleanups for the next dispose (S-1); a cancelled fiber unload completes the teardown (sync inline, async deferred) and lands in its target state (A-9); a same-disposer cleanup's `dispose_blocking` **and** its own async `dispose()` return immediately (drain-frame self-join, R2-1), while same-thread independent joiners still wait | `concurrency::cancelling_dispose_async_restores_unstarted_effects`, `concurrency::cancelling_async_disposer_restores_unstarted_cleanups`, `redteam3_attacks::at29_concurrent_dispose_joins_inflight`, `regression_semantics::fix15_cancelled_teardown_is_retried_by_dispose_blocking`, `regression_semantics::fix15_cancelled_dispose_async_is_retried_by_fiber_dispose`, `regression_semantics::fix15_self_join_from_cleanup_returns_instead_of_deadlocking`, `regression_semantics::fix15_self_join_from_fiber_cleanup_returns_instead_of_deadlocking`, `regression_semantics::fix15_self_join_from_cleanup_via_async_dispose_returns`, `regression_core::a2_cancelled_refresh_async_finishes_the_teardown`, `regression_core::a9_cancelled_dispose_async_completes_the_teardown`, `regression_core::f1_retried_root_dispose_async_recovers_parked_cascade`, `regression_core::f1_dispose_all_recovers_parked_cascade`, `regression_core::f1_refresh_async_recovers_parked_cascade`, `regression_core::f4_cancelled_recovery_releases_the_latch_for_the_next_when_idle`, `regression_core::f4_cancelled_refresh_recovery_is_retried_by_when_idle`, `regression_semantics::f1_when_idle_recovers_parked_cascade_after_cancel`, `regression_semantics::f4_cancelled_recovery_does_not_latch_the_next_when_idle` |
 | CORE-047 | Child fibers are owned by their parent (cascade + rollback); deep chains unload iteratively and ownership bookkeeping stays bounded | `child_ownership::*` (5 cases), `regression_core::c1_deep_chain_dispose_is_iterative_and_ordered`, `regression_core::c1_three_level_cascade_order_is_dependents_first`, `regression_core::c1_cancelled_deep_cascade_still_completes`, `regression_core::c1_dependent_cleanup_panic_is_contained`, `regression_core::r1_deep_plugin_chain_activates_on_a_2mib_thread`, `regression_core::r3a4_dynamic_plugin_churn_keeps_parent_bookkeeping_bounded`, `regression_core::r3a4_long_churn_keeps_memory_and_effects_bounded`, `regression_core::r3a4_parent_dispose_then_child_dispose_is_idempotent`, `regression_core::r3a4_parent_sweep_races_child_self_dispose`, `regression_core::r3a4_cancelled_child_dispose_still_detaches`, `redteam5_attacks::c16_cancelled_parent_dispose_async_retry_disposes_all_children` |
-| CORE-048 | In-place plugin replacement keeps fiber identity and reloads | `replace::*` (6 cases) |
+| CORE-048 | In-place plugin replacement keeps fiber identity and reloads | `replace::*` (6 cases), `api_surface::api_structured_plugin_error_survives_replace` |
 | CORE-049 | Quiescence: `when_idle` resolves when no lifecycle work is in flight; it excludes only the caller's own in-flight registrations (v0.4.3) while `is_idle` stays strict, and it is recovery-aware (v0.4.3, F5) — both `Context` and raw `Registry` APIs retry recovery of parked cancelled-cascade frames while waiting; sync `refresh()` deliberately does not recover | `quiescence::fresh_registry_is_idle`, `quiescence::when_idle_waits_for_a_slow_activation`, `quiescence::when_idle_waits_for_an_async_disposal`, `regression_semantics::c4_when_idle_inside_a_registration_frame_does_not_wait_for_itself`, `regression_core::c4_when_idle_inside_registration_frame_does_not_wait_for_itself`, `regression_semantics::fix11_registration_window_keeps_when_idle_blocked`, `regression_core::f5_when_idle_recovers_parked_frames_that_appear_while_waiting`, `regression_core::f5_repeated_cancel_then_when_idle_does_not_hang`, `regression_core::f5_raw_registry_when_idle_recovers_parked_cascade`, `regression_core::f5_when_idle_sees_parked_frames_parked_after_entry`, `regression_semantics::f5_when_idle_waits_for_active_unload_then_recovers_parked_frames`, `regression_semantics::f5_when_idle_recovers_parked_frames_that_appear_while_waiting`, `regression_semantics::f5_twenty_cancel_and_when_idle_rounds_do_not_hang` |
 | CORE-050 | Cooperative cancellation via `checkpoint` | `quiescence::checkpoint_observes_cooperative_cancellation` |
-| CORE-051 | `dispose_all` shutdown path reclaims the whole tree | `child_ownership::dispose_all_reclaims_the_whole_tree` |
+| CORE-051 | `dispose_all` shutdown path reclaims the whole tree (leak-clean under Miri) | `child_ownership::dispose_all_reclaims_the_whole_tree`, `miri_leaks::contexts_and_plugins_do_not_leak` |
 
 The optional `supervision` feature is not part of the CORE cases; its quota
 semantics (live-resource accounting, S1) are asserted by
@@ -756,7 +816,12 @@ semantics (live-resource accounting, S1) are asserted by
 `disposed_listeners_free_the_listener_quota_slot`,
 `once_listener_frees_its_quota_slot_when_it_auto_removes`,
 `listener_quota_release_is_idempotent_and_concurrency_safe`,
-`disposed_child_fibers_free_the_child_quota_slot`).
+`disposed_child_fibers_free_the_child_quota_slot`). The Q11 change (v0.5.0:
+`max_effects` counts **user** effects only) is asserted by
+`tests/l2_defenses.rs` (`max_effects_one_still_loads_a_plugin`,
+`user_effects_consume_the_max_effects_quota`,
+`disposed_user_effect_frees_the_quota_slot_under_max_effects_one`,
+`l2_activity_uses_the_injected_clock`).
 
 The v0.4.3 audit fixes add **no CORE ID**; they are assertions about the cases
 above, and their regressions are: `regression_core::c1_*` / `r1_*` / `r3a4_*`
@@ -805,7 +870,19 @@ Plugin metadata containment); `service::accessor_setter_rejection_uses_a_dedicat
 - `0.y.z` — breaking changes may land in `y`.
 - Any change to a CORE case ID or to a documented ordering guarantees requires a
   `spec/` change in the same commit and a minor bump.
-- Embedders should pin a tag (`tag = "v0.4.3"`) and update deliberately.
+- Embedders should pin a tag (`tag = "v0.5.0"`) and update deliberately.
+- v0.5.0 is a **minor release**: no CORE case was added, renumbered or removed
+  (still 51 cases). It converges the public API — internal types
+  `FiberRef`, `FiberData`, `PluginKind`, `IdleOrRecoverableWait` and
+  `Registry::counter()` become `pub(crate)`;
+  `Fiber::last_activity() -> Instant` is replaced by `last_activity_ms() -> u64`;
+  Q11: `max_effects` counts user effects only — and adds three general extension
+  APIs: injectable `Clock`, `LifecycleEvent`/`Context::on_lifecycle` and
+  structured `CordisError::Plugin` + `Fiber::error_detail`. Performance: full
+  reverse-dependency index (S1–S4; internal only, no semantic change). See
+  `CHANGELOG.md` for the migration list and
+  [`docs/KERNEL-BOUNDARY.md`](../docs/KERNEL-BOUNDARY.md) §8 for the public-API
+  policy.
 - v0.4.2 is a **patch release**: no CORE case was added, renumbered or removed.
   It fixes defects in the implementation of existing cases and makes previously
   unstated edges explicit. Behavioral deltas are listed in `CHANGELOG.md`

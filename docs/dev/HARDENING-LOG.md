@@ -37,7 +37,7 @@
    wrapper + parent-owned child fiber + 分类通知）。TS 参考实现已用这套机制修复
    （`vendor/README.md` "Local modifications" 第 6 条 + `fiber.ts:504-673`）。只做
    局部 patch（catch_unwind / 手动回滚）会留下 C1–C6 那一组成体系的漏洞。
-3. **计划漏掉了比 7 项更严重的缺陷**：Failed provider 仍可被注入（C1）、子 fiber
+3. **最初的修复清单漏掉了比 7 项更严重的缺陷**：Failed provider 仍可被注入（C1）、子 fiber
    不归父 fiber 所有（C2）、重入 dispose 会把 fiber "复活"（C3）、restart 绕过
    inject gate（H7）、config 被重复解析（H8）。这些均已在冻结基线上编译探针复现。
 4. **A5 的 "长驻进程 1 个 root 可忍" 是错的**：每次 boot 漏 6.6 KB（裸）/ 15.9–17.4 KB
@@ -96,7 +96,7 @@ coeffect 规格分类，驱动激活/停用）。关键义务（docs-parity 抽�
 
 ## 3. 线 K 七项逐条评审
 
-| 项 | 性质判断 | 规模判断 | 计划里的替代方案 | 评审结论 |
+| 项 | 性质判断 | 规模判断 | 清单里的替代方案 | 评审结论 |
 |---|---|---|---|---|
 | A1/A2 apply panic 隔离 + 失败回滚 | 真缺陷；且 **Err 返回也不回滚**（不止 panic） | **低估 1.5–2×**（300–400 + 测试） | "host 包 catch_unwind + 手动 dispose_async" | 不成立：panic 会从 `Context::plugin` 直接穿出（`context.rs:630` `let _ =` 只吞 Err），host 拿不到 Fiber；从 `refresh_all` 穿出会污染别的插件 |
 | A3 `ServiceKey<?Sized>` | 真需求，方案可行 | 120 行量级可信，但要**合并 API** | 两层 `Arc` 包 8 个键 | 可用但双跳；在途实现 (`ArcWrap` + `*_any`) 有混用即静默 None 的坑（§3.3） |

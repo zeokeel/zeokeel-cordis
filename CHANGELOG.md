@@ -5,15 +5,120 @@
 
 ## [Unreleased]
 
-**v0.4.x 语义冻结**：不再新增语义能力；仅接受 bugfix、安全修复、性能改进（不改变语义）
-与文档修正。
+## [0.5.0] - 2026-10-29
+
+**内核 API 收敛 + 新扩展点 + 性能闭环（minor）**：本版按 SemVer 的 `0.y` 规则做了一次
+**破坏性公共 API 收敛**（内部类型退出公共契约、计时 API 改为毫秒 + 注入时钟），同时新增
+可注入时钟、生命周期广播、结构化插件错误三个通用扩展点，并用完整反向依赖索引消除 0.4.x
+的 fanout/级联性能回归。门禁：默认 `cargo test` **446 passed / 0 failed / 0 ignored**、
+`--features supervision` **461 passed / 0 failed / 0 ignored**（另含 Miri、跨平台、
+coverage、deny、actionlint、SBOM 与属性测试，见 `Docs`/`Verification`）。
+
+### Performance
+
+- **反向依赖索引（S1–S4）完整实现**：内核维护「provider → 依赖方」的反向索引，并在
+  refresh/卸载/级联路径复用它，消除全表扫描。索引是**纯内部实现**——不新增、不改变任何
+  公共 API 或语义；**显式 `refresh()` 仍做全量重新评估（含 availability gate 翻转）**，
+  内部 `refresh_dependents` 走反向索引快路径，语义等价（E 确认无回归）。实测（相对 0.4.x）：
+  - 5000-fiber fanout：`create + dispose` **−54%**、`dispose` **−74%**；
+  - 1500 层深依赖链级联卸载：cascade **−97%**、`dispose` **−90%**；
+  - 1000-fiber fanout：`create + dispose` **−50%**；
+  - 0.4.3 记录的 5000-fiber `create`/`dispose_all` 慢 25–35% 的回归由此消除。
+
+### Changed
+
+- **【破坏性】内部类型退出公共契约**：`fiber::FiberRef`、`fiber::FiberData`（及其 `pub`
+  字段）、`registry::PluginKind`、`registry::IdleOrRecoverableWait` 全部改为 `pub(crate)`；
+  `Registry::counter()` 也改为 `pub(crate)`。Migration：用 `Fiber`/`Context`/`Registry` 的
+  公开方法（`Fiber::state/get_effects/name/id/parent`、`Registry::size/get/keys/fibers` 等）
+  代替内部结构访问；`PluginKind` 不再公开——直接对 `Plugin` / `AsyncPlugin` trait 编程，
+  runtime 元数据用 `PluginRuntime::{name,key,fibers,fiber_count,is_empty}`。
+- **【破坏性】`Fiber::last_activity() -> Instant` 移除**，替代为
+  `Fiber::last_activity_ms() -> u64`（毫秒，来自树注入的 `Clock`，**`supervision` feature**）。
+  Migration：要 Duration 用 `Fiber::idle_for()`（同 feature），要时间戳用
+  `last_activity_ms()`；`Instant` 不再出现在公共 API。
+- **Q11 行为修正：`FiberQuota::max_effects` 只统计用户 effect**：内核内部 effect（root 的
+  logger provide effect、每个动态加载子 fiber 的 ownership effect 等）不再占用
+  `max_effects` 配额；`max_effects(1)` 仍可正常加载插件，只限制宿主/插件通过
+  `ctx.effect*` 注册的 effect。此前文档中的「`max_effects` 建议 ≥2」限制随之取消。
+- **Logger 时间源可注入**：`LogRecord::ts_unix_ms` 默认来自 `SystemClock`；`ctx.logger()`
+  门面在**创建时快照**当前树 `Clock`（切换后需重新获取 facade），裸 `LoggerService` API
+  始终用 `SystemClock`（见 Added），因此测试/回放可得到确定性时间戳。
+- **`Ok` 语义澄清（v0.5.0）**：`restart`/`update`/`replace_plugin`（含 async 变体）返回
+  `Ok` 只表示操作完成，**不代表 fiber 处于 `Active`**；reload/激活失败会被 containment 到
+  fiber 层（`Failed`），结构化错误保留在 `Fiber::error_detail()`。请用
+  `state()`/`error_detail()` 判定结果；validation/veto/lifecycle 错误仍返回 `Err`。
+- **`InternalBus` 所有权语义明确**：`Events::internal()`/`InternalBus` 是 **advanced/unstable**
+  surface——注册的回调由**调用者**拥有、不随 fiber 卸载移除，须显式 `Disposer` 释放；常规
+  插件继续用 fiber-owned 的 `Context::on_internal_*`。`Context::on_lifecycle` 是建立在
+  `internal/status` raw hook 上的通用封装（非 fiber 绑定）。
+
+### Added
+
+- **可注入时钟**：`Clock` trait（`now_unix_ms` / `now_monotonic_ms`）与默认 `SystemClock`
+  （wall time = Unix 毫秒，单调时间 = 进程内单调原点，实例互换不重置）；`Context::clock()`
+  读取当前时钟，`Context::set_clock(Arc<dyn Clock>)` **只能在 root fiber 上的 context 设置**
+  （root-derived scope 共享同一树 clock 槽），应在 root 创建后、加载任何插件前一次性设置
+  （**不要在运行期切换**）；只影响**新**观测（已记录的时间戳不重写），单调源不得在运行期跳变。
+  `ctx.logger()` facade 创建时快照 clock（切换后重新获取），裸 `LoggerService` 用 `SystemClock`。
+- **生命周期广播**：`LifecycleEvent { fiber_id, name, from, to }`、`LifecycleListener`、
+  `Context::on_lifecycle(listener) -> Result<Disposer>`——每次 fiber 状态迁移触发一次，多个
+  订阅者独立运行，listener panic 被遏制并记录；订阅**不是 fiber-owned**，返回的 `Disposer`
+  是唯一所有者——**drop `Disposer` 等同 dispose 退订**（单所有者安全网）；要跨安装 fiber 的
+  生命周期继续监听，请保存 `Disposer` 并在需要时显式 dispose（适合宿主级 metrics/关闭协调）。
+- **结构化插件错误**：`CordisError::Plugin { plugin, kind, message }` 与
+  `CordisError::plugin(plugin, kind, message)` 构造函数；插件可在 `apply`/`apply_async` 中
+  返回业务分类错误（如 `"config"`/`"network"`/`"auth"`），内核在激活、
+  `Fiber::await_settled`、restart/update、`Registry::replace` 中原样传播。
+  `Fiber::error_detail() -> Option<CordisError>` 读取保留的结构化错误（含 `Plugin` 变体）。
+- `Fiber::last_activity_ms()` 公开（原 `last_activity` 的毫秒替代，见 Changed；**`supervision`
+  feature**，与 `Fiber::{heartbeat,idle_for}`、`Registry::stalled_fibers()` 一样默认构建不可用）。
+- **`IdleWait` crate 根 re-export**：`Registry::when_idle()` 的返回 future 现在可直接写作
+  `zeokeel_cordis::IdleWait<'_>`（公共 API 清单补入；`Context::when_idle()` 是 async 便捷封装）。
+
+### Docs
+
+- 新增/更新 `docs/KERNEL-BOUNDARY.md`（v3 护栏，11 tests = 4 真实断言 + 7 自测；
+  **API 极简性/公开 API 策略**节）；
+  `CONTRIBUTING.md` 增加 **API 增长判据**（通用性 + 公共面 cap + 破坏性收敛走 minor + migration）；
+  `README.md`/`docs/GUIDE.md`/`docs/KERNEL-ISOLATION.md`/`docs/CORDIS-RUST.md` 同步 0.5.0
+  API/语义；`spec/CORDIS-CORE.md` 同步 §2.3/§2.6/§2.7/§3/§4/§6 的 0.5.0 语义/API 面与测试
+  引用（**不新增 CORE ID**，仍 51 个用例）。
+- **零遗留策略**：文档中所有面向未发布版本的未完成项表述已清除；物理或语言层不可消除的
+  限制统一改称**设计边界（物理/语言层）**并在 `KERNEL-ISOLATION.md` 集中说明。
+
+### Verification
+
+- **跨平台 CI**：新增 `cross-platform` 作业，在 **windows-latest / macos-latest** 上跑
+  default + supervision 测试与 kernel boundary（Ubuntu 继续作为主门禁）。
+- **覆盖率门禁**：`coverage` 作业（`cargo llvm-cov --all-features`）以 **fail-under-lines
+  85.5** 为下限，实测基线 **86.57%** 行覆盖。
+- **Miri**：`miri` 作业 nightly + `-Zmiri-disable-isolation`：`cargo miri test --lib`
+  **28/28 UB-clean**（`-Zmiri-ignore-leaks`，单测脚手架允许泄漏）；
+  `cargo miri test --test miri_leaks` **1/1 leak-clean**。
+- **cargo-deny**：`deny.toml` 启用 advisories（yanked deny、RUSTSEC）/licenses（仅宽松
+  OSI 许可）/bans（多版本告警）/sources（仅 crates.io）；CI `deny` 作业执行 `cargo deny check`；
+  发布流水线同样执行 `cargo deny` 与 unfinished-markers 检查。
+- **actionlint**：CI `actionlint` 作业用 **pinned docker image `rhysd/actionlint:1.7.12`** 对
+  `.github/workflows/*.yml` 做静态检查。
+- **MSRV clippy**：`msrv-clippy` 作业在 Rust **1.85.0** 上跑两种 feature 配置的 clippy，
+  显式允许两种版本级 lint 差异（`mutex_integer`、`needless_lifetimes`）。
+- **SBOM（可复现）**：发布流水线生成 **CycloneDX 1.5** JSON（`scripts/sbom.py`），
+  **两次生成并 `cmp` 比对**以确保可复现，然后作为 GitHub Release 资产上传（与 `.crate`
+  SHA-256 一起）。
+- **属性测试**：新增 `tests/property.rs` 确定性状态机随机测试（SplitMix64 固定种子 +
+  watchdog），覆盖 load/dispose/refresh/update/replace/dispose_all 与 provider/consumer
+  组合（1 个用例）；`tests/api_surface.rs`（19 个公共 API 契约用例）、`tests/miri_leaks.rs`
+  （1 个泄漏场景）一并纳入 `cargo test` 门禁。
+- **零遗留检查**：文档与 CHANGELOG 中不存在未完成项表述；历史 0.4.x 条目只保留历史事实，
+  其中由本版解决的部分已标注「0.5.0 已实现」。
 
 ## [0.4.4] - 2026-10-29
 
 **内核边界 + 取消 recovery 收尾补丁**：不新增语义能力，也不新增/重命名任何 CORE 用例。
 本版把「内核 vs 插件层 / 宿主」的可执行边界（文档 + CI 护栏）固化，并修复 S7——取消
 recovery 时级联根帧的 deferred cleanup 可能延后到显式 dispose 的 P2 边界。反向依赖索引
-优化**不在本版**（移至 0.4.5，设计评审中）。默认 `cargo test`（含 7 个 doc-tests）
+由 0.5.0 的 S1–S4 实现（见 [0.5.0] Performance）。默认 `cargo test`（含 7 个 doc-tests）
 **415 passed / 0 failed**、`--features supervision` **426 passed / 0 failed**（以发布前
 门禁最终实测为准；0.4.3 为 404/415，本版为 +S7 1 个 + `kernel_boundary` 10 个）。
 
@@ -61,11 +166,10 @@ recovery 时级联根帧的 deferred cleanup 可能延后到显式 dispose 的 P
 - `README.md` / `CONTRIBUTING.md` / `docs/DESIGN.md` 同步边界分层与判据；
   `spec/CORDIS-CORE.md` 仅加 editorial note 指向边界文档（**不新增 CORE ID**）。
 
-### Backlog（移出本版）
+### Notes
 
-- **反向依赖索引（性能）**：从 0.4.4 **移至 0.4.5**（设计评审中）。0.4.3 报告的
-  5000-fiber fanout `create`/`dispose_all` 慢约 25–35% 仍是已知 backlog（见 0.4.3
-  Known limitations，计划版本已更新为 0.4.5）；0.4.4 不声称该优化已实现。
+- **反向依赖索引（性能）**：0.4.4 未包含；由 **0.5.0** 的 S1–S4 完整实现，并消除 0.4.3
+  报告的 5000-fiber fanout `create`/`dispose_all` 回归（见 [0.5.0] Performance）。
 
 ## [0.4.3] - 2026-10-29
 
@@ -225,10 +329,10 @@ recovery 时级联根帧的 deferred cleanup 可能延后到显式 dispose 的 P
   `PluginKey::Named("<panicked plugin>")` runtime，因此 `keys`/`replace`/`delete` 只把它们
   当作一个条目、**无法单独定位**其中某个坏插件。这是对已损坏插件的最佳努力隔离（非受支持
   配置），宿主应修复其 `key()`。
-- **性能 backlog（0.4.3 已知回归）**：5000 fiber fanout 场景下 create / `dispose_all` 比
-  0.4.2 慢约 **25–35%**（1k fiber 更快或持平，RSS 与正确性无回归）。计划在 **0.4.5** 以
-  反向依赖索引优化（0.4.4 已将该优化移出）；在此之前超大 fanout 的宿主应评估批量操作的
-  耗时。
+- **性能回归（0.4.3 记录，0.5.0 已消除）**：5000 fiber fanout 场景下 create /
+  `dispose_all` 比 0.4.2 慢约 **25–35%**（1k fiber 更快或持平，RSS 与正确性无回归）。
+  **0.5.0** 的反向依赖索引（S1–S4）已消除该回归：fanout 5k create+dispose −54%、
+  dispose −74%（见 [0.5.0] Performance）。
 - **取消 recovery 时少数 restored cleanup 延后（0.4.3 已知边界，P2）**：当一次 recovery
   正在处理 parked 帧、且在某个作为级联根的 fiber 上被取消时，该 fiber 完成到 `Pending` 后，
   其 `CancelSafeDrain` 恢复的剩余 async cleanup 可能被留在 `deferred_async`，直到下一次显式
@@ -583,7 +687,9 @@ recovery 时级联根帧的 deferred cleanup 可能延后到显式 dispose 的 P
   fiber 状态机、effect 逆序清理、事件（emit/bail/parallel/serial/waterfall）、
   插件 registry 与配置 schema、日志服务。
 
-[Unreleased]: https://github.com/zeokeel/zeokeel-cordis/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/zeokeel/zeokeel-cordis/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.5.0
+[0.4.4]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.4.4
 [0.4.3]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.4.3
 [0.4.2]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.4.2
 [0.4.1]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.4.1
