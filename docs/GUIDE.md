@@ -681,6 +681,41 @@ A：不能，内核没有 ABI/动态加载（见「已知限制」）。需要�
 
 ---
 
+## 19. L2 运行时防线（配额、心跳、能力自省）
+
+```rust
+use std::time::Duration;
+use cordis::{Context, FiberQuota, IsolationCapabilities};
+
+// 1) 启动时自省：确认这个构建能遏制什么
+println!("{}", IsolationCapabilities::detect().summary());
+
+// 2) 配额：单个插件最多注册多少 effect / listener / 子插件（默认无限制）
+root.set_quota(
+    FiberQuota::unlimited()
+        .max_effects(256)
+        .max_listeners(64)
+        .max_child_fibers(32),
+);
+// 插件超限时激活失败：CordisError::QuotaExceeded("effects" | "listeners" | "child_fibers")
+
+// 3) 心跳：长任务里定期上报，避免 supervisor 误判为卡死
+ctx.heartbeat();
+
+// 4) watchdog：宿主侧观测（不提供强杀/抢占）
+for stalled in root.stalled_fibers(Duration::from_secs(5)) {
+    eprintln!("{} 已静默 {:?}", stalled.name(), stalled.idle_for);
+    stalled.fiber.cancel(); // 协作取消；插件需调用 ctx.checkpoint()
+}
+```
+
+要点：
+
+- 配额在**注册时**检查，超限走正常失败/回滚路径，不会留下半注册资源；
+- 心跳是**协作式**的：插件不调用 `heartbeat` 也不会被内核打断，只会被 supervisor 观察到；
+- watchdog 只报告「有 in-flight 操作且静默」的 fiber（含根 fiber），不做任何强制动作；
+- 需要"杀进程/杀线程/超时中断"时，用 L3 进程隔离 / L4 WASM，见 `KERNEL-ISOLATION.md`。
+
 ## 延伸阅读
 
 - 设计思想：[`DESIGN.md`](DESIGN.md)

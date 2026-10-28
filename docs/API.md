@@ -24,6 +24,7 @@
 | `cordis::logger` | `Logger`、`LoggerService`、`LogExporter`、`TracingExporter`、`LogLevel` |
 | `cordis::reflect` | `Accessor`、`ContextMeta` |
 | `cordis::exec` | `block_on`、`yield_now`、`boxed`、`BlockingExecutor`、`set_blocking_executor` |
+| `cordis::l2` | `IsolationCapabilities`、`FiberQuota`、`StalledFiber`（L2 运行时防线） |
 | `cordis::error` | `CordisError`、`Result<T>` |
 
 ---
@@ -252,6 +253,22 @@ pub enum CordisError {
 | `AsyncPluginNeedsAsync` | 异步插件用了同步生命周期 API |
 | `LifecycleBusy` | 同 fiber 生命周期操作被其他线程占用 |
 | `Cancelled` | 协作检查点发现已取消 |
+
+---
+
+## L2 运行时防线
+
+| API | 说明 |
+| --- | --- |
+| `IsolationCapabilities::detect()` | 返回 `{ panic_strategy, panic_containment, unsafe_forbidden, process_isolation, wasm_isolation }` |
+| `caps.summary()` | 可直接打日志的一行摘要 |
+| `FiberQuota::unlimited()` / `.max_effects(n)` / `.max_listeners(n)` / `.max_child_fibers(n)` | per-fiber 资源上限（默认无限制）|
+| `Context::set_quota(quota)` / `Registry::set_quota(quota)` | 为整棵树设置配额 |
+| `Context::quota()` / `Registry::quota()` | 查询当前配额 |
+| `Fiber::heartbeat()` / `Context::heartbeat()` | 上报活动（长任务防误报） |
+| `Fiber::last_activity()` / `Fiber::idle_for()` | 活动时间戳 / 静默时长 |
+| `Registry::stalled_fibers(timeout)` / `Context::stalled_fibers(timeout)` | 返回 `Vec<StalledFiber>`（含 fiber 与 idle_for） |
+| `CordisError::QuotaExceeded(kind)` | 配额超限（effects / listeners / child_fibers） |
 
 ---
 

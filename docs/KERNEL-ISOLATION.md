@@ -130,19 +130,33 @@ RUSTFLAGS="-C panic=abort" cargo check --lib   # 必须失败
 > 但无法把栈溢出、OOM、死锁、无限循环、依赖 UB 变成编译错误。要做"插件崩溃绝不拖垮内核"，
 > 这些仍然必须在 L3 进程隔离或 L4 WASM 里解决。
 
+## 5.6 L2 已落地的 API（v0.3.0+）
+
+| 能力 | API | 说明 |
+|---|---|---|
+| 能力自省 | `IsolationCapabilities::detect()` | panic 策略 / 遏制能力 / unsafe / 进程 & WASM（恒 false，属 embedder）|
+| 资源配额 | `FiberQuota` + `Context::set_quota` / `Registry::set_quota` | effects / listeners / child fibers 上限，超限 `QuotaExceeded` 并回滚 |
+| 心跳 | `Fiber::heartbeat()` / `Context::heartbeat()` | 长任务上报活动 |
+| watchdog 观测 | `Registry::stalled_fibers(timeout)` / `Context::stalled_fibers(timeout)` | 返回 `StalledFiber { fiber, idle_for }`，**不强杀** |
+| 静默等待 | `Registry::when_idle()` / `Context::when_idle()` | 关闭/健康检查 |
+| 协作取消 | `Fiber::cancel()` + `Context::checkpoint()` | supervisor 可先 cancel 再重启/隔离 |
+
+CI 另加 `cargo audit`（RustSec）作业，对依赖做供应链漏洞门禁。
+
 ## 6. 支持 L2/L3 所需的 kernel API（路线图）
 
-1. ~~启动时断言 `panic=unwind`~~ → **已升级为编译期强制**（v0.3.0+，见 §5.5）；后续可加
-   `IsolationCapabilities::detect()` 做运行时自省（记录实际构建参数）。
-2. 观测：`Registry::when_idle(Duration)`（整树静默）、per-fiber `last_activity()`/`heartbeat()`。
+1. ~~启动时断言 `panic=unwind`~~ → **已升级为编译期强制**（v0.3.0+，见 §5.5）；
+   ✅ `IsolationCapabilities::detect()` 已提供运行时自省。
+2. ✅ 观测：`when_idle()`、`Fiber::last_activity()`/`idle_for()`、`Fiber::heartbeat()`、
+   `Registry::stalled_fibers(timeout)` 已提供（§5.6）。
 3. 协作取消：`Context::checkpoint() -> Result<(), Cancelled>`、`Fiber::cancel()`、
    `dispose_cancelling(Duration)`。
 4. 类型化失败 + `on_fiber_failure(FailureKind::{Err,Panic,AbortedImpossible})` 供 supervisor 决策。
 5. 锁纪律：注册时缓存 `Plugin::name/key`，任何用户代码不在内核锁内执行；`Fiber::poisoned()`。
 6. 收尾保证：清理 panic 也必须到达 `Disposed/Failed` 并释放 ctx（v0.3 已做）。
 7. `BlockingExecutor::block_on -> Result<(), _>`：不允许 panic；文档化双 panic abort。
-8. 资源计量：`ctx.spawn_guarded`/`open_guarded`/定时器统一走 `ResourceMeter`；per-fiber 配额
-   （effects/listeners/threads/fds）+ 超限拒绝加载。
+8. ✅ 部分：per-fiber 配额（effects/listeners/child fibers）已实现；`spawn_guarded`/`open_guarded`
+   等 IO/线程级计量仍需 embedder 提供（内核不跟踪线程/fd）。
 9. `PluginManifest`：`{name, inject, config_schema, isolation: Thread|Process|Wasm, limits,
    capabilities}`；进程隔离用 RPC 替代 `Arc<dyn Plugin>`。
 10. 崩溃报告钩子 + 自动重启策略（L2/L3）。

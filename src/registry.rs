@@ -14,6 +14,7 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -23,6 +24,7 @@ use crate::fiber::{
     activate_fiber, activate_fiber_async, dependencies_ready, dependencies_satisfied, unload_fiber,
     unload_fiber_async, Fiber, FiberState,
 };
+use crate::l2::{FiberQuota, StalledFiber};
 
 static IDLE_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -246,6 +248,8 @@ pub struct Registry {
     /// The root fiber (weak): it is not part of `fibers`, but its lifecycle
     /// operations count for quiescence.
     root_fiber: Mutex<Option<std::sync::Weak<Mutex<crate::fiber::FiberData>>>>,
+    /// Per-fiber resource limits enforced when resources are registered.
+    quota: Mutex<FiberQuota>,
     /// Re-entrancy guard for the refresh fixed point: a dependent evaluation
     /// triggered from inside a refresh marks the registry dirty instead of
     /// recursing (prevents exponential re-entrant scans).
@@ -308,6 +312,61 @@ impl Registry {
     /// Current fiber id counter (Cordis `registry.counter`).
     pub fn counter(&self) -> u64 {
         self.counter.lock().map(|counter| *counter).unwrap_or(0)
+    }
+
+    /// Set the per-fiber quota applied to every fiber in this registry.
+    pub fn set_quota(&self, quota: FiberQuota) {
+        if let Ok(mut slot) = self.quota.lock() {
+            *slot = quota;
+        }
+    }
+
+    /// Current per-fiber quota (unlimited by default).
+    pub fn quota(&self) -> FiberQuota {
+        self.quota.lock().map(|quota| *quota).unwrap_or_default()
+    }
+
+    pub(crate) fn quota_limits(&self) -> FiberQuota {
+        self.quota()
+    }
+
+    /// Fibers with a lifecycle operation in flight that have been quiet for at
+    /// least `timeout`. This is the cooperative watchdog: the kernel never
+    /// interrupts or kills the fiber, the embedder supervisor decides what to do
+    /// (log, restart, cancel via `Fiber::cancel`, or isolate out-of-process).
+    pub fn stalled_fibers(&self, timeout: Duration) -> Vec<StalledFiber> {
+        let mut fibers = self
+            .fibers
+            .lock()
+            .map(|fibers| fibers.clone())
+            .unwrap_or_default();
+        if let Some(data) = self
+            .root_fiber
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().and_then(|weak| weak.upgrade()))
+        {
+            fibers.push(Fiber { data });
+        }
+        let mut stalled = Vec::new();
+        for fiber in fibers {
+            let state = fiber.state();
+            let pending = fiber
+                .data
+                .lock()
+                .map(|data| data.pending_ops.load(Ordering::SeqCst))
+                .unwrap_or(0);
+            let in_flight =
+                pending > 0 || matches!(state, FiberState::Loading | FiberState::Unloading);
+            if !in_flight {
+                continue;
+            }
+            let idle_for = fiber.idle_for();
+            if idle_for >= timeout {
+                stalled.push(StalledFiber { fiber, idle_for });
+            }
+        }
+        stalled
     }
 
     /// Whether the whole registry is quiescent: no lifecycle operation is in

@@ -157,6 +157,10 @@ pub struct FiberData {
     pub(crate) dispose_requested: AtomicBool,
     /// Cooperative cancellation flag observed by `Context::checkpoint`.
     pub(crate) cancel_requested: AtomicBool,
+    /// Live listeners registered on this fiber's behalf (quota accounting).
+    pub(crate) listener_count: usize,
+    /// Last observed activity (heartbeat / lifecycle operation), for watchdogs.
+    pub(crate) last_activity: Mutex<std::time::Instant>,
     /// Generation counter of activation attempts; a stale attempt must not
     /// transition or roll back a newer one.
     pub(crate) activation_epoch: AtomicU64,
@@ -304,6 +308,28 @@ impl Fiber {
         } else {
             Ok(())
         }
+    }
+
+    /// Update this fiber's activity timestamp (embedder heartbeat).
+    ///
+    /// Long-running plugins should call `ctx.heartbeat()` periodically so an
+    /// embedder watchdog can distinguish "busy" from "stuck".
+    pub fn heartbeat(&self) {
+        touch_activity(&self.data);
+    }
+
+    /// When this fiber last reported activity (lifecycle step or heartbeat).
+    pub fn last_activity(&self) -> std::time::Instant {
+        self.data
+            .lock()
+            .ok()
+            .and_then(|fiber| fiber.last_activity.lock().ok().map(|at| *at))
+            .unwrap_or_else(std::time::Instant::now)
+    }
+
+    /// How long this fiber has been quiet.
+    pub fn idle_for(&self) -> std::time::Duration {
+        self.last_activity().elapsed()
     }
 
     /// Request cooperative cancellation: plugins observe it through
@@ -1625,9 +1651,20 @@ impl Drop for OperationGuard<'_> {
     }
 }
 
+fn touch_activity(data: &FiberRef) {
+    if let Ok(fiber) = data.lock() {
+        if let Ok(mut at) = fiber.last_activity.lock() {
+            *at = std::time::Instant::now();
+        }
+    }
+}
+
 fn begin_operation(data: &FiberRef) -> OperationGuard<'_> {
     if let Ok(fiber) = data.lock() {
         fiber.pending_ops.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut at) = fiber.last_activity.lock() {
+            *at = std::time::Instant::now();
+        }
     }
     OperationGuard { data }
 }
@@ -1635,6 +1672,9 @@ fn begin_operation(data: &FiberRef) -> OperationGuard<'_> {
 fn end_operation(data: &FiberRef) {
     let waiters = match data.lock() {
         Ok(fiber) => {
+            if let Ok(mut at) = fiber.last_activity.lock() {
+                *at = std::time::Instant::now();
+            }
             if fiber.pending_ops.fetch_sub(1, Ordering::SeqCst) == 1 {
                 fiber
                     .settle_waiters

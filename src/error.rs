@@ -25,6 +25,8 @@ pub enum CordisError {
     AsyncPluginNeedsAsync(String),
     /// A cooperative checkpoint observed that the fiber was cancelled.
     Cancelled,
+    /// A per-fiber resource quota was exceeded (see `FiberQuota`).
+    QuotaExceeded(String),
     /// Another thread is already running a lifecycle operation on this fiber
     /// (`dispose`/`restart`/`update` are mutually exclusive; kernel-grade
     /// stability prefers a safe error over a data race).
@@ -48,6 +50,7 @@ impl fmt::Display for CordisError {
                 write!(f, "computed accessor is read-only: {name} (ctx.set)")
             }
             Self::Cancelled => write!(f, "operation cancelled"),
+            Self::QuotaExceeded(kind) => write!(f, "resource quota exceeded: {kind}"),
             Self::LifecycleBusy => {
                 write!(f, "another lifecycle operation is already in progress")
             }

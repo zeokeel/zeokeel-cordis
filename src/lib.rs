@@ -61,6 +61,7 @@ pub mod events;
 pub mod exec;
 pub mod fiber;
 pub mod internal;
+pub mod l2;
 pub mod logger;
 pub mod reflect;
 pub mod registry;
@@ -80,6 +81,7 @@ pub use internal::{
     InternalBus, ListenerHook, ListenerOverride, ListenerRequest, PluginHook, ServiceHook, SetHook,
     SetNext, StatusHook, UpdateHook, UpdateNext,
 };
+pub use l2::{FiberQuota, IsolationCapabilities, StalledFiber};
 pub use logger::{LogExporter, LogLevel, LogRecord, Logger, LoggerService, TracingExporter};
 pub use reflect::{Accessor, AccessorGet, AccessorSet, ContextMeta};
 pub use registry::{AsyncPlugin, Plugin, PluginKey, PluginKind, PluginRuntime, Registry};

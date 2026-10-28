@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::async_effects::{AsyncCleanup, AsyncDisposer, AsyncEffect};
 use crate::config::ConfigSchema;
-use crate::effect::{Disposer, Effect};
+use crate::effect::{cleanup, Disposer, Effect};
 use crate::error::{CordisError, Result};
 use crate::events::{AsyncListenerFn, ContextScope, EventOptions, EventResult, Events, ListenerFn};
 use crate::exec::{boxed, BoxFuture};
@@ -21,6 +21,7 @@ use crate::internal::{
     ConfigHook, DispatchHook, GetHook, ListenerHook, ListenerRequest, PluginHook, ServiceHook,
     SetHook, StatusHook, UpdateHook,
 };
+use crate::l2::{FiberQuota, StalledFiber};
 use crate::logger::{LogExporter, LogLevel, Logger, LoggerService, LOGGER};
 use crate::reflect::{Accessor, ContextMeta};
 use crate::registry::{AsyncPlugin, Plugin, PluginKey, PluginKind, Registry, RootPlugin};
@@ -99,6 +100,8 @@ impl Context {
             children: Mutex::new(Vec::new()),
             dispose_requested: std::sync::atomic::AtomicBool::new(false),
             cancel_requested: std::sync::atomic::AtomicBool::new(false),
+            listener_count: 0,
+            last_activity: Mutex::new(std::time::Instant::now()),
             activation_epoch: std::sync::atomic::AtomicU64::new(0),
             lifecycle_owner: std::sync::atomic::AtomicU64::new(0),
             lifecycle_depth: std::sync::atomic::AtomicUsize::new(0),
@@ -591,6 +594,76 @@ impl Context {
         self.register_effect_labeled(disposer, label)
     }
 
+    /// Reserve one listener slot on this fiber (quota enforcement).
+    fn reserve_listener(&self) -> Result<()> {
+        let max = self.inner.registry.quota_limits().max_listeners;
+        let mut fiber = self
+            .inner
+            .fiber
+            .data
+            .lock()
+            .map_err(|_| CordisError::Disposed)?;
+        if let Some(max) = max {
+            if fiber.listener_count >= max {
+                return Err(CordisError::QuotaExceeded("listeners".to_string()));
+            }
+        }
+        fiber.listener_count += 1;
+        Ok(())
+    }
+
+    /// Own a newly registered listener: enforce the listener quota, wrap the
+    /// disposer so the count is released on cleanup, and attach it to the fiber.
+    fn register_listener_effect(
+        &self,
+        disposer: Disposer,
+        label: &'static str,
+    ) -> Result<Disposer> {
+        if let Err(error) = self.reserve_listener() {
+            disposer.dispose();
+            return Err(error);
+        }
+        let fiber_ref = self.inner.fiber.clone();
+        let inner = disposer.clone();
+        let counted = Disposer::new(vec![cleanup(move || {
+            if let Ok(mut fiber) = fiber_ref.data.lock() {
+                fiber.listener_count = fiber.listener_count.saturating_sub(1);
+            }
+            inner.dispose();
+        })]);
+        match self.register_effect_labeled(counted, label) {
+            Ok(()) => Ok(disposer),
+            Err(error) => {
+                if let Ok(mut fiber) = self.inner.fiber.data.lock() {
+                    fiber.listener_count = fiber.listener_count.saturating_sub(1);
+                }
+                disposer.dispose();
+                Err(error)
+            }
+        }
+    }
+
+    /// Update the current fiber's watchdog activity timestamp.
+    pub fn heartbeat(&self) {
+        self.inner.fiber.heartbeat();
+    }
+
+    /// Set the per-fiber resource quota applied to the whole registry tree.
+    pub fn set_quota(&self, quota: FiberQuota) {
+        self.inner.registry.set_quota(quota);
+    }
+
+    /// Current per-fiber resource quota.
+    pub fn quota(&self) -> FiberQuota {
+        self.inner.registry.quota()
+    }
+
+    /// Fibers with work in flight that have been quiet for at least `timeout`
+    /// (cooperative watchdog; see [`crate::IsolationCapabilities`]).
+    pub fn stalled_fibers(&self, timeout: std::time::Duration) -> Vec<StalledFiber> {
+        self.inner.registry.stalled_fibers(timeout)
+    }
+
     pub(crate) fn register_effect_labeled(
         &self,
         disposer: Disposer,
@@ -626,6 +699,7 @@ impl Context {
     }
 
     fn push_effect(&self, effect: FiberEffect) -> Result<()> {
+        let max_effects = self.inner.registry.quota_limits().max_effects;
         let mut fiber = self
             .inner
             .fiber
@@ -634,6 +708,11 @@ impl Context {
             .map_err(|_| CordisError::Disposed)?;
         if fiber.state == FiberState::Disposed || fiber.state == FiberState::Unloading {
             return Err(CordisError::InactiveEffect);
+        }
+        if let Some(max) = max_effects {
+            if fiber.effects.len() >= max {
+                return Err(CordisError::QuotaExceeded("effects".to_string()));
+            }
         }
         let mut effect = effect;
         effect.activation = fiber
@@ -806,6 +885,19 @@ impl Context {
                 plugin.name()
             )));
         }
+        if let Some(max) = self.inner.registry.quota_limits().max_child_fibers {
+            let live_children = self
+                .inner
+                .fiber
+                .data
+                .lock()
+                .ok()
+                .and_then(|parent| parent.children.lock().ok().map(|children| children.len()))
+                .unwrap_or(0);
+            if live_children >= max {
+                return Err(CordisError::QuotaExceeded("child_fibers".to_string()));
+            }
+        }
         let id = self.inner.registry.next_id();
         let name = plugin.name();
         let data: FiberRef = Arc::new(Mutex::new(FiberData {
@@ -827,6 +919,8 @@ impl Context {
             children: Mutex::new(Vec::new()),
             dispose_requested: std::sync::atomic::AtomicBool::new(false),
             cancel_requested: std::sync::atomic::AtomicBool::new(false),
+            listener_count: 0,
+            last_activity: Mutex::new(std::time::Instant::now()),
             activation_epoch: std::sync::atomic::AtomicU64::new(0),
             lifecycle_owner: std::sync::atomic::AtomicU64::new(0),
             lifecycle_depth: std::sync::atomic::AtomicUsize::new(0),
@@ -1024,8 +1118,7 @@ impl Context {
             self.inner.isolate.clone(),
             callback,
         );
-        self.register_effect_labeled(disposer.clone(), "ctx.on")?;
-        Ok(disposer)
+        self.register_listener_effect(disposer, "ctx.on")
     }
 
     /// Register a self-removing sync listener (Cordis `ctx.once`).
@@ -1111,8 +1204,7 @@ impl Context {
             self.inner.isolate.clone(),
             callback,
         );
-        self.register_effect_labeled(disposer.clone(), "ctx.on_async")?;
-        Ok(disposer)
+        self.register_listener_effect(disposer, "ctx.on_async")
     }
 
     // -----------------------------------------------------------------------
@@ -1248,8 +1340,7 @@ impl Context {
             self.inner.isolate.clone(),
             callback,
         );
-        self.register_effect_labeled(disposer.clone(), "ctx.on_waterfall")?;
-        Ok(disposer)
+        self.register_listener_effect(disposer, "ctx.on_waterfall")
     }
 
     /// Register an async waterfall middleware owned by the current fiber.
@@ -1270,8 +1361,7 @@ impl Context {
             self.inner.isolate.clone(),
             callback,
         );
-        self.register_effect_labeled(disposer.clone(), "ctx.on_waterfall_async")?;
-        Ok(disposer)
+        self.register_listener_effect(disposer, "ctx.on_waterfall_async")
     }
 
     pub fn emit(&self, name: &str, args: &[Value]) {

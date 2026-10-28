@@ -7,7 +7,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](#环境要求)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-312%20passed-brightgreen.svg)](#质量与测试)
+[![Tests](https://img.shields.io/badge/tests-318%20passed-brightgreen.svg)](#质量与测试)
 
 ---
 
@@ -350,7 +350,7 @@ Context 树（不可变、可派生）
 
 ## 质量与测试
 
-- **312 个测试、31 个测试套件**全部通过：`cargo test`
+- **318 个测试、32 个测试套件**全部通过：`cargo test`
 - 代码风格与静态检查：`cargo fmt --check && cargo clippy --all-targets -- -D warnings`
 - `spec/CORDIS-CORE.md` 中的每个 `CORE-0xx` 用例都在 `tests/` 中有对应测试；
 - 除常规单测外，还有 8 轮独立对抗性测试套件（panic / abort / hang / 并发 / 泄漏 / 语义 parity），
@@ -391,6 +391,34 @@ Context 树（不可变、可派生）
 | 文档 | CI `RUSTDOCFLAGS=-D warnings` | 失效的文档链接/未解析引用直接失败 |
 | 构建一致性 | release `codegen-units = 1` + `lto = "thin"` + `panic="unwind"` | 整 crate 优化、可复现的严格构建 |
 | CI 反证 | CI 里执行 `RUSTFLAGS="-C panic=abort" cargo check` 并断言失败 | 每次 CI 都验证编译期契约仍然生效 |
+
+## L2 运行时防线（v0.3.0+）
+
+编译期之外，内核提供一组**协作式**的运行时防线（不做抢占，不做强杀）：
+
+| API | 作用 |
+| --- | --- |
+| `IsolationCapabilities::detect()` | 启动时自省：panic 策略、能否遏制 panic、是否禁用 unsafe、进程/WASM 隔离是否为 0（恒为 embedder 层）|
+| `Context::set_quota(FiberQuota)` / `Registry::set_quota` | 为所有 fiber 设置资源上限：`max_effects`、`max_listeners`、`max_child_fibers`；超限返回 `CordisError::QuotaExceeded` 并走正常回滚 |
+| `Fiber::heartbeat()` / `Context::heartbeat()` | 插件在长任务里上报活动；自动更新 `last_activity` |
+| `Fiber::idle_for()` / `last_activity()` | 单 fiber 静默时长 |
+| `Registry::stalled_fibers(timeout)` / `Context::stalled_fibers(timeout)` | watchdog 观测：有 in-flight 操作且静默超过 `timeout` 的 fiber 列表 |
+| `Fiber::cancel()` + `Context::checkpoint()` | 协作取消；supervisor 可对 stalled fiber 先 cancel 再决定重启/隔离 |
+
+```rust
+use std::time::Duration;
+use cordis::{Context, FiberQuota, IsolationCapabilities};
+
+let root = Context::root();
+println!("{}", IsolationCapabilities::detect().summary());
+root.set_quota(FiberQuota::unlimited().max_effects(256).max_listeners(64).max_child_fibers(32));
+
+// 宿主 supervisor 循环（示例）：
+for stalled in root.stalled_fibers(Duration::from_secs(5)) {
+    eprintln!("stalled: {} idle for {:?}", stalled.name(), stalled.idle_for);
+    stalled.fiber.cancel(); // 协作取消；插件需调用 ctx.checkpoint()
+}
+```
 
 **编译期能做什么、不能做什么**：编译器可以强制"可判定的前置条件"（panic 策略、unsafe 禁用、
 溢出检查、部分 lint 模式），但**无法证明**不存在栈溢出、OOM、死锁、无限循环或依赖中的 UB——
@@ -434,7 +462,10 @@ v0.2.0 引入异步插件与阻塞执行器钩子；v0.1.0 为初始内核。
 - **取消卸载只丢失「正在 await 的那一个」清理 future**：未开始的清理会被恢复并在下次 dispose 时
   逆序执行；在飞的那个无法恢复，会记录日志。
 - **事件作用域过滤是 isolate 映射相等**，不是「自己的子树」；JSON 负载无类型化事件表。
-- **无抢占、无 watchdog、无资源配额**：静默与取消都是协作式的，内核不会强杀插件。
+- **无抢占/强杀**：内核不会中断或杀死插件线程。但自 v0.3.0 起提供 L2 运行时防线：
+  `IsolationCapabilities` 能力自省、per-fiber `FiberQuota`（effects / listeners / child fibers）、
+  `ctx.heartbeat()` + `Registry::stalled_fibers(timeout)` watchdog 观测、`when_idle()` 静默等待。
+  真正"杀进程/杀线程/超时中断"仍需 L3 进程隔离或 L4 WASM。
 - **无动态插件加载 / 稳定 ABI**：插件是静态链接的 Rust trait object（`Arc<dyn Plugin>`）；
   要「换一个插件二进制」请用进程隔离或 WASM。
 
