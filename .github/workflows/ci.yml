@@ -55,31 +55,66 @@ jobs:
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: test
-        run: cargo test
+        run: cargo test --locked
       - name: test (supervision feature)
-        run: cargo test --features supervision
+        run: cargo test --locked --features supervision
       - name: clippy (supervision feature)
-        run: cargo clippy --all-targets --features supervision -- -D warnings
+        run: cargo clippy --all-targets --locked --features supervision -- -D warnings
       - name: doc
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --locked
       # docs.rs builds with every feature ([package.metadata.docs.rs]
       # all-features = true), so the rendered docs must be warning-free in that
       # configuration too.
       - name: doc (all features)
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --all-features
+        run: cargo doc --no-deps --locked --all-features
+      - name: examples build
+        run: cargo build --examples --locked
+      - name: examples smoke run
+        run: |
+          cargo run --locked --quiet --example hello
+          cargo run --locked --quiet --example services
+          cargo run --locked --quiet --example events
+          cargo run --locked --quiet --example async_plugin
+      # A real package build + `cargo verify` of the staged crate, not just a
+      # file listing: catches manifest/include/readme mistakes before release.
+      - name: package verify
+        run: cargo package --locked
       - name: release build (overflow-checks)
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: panic=abort is rejected at compile time
         run: |
-          if RUSTFLAGS="-C panic=abort" cargo check --lib >/dev/null 2>&1; then
+          if RUSTFLAGS="-C panic=abort" cargo check --lib --locked >/dev/null 2>&1; then
             echo "panic=abort build unexpectedly succeeded" >&2
             exit 1
           fi
           echo "panic=abort rejected as expected"
 
+  # The declared MSRV (`rust-version = "1.85"` in Cargo.toml) must be verified
+  # with a real toolchain, not by a lint. Clippy is *not* run here on purpose:
+  # lint sets change per release (e.g. `mutex_integer` fires on 1.85 but not on
+  # stable), while build/test/doc must stay green across the MSRV.
+  msrv:
+    name: msrv (1.85.0)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install Rust 1.85.0
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: 1.85.0
+      - name: test (MSRV)
+        run: cargo test --locked
+      - name: test (MSRV, supervision feature)
+        run: cargo test --locked --features supervision
+      - name: doc (MSRV, all features)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --locked --all-features
