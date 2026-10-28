@@ -36,9 +36,13 @@
 
 ```toml
 [dependencies]
-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.3.0" }
+zeokeel-cordis = "0.3.0"
 serde_json = "1"   # 插件配置用 serde_json::Value
 ```
+
+> crates.io 包名是 `zeokeel-cordis`，库目标名仍是 `cordis`，代码里继续 `use cordis::...`；
+> 需要跟仓库最新代码时可用 git 依赖：
+> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.3.0" }`。
 
 - MSRV：Rust **1.85+**
 - 同步宿主不需要异步运行时；异步宿主可选 tokio，但内核本身不依赖 tokio

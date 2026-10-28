@@ -7,6 +7,8 @@
 > 进程/WASM 隔离都属于使用它的宿主（embedder）。
 
 [![CI](https://github.com/zeokeel/zeokeel-cordis/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zeokeel/zeokeel-cordis/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/zeokeel-cordis.svg)](https://crates.io/crates/zeokeel-cordis)
+[![docs.rs](https://img.shields.io/docsrs/zeokeel-cordis.svg)](https://docs.rs/zeokeel-cordis)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](#快速开始)
 [![cargo audit](https://img.shields.io/badge/security-cargo--audit-brightgreen.svg)](https://github.com/zeokeel/zeokeel-cordis/actions/workflows/ci.yml)
@@ -57,11 +59,13 @@ Cordis 把「动态组合」拆成两个正交维度：
 
 ```toml
 [dependencies]
-zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.3.0" }
+zeokeel-cordis = "0.3.0"
 serde_json = "1"   # 插件配置是 serde_json::Value
 ```
 
 > crates.io 发布名为 `zeokeel-cordis`；库目标名仍是 `cordis`，代码里继续 `use cordis::...`。
+> 需要跟仓库最新未发布代码时，可换成 git 依赖：
+> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.3.0" }`。
 
 最小插件（完整可运行版本：[`examples/hello.rs`](examples/hello.rs)）：
 
@@ -125,7 +129,7 @@ fn main() -> Result<()> {
 观测），**默认关闭**——核心内核不含任何监督策略：
 
 ```toml
-zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.3.0", features = ["supervision"] }
+zeokeel-cordis = { version = "0.3.0", features = ["supervision"] }
 ```
 
 详见 [`docs/KERNEL-ISOLATION.md`](docs/KERNEL-ISOLATION.md)。
