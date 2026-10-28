@@ -239,6 +239,6 @@ best-effort 工程承诺。
 - 论文：<https://arxiv.org/abs/2608.25512>
 - 规范：[`spec/CORDIS-CORE.md`](../spec/CORDIS-CORE.md)（英文，CORE-001…051）
 - 使用指南：[`GUIDE.md`](GUIDE.md)
-- API 速查：[`API.md`](API.md)
+- API 速查：`cargo doc --open`（rustdoc）
 - 隔离承诺：[`KERNEL-ISOLATION.md`](KERNEL-ISOLATION.md)
 - Rust 移植笔记：[`CORDIS-RUST.md`](CORDIS-RUST.md)（英文）

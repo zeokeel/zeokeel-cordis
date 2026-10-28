@@ -1,3 +1,4 @@
+#![cfg(feature = "supervision")]
 //! L2 runtime defenses: capability introspection, per-fiber quotas and the
 //! cooperative watchdog/heartbeat API.
 

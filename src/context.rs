@@ -9,7 +9,9 @@ use serde_json::Value;
 
 use crate::async_effects::{AsyncCleanup, AsyncDisposer, AsyncEffect};
 use crate::config::ConfigSchema;
-use crate::effect::{cleanup, Disposer, Effect};
+#[cfg(feature = "supervision")]
+use crate::effect::cleanup;
+use crate::effect::{Disposer, Effect};
 use crate::error::{CordisError, Result};
 use crate::events::{AsyncListenerFn, ContextScope, EventOptions, EventResult, Events, ListenerFn};
 use crate::exec::{boxed, BoxFuture};
@@ -21,6 +23,7 @@ use crate::internal::{
     ConfigHook, DispatchHook, GetHook, ListenerHook, ListenerRequest, PluginHook, ServiceHook,
     SetHook, StatusHook, UpdateHook,
 };
+#[cfg(feature = "supervision")]
 use crate::l2::{FiberQuota, StalledFiber};
 use crate::logger::{LogExporter, LogLevel, Logger, LoggerService, LOGGER};
 use crate::reflect::{Accessor, ContextMeta};
@@ -595,6 +598,7 @@ impl Context {
     }
 
     /// Reserve one listener slot on this fiber (quota enforcement).
+    #[cfg(feature = "supervision")]
     fn reserve_listener(&self) -> Result<()> {
         let max = self.inner.registry.quota_limits().max_listeners;
         let mut fiber = self
@@ -614,6 +618,7 @@ impl Context {
 
     /// Own a newly registered listener: enforce the listener quota, wrap the
     /// disposer so the count is released on cleanup, and attach it to the fiber.
+    #[cfg(feature = "supervision")]
     fn register_listener_effect(
         &self,
         disposer: Disposer,
@@ -643,23 +648,39 @@ impl Context {
         }
     }
 
+    /// Without the `supervision` feature listeners are attached directly (no
+    /// quota bookkeeping in the core kernel).
+    #[cfg(not(feature = "supervision"))]
+    fn register_listener_effect(
+        &self,
+        disposer: Disposer,
+        label: &'static str,
+    ) -> Result<Disposer> {
+        self.register_effect_labeled(disposer.clone(), label)?;
+        Ok(disposer)
+    }
+
     /// Update the current fiber's watchdog activity timestamp.
+    #[cfg(feature = "supervision")]
     pub fn heartbeat(&self) {
         self.inner.fiber.heartbeat();
     }
 
     /// Set the per-fiber resource quota applied to the whole registry tree.
+    #[cfg(feature = "supervision")]
     pub fn set_quota(&self, quota: FiberQuota) {
         self.inner.registry.set_quota(quota);
     }
 
     /// Current per-fiber resource quota.
+    #[cfg(feature = "supervision")]
     pub fn quota(&self) -> FiberQuota {
         self.inner.registry.quota()
     }
 
     /// Fibers with work in flight that have been quiet for at least `timeout`
     /// (cooperative watchdog; see [`crate::IsolationCapabilities`]).
+    #[cfg(feature = "supervision")]
     pub fn stalled_fibers(&self, timeout: std::time::Duration) -> Vec<StalledFiber> {
         self.inner.registry.stalled_fibers(timeout)
     }
@@ -699,7 +720,10 @@ impl Context {
     }
 
     fn push_effect(&self, effect: FiberEffect) -> Result<()> {
+        #[cfg(feature = "supervision")]
         let max_effects = self.inner.registry.quota_limits().max_effects;
+        #[cfg(not(feature = "supervision"))]
+        let _max_effects: Option<usize> = None;
         let mut fiber = self
             .inner
             .fiber
@@ -709,6 +733,7 @@ impl Context {
         if fiber.state == FiberState::Disposed || fiber.state == FiberState::Unloading {
             return Err(CordisError::InactiveEffect);
         }
+        #[cfg(feature = "supervision")]
         if let Some(max) = max_effects {
             if fiber.effects.len() >= max {
                 return Err(CordisError::QuotaExceeded("effects".to_string()));
@@ -885,6 +910,7 @@ impl Context {
                 plugin.name()
             )));
         }
+        #[cfg(feature = "supervision")]
         if let Some(max) = self.inner.registry.quota_limits().max_child_fibers {
             let live_children = self
                 .inner

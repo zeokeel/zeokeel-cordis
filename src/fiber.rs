@@ -158,6 +158,7 @@ pub struct FiberData {
     /// Cooperative cancellation flag observed by `Context::checkpoint`.
     pub(crate) cancel_requested: AtomicBool,
     /// Live listeners registered on this fiber's behalf (quota accounting).
+    #[cfg_attr(not(feature = "supervision"), allow(dead_code))]
     pub(crate) listener_count: usize,
     /// Last observed activity (heartbeat / lifecycle operation), for watchdogs.
     pub(crate) last_activity: Mutex<std::time::Instant>,
@@ -314,11 +315,17 @@ impl Fiber {
     ///
     /// Long-running plugins should call `ctx.heartbeat()` periodically so an
     /// embedder watchdog can distinguish "busy" from "stuck".
+    #[cfg(feature = "supervision")]
     pub fn heartbeat(&self) {
-        touch_activity(&self.data);
+        if let Ok(fiber) = self.data.lock() {
+            if let Ok(mut at) = fiber.last_activity.lock() {
+                *at = std::time::Instant::now();
+            }
+        }
     }
 
     /// When this fiber last reported activity (lifecycle step or heartbeat).
+    #[cfg(feature = "supervision")]
     pub fn last_activity(&self) -> std::time::Instant {
         self.data
             .lock()
@@ -328,6 +335,7 @@ impl Fiber {
     }
 
     /// How long this fiber has been quiet.
+    #[cfg(feature = "supervision")]
     pub fn idle_for(&self) -> std::time::Duration {
         self.last_activity().elapsed()
     }
@@ -1648,14 +1656,6 @@ pub(crate) struct OperationGuard<'a> {
 impl Drop for OperationGuard<'_> {
     fn drop(&mut self) {
         end_operation(self.data);
-    }
-}
-
-fn touch_activity(data: &FiberRef) {
-    if let Ok(fiber) = data.lock() {
-        if let Ok(mut at) = fiber.last_activity.lock() {
-            *at = std::time::Instant::now();
-        }
     }
 }
 

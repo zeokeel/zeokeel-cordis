@@ -1155,34 +1155,9 @@ fn rt19_async_waterfall_panic_is_contained_and_stops_the_chain() {
     assert_kernel_usable(&root);
 }
 
-/// Register item 10g: a panicking `BlockingExecutor` must not abort the process
-/// (a cleanup panic during unwinding must not re-panic in `Drop`). Runs in a
-/// child process because v0.2 aborts the whole process here.
-#[test]
-fn rt20_panicking_blocking_executor_does_not_abort() {
-    let exe = env!("CARGO_BIN_EXE_redteam_probe");
-    let output = watchdog(
-        "rt20_panicking_blocking_executor_does_not_abort",
-        Duration::from_secs(60),
-        move || {
-            std::process::Command::new(exe)
-                .arg("blocking-executor-panic")
-                .output()
-        },
-    )
-    .expect("spawn redteam probe");
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        output.status.success(),
-        "PROCESS-ABORT: panic during blocking-executor disposal aborted the process (status {:?})\nstdout: {stdout}\nstderr: {stderr}",
-        output.status
-    );
-    assert!(
-        stdout.contains("VERDICT=OK"),
-        "probe did not finalize disposal after the executor panic:\nstdout: {stdout}\nstderr: {stderr}"
-    );
-}
+// (Removed: the process-level BlockingExecutor panic probe was a development
+// artifact; in-process panic containment is covered by the blocking-executor
+// tests in tests/async_conformance.rs.)
 
 // ---------------------------------------------------------------------------
 // 11. `Fiber::name()` must not call user code under the lock

@@ -14,6 +14,7 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "supervision")]
 use std::time::Duration;
 
 use serde_json::Value;
@@ -24,6 +25,7 @@ use crate::fiber::{
     activate_fiber, activate_fiber_async, dependencies_ready, dependencies_satisfied, unload_fiber,
     unload_fiber_async, Fiber, FiberState,
 };
+#[cfg(feature = "supervision")]
 use crate::l2::{FiberQuota, StalledFiber};
 
 static IDLE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -248,7 +250,9 @@ pub struct Registry {
     /// The root fiber (weak): it is not part of `fibers`, but its lifecycle
     /// operations count for quiescence.
     root_fiber: Mutex<Option<std::sync::Weak<Mutex<crate::fiber::FiberData>>>>,
-    /// Per-fiber resource limits enforced when resources are registered.
+    /// Per-fiber resource limits enforced when resources are registered
+    /// (only with the `supervision` feature; unlimited otherwise).
+    #[cfg(feature = "supervision")]
     quota: Mutex<FiberQuota>,
     /// Re-entrancy guard for the refresh fixed point: a dependent evaluation
     /// triggered from inside a refresh marks the registry dirty instead of
@@ -294,6 +298,15 @@ impl std::future::Future for IdleWait<'_> {
     }
 }
 
+/// Internal form of per-fiber limits (only with the `supervision` feature).
+#[cfg(feature = "supervision")]
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct QuotaLimits {
+    pub(crate) max_effects: Option<usize>,
+    pub(crate) max_listeners: Option<usize>,
+    pub(crate) max_child_fibers: Option<usize>,
+}
+
 /// Snapshot taken before a rebind so a rejected replace can be undone.
 struct RebindUndo {
     old_key: PluginKey,
@@ -315,6 +328,7 @@ impl Registry {
     }
 
     /// Set the per-fiber quota applied to every fiber in this registry.
+    #[cfg(feature = "supervision")]
     pub fn set_quota(&self, quota: FiberQuota) {
         if let Ok(mut slot) = self.quota.lock() {
             *slot = quota;
@@ -322,18 +336,27 @@ impl Registry {
     }
 
     /// Current per-fiber quota (unlimited by default).
+    #[cfg(feature = "supervision")]
     pub fn quota(&self) -> FiberQuota {
         self.quota.lock().map(|quota| *quota).unwrap_or_default()
     }
 
-    pub(crate) fn quota_limits(&self) -> FiberQuota {
-        self.quota()
+    /// Internal limits used by the enforcement hooks (`supervision` only).
+    #[cfg(feature = "supervision")]
+    pub(crate) fn quota_limits(&self) -> QuotaLimits {
+        let quota = self.quota();
+        QuotaLimits {
+            max_effects: quota.max_effects,
+            max_listeners: quota.max_listeners,
+            max_child_fibers: quota.max_child_fibers,
+        }
     }
 
     /// Fibers with a lifecycle operation in flight that have been quiet for at
     /// least `timeout`. This is the cooperative watchdog: the kernel never
     /// interrupts or kills the fiber, the embedder supervisor decides what to do
     /// (log, restart, cancel via `Fiber::cancel`, or isolate out-of-process).
+    #[cfg(feature = "supervision")]
     pub fn stalled_fibers(&self, timeout: Duration) -> Vec<StalledFiber> {
         let mut fibers = self
             .fibers

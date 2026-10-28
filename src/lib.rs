@@ -61,6 +61,7 @@ pub mod events;
 pub mod exec;
 pub mod fiber;
 pub mod internal;
+#[cfg(feature = "supervision")]
 pub mod l2;
 pub mod logger;
 pub mod reflect;
@@ -81,6 +82,7 @@ pub use internal::{
     InternalBus, ListenerHook, ListenerOverride, ListenerRequest, PluginHook, ServiceHook, SetHook,
     SetNext, StatusHook, UpdateHook, UpdateNext,
 };
+#[cfg(feature = "supervision")]
 pub use l2::{FiberQuota, IsolationCapabilities, StalledFiber};
 pub use logger::{LogExporter, LogLevel, LogRecord, Logger, LoggerService, TracingExporter};
 pub use reflect::{Accessor, AccessorGet, AccessorSet, ContextMeta};

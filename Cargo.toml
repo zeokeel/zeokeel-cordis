@@ -10,6 +10,13 @@ keywords = ["cordis", "plugin", "dependency-injection", "kernel"]
 categories = ["development-tools"]
 readme = "README.md"
 
+[features]
+default = []
+# Optional L2 supervision helpers (capability introspection, per-fiber quotas,
+# watchdog/heartbeat). The core kernel runs without this feature; enable it in
+# the embedder's supervisor binary.
+supervision = []
+
 # Strictest supported build configuration.
 # - panic=unwind is mandatory: panic containment is implemented with
 #   `catch_unwind` (see the compile-time guard in src/lib.rs).

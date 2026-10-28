@@ -130,7 +130,7 @@ RUSTFLAGS="-C panic=abort" cargo check --lib   # 必须失败
 > 但无法把栈溢出、OOM、死锁、无限循环、依赖 UB 变成编译错误。要做"插件崩溃绝不拖垮内核"，
 > 这些仍然必须在 L3 进程隔离或 L4 WASM 里解决。
 
-## 5.6 L2 已落地的 API（v0.3.0+）
+## 5.6 L2 可选 API（`supervision` feature，默认关闭，v0.3.0+）
 
 | 能力 | API | 说明 |
 |---|---|---|

@@ -707,55 +707,82 @@ fn c11_failing_child_does_not_fail_parent_and_is_reclaimed() {
 // 3. Nesting / recursion
 // ---------------------------------------------------------------------------
 
-/// Cross-loading (A loads B, B loads A) must be contained (one side
-/// Pending/Failed), not recurse forever. Runs in a subprocess because v0.3
-/// overflows the stack and aborts the process.
+/// Cross-loading (a plugin that keeps loading itself) must be contained by the
+/// loading-depth guard instead of overflowing the stack, in-process.
 #[test]
 fn c12_cross_loading_cycle_is_contained() {
     watchdog("c12", Duration::from_secs(30), || {
-        let probe = env!("CARGO_BIN_EXE_child_probe");
-        let output = std::process::Command::new(probe)
-            .arg("cycle")
-            .output()
-            .expect("spawn child probe");
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        struct Cycle;
+        impl Plugin for Cycle {
+            fn name(&self) -> &'static str {
+                "r5-cycle"
+            }
+            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+                ctx.plugin(Arc::new(Cycle), Value::Null)?;
+                Ok(())
+            }
+        }
+        let root = Context::root();
+        let _top = root.plugin(Arc::new(Cycle), Value::Null).expect("fiber");
+        // The depth-limited fiber fails; ancestors observe a Failed child and
+        // stay Active. The process must not overflow its stack.
+        let failed = root
+            .registry()
+            .fibers()
+            .into_iter()
+            .find(|fiber| fiber.state() == FiberState::Failed)
+            .expect("the loading-depth guard must fail one fiber");
+        let error = failed.error().unwrap_or_default();
         assert!(
-            output.status.success(),
-            "RECURSION-CYCLE: process aborted (status {:?}); stderr tail: {}",
-            output.status,
-            stderr.lines().rev().take(3).collect::<Vec<_>>().join(" | ")
+            error.contains("depth limit"),
+            "expected the loading-depth guard to reject the chain: {error}"
         );
-        assert!(
-            stdout.contains("CYCLE_SURVIVED"),
-            "cross-loading cycle was not contained: stdout={stdout} stderr={stderr}"
-        );
+        root.dispose_all().expect("cleanup");
+        assert_eq!(root.registry().fiber_count(), 0);
     });
 }
 
-/// Chains up to 1000 levels dispose in the subprocess (1000 measured OK; 1500
-/// overflows the default stack — see RESULTS).
+/// Deep (300-level) chains are rejected by the loading-depth guard instead of
+/// overflowing the stack, in-process (100-level chains still work: c05).
 #[test]
-fn c13_deep_chain_subprocess_1000_levels() {
+fn c13_deep_chain_is_contained() {
     watchdog("c13", Duration::from_secs(60), || {
-        let probe = env!("CARGO_BIN_EXE_child_probe");
-        for depth in [100usize, 1000] {
-            let output = std::process::Command::new(probe)
-                .arg("depth")
-                .arg(depth.to_string())
-                .output()
-                .expect("spawn child probe");
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.status.success(),
-                "depth {depth} aborted: status {:?}, stdout={stdout}",
-                output.status
-            );
-            assert!(
-                stdout.contains("RESULT=OK") && stdout.contains("registry=0"),
-                "depth {depth} did not dispose cleanly: {stdout}"
-            );
+        struct DeepChain {
+            remaining: usize,
         }
+        impl Plugin for DeepChain {
+            fn name(&self) -> &'static str {
+                "r5-deep-chain"
+            }
+            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+                if self.remaining > 0 {
+                    ctx.plugin(
+                        Arc::new(DeepChain {
+                            remaining: self.remaining - 1,
+                        }),
+                        Value::Null,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+        let root = Context::root();
+        let _top = root
+            .plugin(Arc::new(DeepChain { remaining: 300 }), Value::Null)
+            .expect("fiber");
+        let failed = root
+            .registry()
+            .fibers()
+            .into_iter()
+            .find(|fiber| fiber.state() == FiberState::Failed)
+            .expect("300-level chain must be rejected by the depth guard");
+        assert!(
+            failed.error().unwrap_or_default().contains("depth limit"),
+            "unexpected failure: {:?}",
+            failed.error()
+        );
+        root.dispose_all().expect("cleanup");
+        assert_eq!(root.registry().fiber_count(), 0);
     });
 }
 

@@ -58,6 +58,10 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test
         run: cargo test
+      - name: test (supervision feature)
+        run: cargo test --features supervision
+      - name: clippy (supervision feature)
+        run: cargo clippy --all-targets --features supervision -- -D warnings
       - name: doc
         env:
           RUSTDOCFLAGS: -D warnings

@@ -5,7 +5,7 @@
 
 - 版本：v0.3.0（Rust 1.85+，edition 2021）
 - 规范：[`spec/CORDIS-CORE.md`](../spec/CORDIS-CORE.md)（英文，编号用例）
-- 设计：[`DESIGN.md`](DESIGN.md)、API 速查：[`API.md`](API.md)
+- 设计：[`DESIGN.md`](DESIGN.md)；API 速查：`cargo doc --open`
 
 ---
 
@@ -681,7 +681,7 @@ A：不能，内核没有 ABI/动态加载（见「已知限制」）。需要�
 
 ---
 
-## 19. L2 运行时防线（配额、心跳、能力自省）
+## 19. 可选 L2 防线（`supervision` feature：配额、心跳、能力自省）
 
 ```rust
 use std::time::Duration;
@@ -719,7 +719,7 @@ for stalled in root.stalled_fibers(Duration::from_secs(5)) {
 ## 延伸阅读
 
 - 设计思想：[`DESIGN.md`](DESIGN.md)
-- API 速查：[`API.md`](API.md)
+- API 速查：`cargo doc --open`
 - 规范（英文）：[`spec/CORDIS-CORE.md`](../spec/CORDIS-CORE.md)
 - 隔离承诺：[`KERNEL-ISOLATION.md`](KERNEL-ISOLATION.md)
 - 可运行示例：[`examples/`](../examples/)
