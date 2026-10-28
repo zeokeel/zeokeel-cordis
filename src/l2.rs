@@ -7,7 +7,7 @@
 //! - [`IsolationCapabilities`] reports what this build can and cannot contain;
 //! - [`FiberQuota`] bounds the resources one fiber may register (effects,
 //!   listeners, child fibers) so a runaway plugin cannot exhaust the process;
-//! - heartbeat/watchdog helpers ([`Fiber::heartbeat`], [`crate::Registry::stalled_fibers`])
+//! - heartbeat/watchdog helpers ([`crate::Fiber::heartbeat`], [`crate::Registry::stalled_fibers`])
 //!   let an embedder supervisor observe long-running or stuck operations without
 //!   the kernel ever force-killing a thread.
 //!

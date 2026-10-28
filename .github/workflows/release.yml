@@ -33,6 +33,12 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps
+      # docs.rs renders with all features enabled; refuse to publish docs that
+      # only look right in the default-feature configuration.
+      - name: doc (all features)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features
       - name: verify package
         run: cargo package --list
       - name: publish

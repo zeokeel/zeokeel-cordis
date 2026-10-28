@@ -66,6 +66,13 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps
+      # docs.rs builds with every feature ([package.metadata.docs.rs]
+      # all-features = true), so the rendered docs must be warning-free in that
+      # configuration too.
+      - name: doc (all features)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features
       - name: release build (overflow-checks)
         run: cargo build --release
       - name: panic=abort is rejected at compile time
