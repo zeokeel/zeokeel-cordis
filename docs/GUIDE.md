@@ -3,7 +3,7 @@
 从零开始：安装、写插件、注册服务、处理依赖、管理生命周期、做测试。本文所有示例都对应
 [`examples/`](../examples/) 下的可运行代码，建议边读边跑。
 
-- 版本：v0.4.1（Rust 1.85+，edition 2021）
+- 版本：v0.4.2（Rust 1.85+，edition 2021）
 - 规范：[`spec/CORDIS-CORE.md`](../spec/CORDIS-CORE.md)（英文，编号用例）
 - 设计：[`DESIGN.md`](DESIGN.md)；API 速查：`cargo doc --open`
 
@@ -29,20 +29,25 @@
 16. [测试建议](#16-测试建议)
 17. [错误速查](#17-错误速查)
 18. [FAQ 与常见坑](#18-faq-与常见坑)
+19. [可选 L2 防线（supervision）](#19-可选-l2-防线supervision-feature配额心跳能力自省)
 
 ---
 
 ## 1. 安装
 
+```bash
+cargo add zeokeel-cordis
+```
+
 ```toml
 [dependencies]
-zeokeel-cordis = "0.4.1"
+zeokeel-cordis = "0.4.2"
 serde_json = "1"   # 插件配置用 serde_json::Value
 ```
 
 > crates.io 包名 `zeokeel-cordis` 与库目标名 `zeokeel_cordis` 一致：代码里统一 `use zeokeel_cordis::...`；
 > 需要跟仓库最新代码时可用 git 依赖：
-> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.4.1" }`。
+> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.4.2" }`。
 
 - MSRV：Rust **1.85+**
 - 同步宿主不需要异步运行时；异步宿主可选 tokio，但内核本身不依赖 tokio
@@ -117,7 +122,7 @@ let b = root.clone();    // 同一个作用域的句柄（共享 isolate 映射�
 
 ```rust
 use std::sync::Arc;
-use zeokeel_cordis::{ConfigSchema, Context, Plugin, Result};
+use zeokeel_cordis::{ConfigSchema, Context, JsonConfigSchema, JsonType, Plugin, Result};
 use serde_json::Value;
 
 struct HttpPlugin;
@@ -131,7 +136,13 @@ impl Plugin for HttpPlugin {
             JsonConfigSchema::new()
                 .required("port")
                 .property("port", JsonType::Number)
-                .default_value("host", serde_json::json!("127.0.0.1")),
+                .default_value("host", serde_json::json!("127.0.0.1"))
+                // v0.4.2：null 默认值不声明类型。
+                // 未声明类型 → 缺省注入 null（该字段不做类型检查）
+                .default_value("proxy", Value::Null)
+                // 已显式声明类型 → 缺省不注入（可选字段保持 absent；有值时按类型校验）
+                .property("tls", JsonType::Object)
+                .default_value("tls", Value::Null),
         ))
     }
 
@@ -243,8 +254,12 @@ impl Plugin for Uptime {
 
 - 依赖不满足时 fiber 停在 **Pending**，`apply` 不会执行；
 - 提供者出现后自动 `Loading → Active`；
+- **注入门是严格查询（v0.4.2）**：提供者 fiber 必须是 `Active`（`apply` 已返回）才算满足依赖；
+  accessor / `internal/get` 虚拟服务只对 `ctx.get` 可见，永远不满足 `inject`；
 - 提供者撤销/替换时，依赖方会自动重新求值（卸载回 Pending，或重启）；
-- 依赖闭环是固定点刷新，带重入保护，不会无限递归。
+- 依赖闭环是**有界固定点刷新**：最多 64 轮，每轮按 registry 快照顺序推进；正序依赖链
+  （提供者先注册）一轮即可全部激活，逆序链约每轮前进一层——依赖链极深时可能需要多次
+  `ctx.refresh()` 才能完全稳定，且带重入保护不会无限递归。
 
 ### 5.2 依赖变化
 
@@ -311,7 +326,9 @@ ctx.effect_stream(stream, "consumer")?;
 - 清理按**注册的逆序**执行；
 - 同步与异步清理共享同一条顺序（不会出现「异步的提前跑」）；
 - 每个 `Disposer` 单次、幂等，重复 dispose 安全；
-- 清理函数 panic 会被隔离（记日志，继续执行后面的清理）。
+- 清理函数 panic 会被记录并继续执行后面的清理，收尾完成后**首个 panic 重抛**给
+  `dispose()`/`dispose_async()` 的调用方（CORE-030）。由 refresh/retire 路径触发的
+  卸载会把这类 panic 记录后**遏制**，避免 provider 卡在 `Unloading`（v0.4.2）。
 
 ### 6.3 所有权窗口
 
@@ -379,8 +396,10 @@ let out = ctx.waterfall(
 ```
 
 - `next.remaining()` 查询剩余中间件数量，`next.terminal()` 跳过剩余直接执行终端；
-- 不调用 `next` 就等于否决整条链（包括终端行为）；
-- 中间件 panic 会中止整条 waterfall 并向上抛出（fail-closed，不静默放行）。
+- 不调用 `next` 就等于否决整条链（包括终端行为）——waterfall lane **没有 `Bail` 语义**，
+  `EventResult::Bail` 只属于 `emit`/`bail`/`serial_async` 这条监听器路线；
+- 中间件 panic 会中止整条 waterfall 并把 panic 重抛给调用方（fail-closed，不静默放行）；
+  **sync 与 async lane 一致**（v0.4.2 起 `waterfall_async` 也 re-raise，不再吞成 `Null`）。
 
 waterfall 是显式 `next` 的中间件链：不调用 `next` 就等于否决后续（包括终端行为）。
 异步版本用 `on_waterfall_async` + `waterfall_async`。
@@ -440,7 +459,15 @@ impl BlockingExecutor for MyExecutor {
 set_blocking_executor(Arc::new(MyExecutor)); // 首次安装生效
 ```
 
-- `exec::block_on` / `yield_now`：内核自带的极简 executor，适合测试与非异步宿主。
+- `exec::block_on` / `yield_now`：内核自带的极简 executor，适合测试与非异步宿主；
+- `AsyncDisposer::dispose_blocking`（在同步代码里等待异步清理）v0.4.2 起会真正 **join**
+  在飞清理：即使另一个调用者已经接管了 disposer，也会等到清理完成才返回；被取消的 teardown
+  会被重试（S-1），而在同一个 disposer 的 cleanup 内调用它自己的 `dispose_blocking()` 会
+  立即返回（自 join 短路，S-2，避免自等死锁）。
+- **取消 async 生命周期**（drop `dispose_async`/`refresh_async` 的 future）v0.4.2 起会把
+  unload **做完**而不是恢复旧状态：同步 cleanup 立即执行、异步 cleanup 转入 deferred 由
+  下一次 dispose 收尾，fiber 落到 `Pending`/`Disposed`（A-9）；取消
+  `AsyncDisposer::dispose` 则恢复未启动 cleanup、由下次 dispose 重试（S-1）——两种粒度不同。
 
 ---
 
@@ -472,7 +499,7 @@ let root = Context::root();
 let plain = root.extend();              // 共享父作用域
 let scoped = root.isolate("db");        // 名为 db 的服务/事件在子树内独立
 let labeled = root.isolate_labeled("db", "tenant-a"); // 相同 label 的子树共享
-let intercepted = root.intercept("http", json!({ "port": 9000 })); // 覆盖配置
+let intercepted = root.intercept("logger", json!({ "level": "debug" })); // 覆盖 logger 配置
 ```
 
 规则：
@@ -482,7 +509,12 @@ let intercepted = root.intercept("http", json!({ "port": 9000 })); // 覆盖配�
 | `extend` | 继承父 | 继承父 |
 | `isolate(name)` | `name` 对应的服务在子树内新 scope | 事件派发按 isolate 映射过滤 |
 | `isolate_labeled(name, label)` | 同 label 的子作用域共享 scope | 同 label 之间事件互通 |
-| `intercept` | 不影响服务，覆盖配置解析链 | 无影响 |
+| `intercept` | 不影响服务，只覆盖 `Context::resolve_config` 的配置解析链 | 无影响 |
+
+`intercept` 只作用于走 `Context::resolve_config` 的配置：内置 `logger`（`logger` 配置名）
+与实现了 `Service::resolve_config` 的服务；**插件配置不走这条链**（插件配置来自
+`ctx.plugin` 传入值 + `internal/config` waterfall + schema），因此用
+`root.intercept("http", …)` 并不会覆盖某个 `http` 插件的配置（v0.4.2 明确）。
 
 注意：事件作用域过滤是「**映射相等**」，不是「自己的子树」。如果需要子树内广播，
 使用该子树自己的 `ctx.emit`（派发上下文 = 该子树作用域）。
@@ -506,11 +538,22 @@ let fibers = root.registry().replace(
 ```
 
 - `restart` / `update` / `dispose` 是**阻塞边界**：在异步宿主里优先用 `*_async` 变体；
-- 生命周期操作互斥，跨线程并发会得到 `LifecycleBusy`；
-- `update` 的配置会被校验，然后作为下一轮激活的 raw config（重新解析一次，不叠加）；
-  `internal/update` hook 替换出的配置也会在 `update` 返回前用 schema 校验，非法则返回 `Validation`
-  并恢复旧 raw config、不重启（v0.3.0 起）；
-- `Registry::replace` 是原子的：任一 fiber 拒绝 reload 时整体回滚；
+- 生命周期操作互斥，跨线程并发会得到 `LifecycleBusy`；`Fiber::replace_plugin` 也占用同一把
+  生命周期槽（v0.4.2）；
+- `update` 的顺序是：`internal/config` → schema 校验 → `internal/update`，只有 waterfall
+  终端才会保存新 raw config 并重启（v0.4.2）：
+  - 校验失败返回 `Validation`，不重启、不改 raw config；
+  - hook 返回的替换配置会先校验，再成为下一轮激活的 raw config（重新解析一次，不叠加）；
+  - hook 不调用 `next` 视为**否决**：`update` 返回 `Ok(())`，不重启、raw config 不变；
+  - 公开入口：`fiber.update(config)`（等价 `no_save = false`）与
+    `fiber.update_with_no_save(config, no_save)`；异步版 `update_async` /
+    `update_async_with_no_save`。`no_save` 只是沿 `internal/update` 链传给 hook 的
+    **持久化提示**（Cordis `update(config, noSave)`）：内核不会因为 `no_save` 跳过内存
+    raw config 更新——成功的（未被否决的）update 始终保留新 raw config 并重启（与 TS 一致）；
+- `Registry::replace` 失败时会把已切换的 fiber 用旧 plugin 重新加载回滚，整体保持一致；
+  回滚本身失败返回 `CordisError::Rollback`（v0.4.2）；
+- reload 期间旧实现的 cleanup panic **不会**再穿出 `replace`/`replace_plugin`：被遏制为
+  `Err(CordisError::PluginFailed("… reload panicked: …"))` 并触发上述回滚（v0.4.2）；
 - disposed fiber 不能重启（Disposed 是终态）。
 
 ---
@@ -523,9 +566,14 @@ let fibers = root.registry().replace(
 root.dispose_all()?; // 逐个 dispose 所有 fiber + 根 fiber，收集首个错误但继续尝试
 ```
 
-- 即使某个清理 panic，也会尝试完所有 fiber 再抛出（CORE-051）；
+- 即使某个清理 panic，也会尝试完所有 fiber 再抛出（CORE-051）；若同时还有其它 fiber 返回
+  `Err`，**panic 优先**：错误只记日志、首个 panic 重抛（v0.4.2）；
 - 关闭后 registry 为空、`is_idle()` 为 true；
-- **未 dispose 的 fiber 会保留整棵图**（约 9 KB/boot 实测），宿主退出时务必调用 `dispose_all`。
+- **未 dispose 的 fiber 会保留整棵图**，宿主退出时务必调用 `dispose_all`；
+- **极深依赖链请分层/分批 dispose**：依赖链 unload 走递归（栈深度≈链层数），2 MiB worker
+  栈上 debug 约 480 层 / release 约 2200 层就会栈溢出 abort（不可捕获；0.4.1 同型，
+  0.4.2 未修）。数百~数千层的依赖图请拆成多棵浅树或逐批 `dispose()`，不要依赖单次顶层
+  `dispose_all` 完成全部回收。
 
 ### 12.2 静默检测
 
@@ -537,7 +585,14 @@ let idle: bool = root.registry().is_idle();
 root.when_idle().await; // 配合 `block_on` 用于同步代码
 ```
 
-适合：关闭前等待、测试断言、supervisor 的健康检查。
+适合：关闭前等待、测试断言、supervisor 的健康检查。v0.4.2 起 `ctx.plugin*` 的
+**注册→激活窗口**（含 `internal/plugin` create hook 到激活完成）都计入 in-flight，
+`is_idle()`/`when_idle` 不会在插件还在创建/激活时提前返回。
+
+> **注意（v0.4.2 可观察变化）**：不要在该注册窗口（典型是 `internal/plugin` create hook）
+> 内**同步等待** `when_idle()`——guard 由发起注册的调用者持有，同步等待会**自我死锁**；
+> 0.4.1 在该窗口会立即返回。同理 create hook 内 `fiber.await_settled()` 会立即 `Ok(())`
+> （fiber 仍是 `Pending`），`stalled_fibers()` 也看不到该窗口。需要等待请从 hook 外部进行。
 
 ---
 
@@ -566,17 +621,26 @@ for chunk in work {
 ## 14. 日志
 
 ```rust
+use std::sync::Arc;
+
+use zeokeel_cordis::TracingExporter;
+
 let logger = ctx.logger();                 // 当前 fiber 命名的 logger
 logger.info("hello", Value::Null);          // 级别：error/warn/info/debug；第二参是结构化字段
 logger.warn("slow", serde_json::json!({ "ms": 120 }));
 let service = ctx.logger_service();        // 全局日志服务（可 set_level）
 let named = ctx.logger_named("http");      // 命名 logger
 
-// 导出日志（例如转到 tracing）
+// 安装导出器后日志才会离开 ring buffer（例如转到 tracing）
 let disposer = ctx.log_exporter(Arc::new(TracingExporter))?;
 ```
 
-- 根上下文自带 Logger 服务；日志通过 tracing 输出；
+- 根上下文自带 Logger 服务，但**默认没有安装任何 exporter**：记录只写入内建 ring buffer
+  （容量 1000，可用 `LoggerService::records()` 读取），不会自动打印到终端、也不会进入
+  `tracing`（内核自身的 `tracing` 诊断日志是另一条独立通道）；
+- 需要输出时用 `ctx.log_exporter(Arc::new(TracingExporter))` 安装导出器（`TracingExporter`
+  把记录转发给 `tracing`，由宿主自己的 subscriber 决定落盘/打印）；也可以实现
+  `LogExporter` 自定义导出；
 - `LoggerService::set_level` 可在运行时调级；
 - 导出器 panic 会被隔离（记录后继续）。
 
@@ -594,6 +658,13 @@ ctx.on_internal_plugin(Arc::new(|fiber: &Fiber| {
 ctx.on_internal_config(Arc::new(|fiber: &Fiber, config: Value, next: &ConfigNext| {
     let resolved = next.next(config);
     resolved
+}))?;
+
+// internal/update：hook 不调 next 则否决整个 update；no_save 是持久化提示
+// （来自 update_with_no_save / update_async_with_no_save，update 等价 no_save=false；
+//  内核成功 update 始终保留新 raw config，不会因 no_save 跳过存储）
+ctx.on_internal_update(Arc::new(|_fiber: &Fiber, config: Value, no_save: bool, next: &UpdateNext| {
+    next.next(config, no_save);
 }))?;
 
 // 服务/配置/更新/get/set/监听器/派发 都有对应 typed hook
@@ -615,8 +686,19 @@ for fiber in root.registry().fibers() {
 }
 ```
 
+> `keys()`/`values()`/`size()`/`fiber_count()`/`fibers()` 各自只锁一个结构：并发生命周期
+> 操作进行中，跨调用的结果可能**瞬时不一致**（例如 `keys()` 还列着 `size()` 已不计的
+> runtime）。它们是**诊断快照**，不是事务视图；需要一致视图时先 `when_idle()`。
+
 内部钩子是「中间件式」的 typed 通道（不是字符串事件），适合宿主集成：审计、每插件限流、
 配置来源注入、加载拦截等。
+
+> **v0.4.2 注意（注册窗口）**：`ctx.plugin*` 的注册→激活窗口计入 in-flight，而
+> `internal/plugin` create hook 正是在该窗口内执行。**不要在 create hook 内同步等待**
+> `when_idle()`：guard 由发起注册的调用者持有，会自我死锁（0.4.1 会立即返回）；
+> `is_idle()` 不阻塞，但在该窗口只返回 `false`。
+> 同理，create hook 里拿到的 fiber 仍是 `Pending`：`fiber.await_settled()` 立即返回
+> `Ok(())`，`stalled_fibers()` 也看不到该窗口；需要等待请从注册调用之外进行。
 
 ---
 
@@ -648,14 +730,16 @@ fn plugin_activation_and_cleanup() {
 | `DuplicateService(name)` | 同一作用域重复提供同名服务 | 用 `isolate` 或先撤销旧服务 |
 | `UnknownService(name)` | `require` 的服务不存在 | 检查 `inject`/提供者 |
 | `InvalidPlugin(msg)` | 插件非法（名称/层级/替换目标） | 见消息 |
-| `PluginFailed(msg)` | 激活失败（`apply` 返回 Err） | 看 `fiber.error()` |
+| `PluginFailed(msg)` | 激活失败（`apply` 返回 Err），或 replace/reload 的 panic 被遏制（v0.4.2；msg 含 `reload panicked`） | 看 `fiber.error()` / msg |
 | `Disposed` | fiber/上下文已销毁 | 不要复用已 dispose 的句柄 |
 | `Validation(err)` | 配置 schema 校验失败 | 修正配置或 schema |
 | `ServiceWriteForbidden(name)` | 试图 `set` 别人提供的服务 | 通过提供者 API 修改 |
+| `ServiceTypeMismatch(name)` | `set`/`set_any` 写入的值类型与已注册服务不一致（v0.4.2）| 用正确类型写入；要换类型需先撤销旧服务 |
 | `AccessorReadOnly(name)` | 对只读计算访问器调 `set` | 改用可写 key |
 | `AsyncPluginNeedsAsync(name)` | 对异步插件用了同步生命周期 API | 改用 `*_async` |
 | `Cancelled` | 协作 checkpoint 观察到取消 | 正常退出/清理 |
 | `LifecycleBusy` | 同 fiber 生命周期操作被其他线程占用 | 重试或串行化 |
+| `Rollback(msg)` | `Registry::replace` 的回滚未完全成功（v0.4.2）| 消息含原始错误与回滚错误；必要时手动重建 |
 
 ---
 
@@ -664,12 +748,23 @@ fn plugin_activation_and_cleanup() {
 **Q：为什么 `ctx.set` 改不了别人提供的服务？**
 A：服务归提供者 fiber 所有，`set` 只允许修改当前 fiber 自己提供的服务；跨组件修改应通过服务自身 API。
 
+**Q：为什么 `ctx.set` 返回 `ServiceTypeMismatch`？**
+A：v0.4.2 起 `set`/`set_any` 会用 `TypeId` 校验类型，写入值必须与已注册服务的类型一致；
+类型不同不会覆盖成功，原服务保持不变。要更换类型请先撤销旧服务再 `provide`。
+
+**Q：为什么日志一条都看不到？**
+A：根上下文只注册了 Logger 服务、**默认没有 exporter**，记录只进 ring buffer。
+用 `ctx.log_exporter(Arc::new(TracingExporter))` 安装导出器后才会输出到 `tracing`
+（再由宿主的 subscriber 决定打印/落盘）。
+
 **Q：为什么 `fiber.dispose()` 在 tokio 里会卡住/死锁？**
 A：同步生命周期是阻塞边界。改用 `dispose_async().await`，或在非 async 线程调用，
 或安装 `exec::set_blocking_executor`。
 
 **Q：插件为什么一直 Pending？**
-A：`inject` 声明的依赖没有满足（服务名拼写、作用域隔离、provider 还没加载）。
+A：`inject` 声明的依赖没有满足（服务名拼写、作用域隔离、provider 还没加载）。v0.4.2 起注入门
+是严格查询：provider fiber 必须已经 `Active`；accessor 与 `internal/get` 虚拟服务只对
+`ctx.get` 可见，不参与 `inject`。
 
 **Q：为什么子插件没随父卸载？**
 A：只有通过 `ctx.plugin(...)` 加载的子 fiber 才是父的 effect；手动构造的 fiber 需要自己 dispose。

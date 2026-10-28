@@ -160,7 +160,7 @@ Pending ──(依赖满足)──► Loading ──(apply 成功)──► Acti
 | --- | --- | --- |
 | I1 | effect 逆序、单次清理；fiber 卸载后不残留服务/监听器 | CORE-020、CORE-046 |
 | I2 | 激活失败必须回滚已注册的一切 | CORE-026、CORE-027 |
-| I3 | panic 不跨越内核边界：apply/cleanup/listener/hook/schema/exporter 逐个隔离 | CORE-028、CORE-030 |
+| I3 | panic 不跨越内核边界：apply/cleanup/listener/hook/schema/exporter 逐个隔离（waterfall 中间件例外：fail-closed，panic 中止链并重抛） | CORE-028、CORE-030 |
 | I4 | 依赖变化驱动激活/停用与重算 | CORE-015、CORE-025、CORE-040 |
 | I5 | 服务身份由 `(scope, name)` 唯一确定，类型错误必须报错而不是 UB | CORE-005、CORE-019 |
 | I6 | `ctx.set` 只允许修改自己的服务；撤销按注册逆序 | CORE-041 |
@@ -182,6 +182,8 @@ TypeScript 的 Cordis 用 `ctx.serviceName` 属性访问，依赖运行时 Proxy
 - 服务用 `ServiceKey<T>` 显式声明；`T: ?Sized + Send + Sync + 'static` 同时支持具体类型与 trait object；
 - 具体类型服务直接 `Arc<T>`，trait object 服务用 `provide_any/get_any/require_any/set_any`
   包装（`Arc<dyn Trait>` 无法安全地向上转成 `Arc<dyn Any>`）；
+- `ctx.set`/`set_any` 用 `TypeId` 校验写入值的类型，不匹配返回
+  `CordisError::ServiceTypeMismatch`（v0.4.2 落实 I5：类型错误必须报错，而不是静默覆盖）；
 - 好处：**编译期类型安全**、零反射、零全局类型名冲突；代价：写法略啰嗦（`ServiceKey` 常量）。
 
 ### 6.2 同步与异步是两条明确通道
@@ -199,8 +201,9 @@ Rust 没有 `Promise` 的隐式调度，所以内核不「偷偷」把同步调�
 Rust 的 `panic=unwind` 提供了一种**进程内**的故障遏制手段，但仅限 unwinding panic。
 因此内核对每类用户代码（apply、cleanup、listener、internal hook、schema、exporter、accessor）
 做 `catch_unwind` + 记日志，并**明确列出无法遏制的情况**（abort、栈溢出、OOM、UB、死循环、外部 kill），
-详见 [KERNEL-ISOLATION.md](KERNEL-ISOLATION.md)。这不是「沙箱」，而是「插件错误不拖垮内核」的
-best-effort 工程承诺。
+详见 [KERNEL-ISOLATION.md](KERNEL-ISOLATION.md)。**waterfall 中间件是唯一例外**：其 panic
+按 fail-closed 语义中止链并重抛给调用方（sync/async 一致），绝不"panic 后放行"。
+这不是「沙箱」，而是「插件错误不拖垮内核」的 best-effort 工程承诺。
 
 ### 6.4 静态链接、无 ABI、无 unsafe
 

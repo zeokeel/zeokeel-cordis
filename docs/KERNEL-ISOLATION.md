@@ -5,7 +5,7 @@
 > 下面 L2–L4 只是写给 embedder 的**建议方案**（在 crate 之外实现），不是本 crate 的
 > 实现范围。内核自身只承诺 §3 所列的 in-process fault containment。
 
-> 适用版本：v0.2.0 基线 + `fix/kernel-hardening-v0.3` 分支的 fault-containment 修复。
+> 适用版本：v0.4.2（v0.2.0 基线 + v0.3.0 加固 + v0.4.2 的遏制/语义修正）。
 > 本文回答一个问题：**"插件崩溃会不会拖垮内核？"** 答案分两半——**可捕获的 panic
 > 不会；Rust 进程内不可恢复的故障会**。本文给出实测证据、我们据此作出的承诺，以及
 > 要做到"Linux 内核级"所必需的外层隔离方案。
@@ -14,7 +14,8 @@
 
 Cordis 在进程内提供的是 **unwinding panic 的故障遏制（fault containment）**，不是沙箱
 （sandbox）。在 `panic = "unwind"` 且插件不主动 abort/不越界（见 §4）的前提下，一个插件
-的 panic 只会让它自己的 fiber 回滚/失败，其它插件与内核继续运行；但 `panic="abort"`、
+的 panic 只会让它自己的 fiber 回滚/失败，其它插件与内核继续运行（**waterfall 中间件是
+唯一例外**：按 fail-closed 语义中止链并重抛给调用者，见 §3 第 5 条）；但 `panic="abort"`、
 栈溢出、OOM、`process::abort()`、插件 `unsafe` UB、死循环/死锁、线程/fd 泄漏等
 **进程内无法隔离**，会杀死或卡死整个进程。要把不可信插件做成"Linux 模块级"的可靠性，
 必须使用**进程隔离（L3）**或 **WASM 沙箱（L4）**。
@@ -41,26 +42,72 @@ Cordis 在进程内提供的是 **unwinding panic 的故障遏制（fault contai
 
 > 数据来源：`target/scratch/redteam-isolation/REPORT.md` 与 `run.log`（exit code：
 > 134=abort/栈溢出/OOM，137=外部 SIGKILL，139=UB SIGSEGV，0=可捕获）。
+> 表中第 12–15 行记录的是 v0.2.0 当时的在途状态；v0.3.0+ 的遏制策略以 §3 为准
+> （v0.4.2 进一步把 sync/async waterfall 的 panic 策略统一为 fail-closed re-raise）。
 
 ## 3. 我们能承诺什么（写进 README/spec 的措辞）
 
 **能承诺**（L1，`panic=unwind`，插件遵守 §4 契约）：
 
 1. 内核**调用**的插件回调（`apply`/`apply_async`、effect body 之外的 cleanup、
-   listener、waterfall、internal hook、exporter、accessor、schema）中的 unwinding panic
+   listener、internal hook、exporter、accessor、schema）中的 unwinding panic
    被遏制：该调用失败/被跳过并记录日志，不会 unwind 穿出内核公共 API。
 2. 激活失败（Err 或 panic）**回滚**该 fiber 已注册的 effect/service/listener，fiber 进入
    `Failed`，不污染依赖方（provider 的 service 随回滚移除）。
 3. 一个 fiber 的失败/处置不改变其它 fiber 的状态；dispose 的清理按逆序全量执行，清理
-   panic 在**收尾完成后**才重抛给定调用者。
+   panic 在**收尾完成后**才重抛给定调用者。0.4.2 起，由 refresh/retire 路径触发的
+   依赖方卸载会把 panic **记录并遏制**（provider 不会卡在 `Unloading`），而直接调用
+   `Fiber::dispose()` 仍按上述契约重抛。
 4. 当 `panic=unwind` 时，**插件代码中的 `panic!` 不杀死进程**（测试用例：`hardening::
    panicking_apply_is_isolated_and_rolled_back`、`containment::*`）。
+5. **waterfall 中间件是唯一的例外**：其 panic 会中止整条中间件链（终端行为不执行）
+   并**重抛给调用者**（fail-closed，绝不"panic 后放行"）；sync 与 async lane 一致
+   （0.4.2 起 async 也 re-raise，不再吞成 `Value::Null`）。在激活路径内调用时，它表现为
+   该 fiber 的激活失败并按第 2 条回滚。
+6. **替换/重载的 reload panic 被遏制为错误**（v0.4.2）：`Registry::replace` /
+   `replace_async` / `Fiber::replace_plugin(_async)` 的 reload 会 drain 旧实现的 cleanup
+   （embedder 代码）。cleanup panic 现在被捕获并转成
+   `Err(CordisError::PluginFailed("<op>: reload panicked: …"))`，随后执行完整回滚
+   （`Registry` 路径把已 reload 的 fiber 用旧实现重新加载，单 fiber 路径恢复旧
+   plugin/runtime）；`Registry` 路径上只有**回滚自身失败**才返回
+   `CordisError::Rollback`。调用方不再收到 panic。
+7. **取消语义按粒度区分（v0.4.2：S-1/S-2 + A-9）**：
+   - **`AsyncDisposer` 句柄**（单个 effect 的 async cleanup 批次）：`AsyncDisposer::dispose`
+     的 future 被 drop 时，未启动的 cleanup 会被恢复；下一次 `dispose()` /
+     `dispose_blocking()`（含 `Fiber::dispose()` 的同步安全网）会重新取得 teardown 并
+     **按原逆序重试**（S-1）。同一 disposer 的 cleanup 内调用它自己的
+     `dispose_blocking()` 会**立即返回**（自 join 短路，避免自等死锁；0.4.1 同行为），
+     而跨线程/其它 disposer 的调用仍会阻塞到 teardown 真正结束（S-2）；在 cleanup 内 `await` 自己的 `AsyncDisposer::dispose` 同样短路（R2-1，drain-frame 判据，不会误伤同线程的独立 joiner）。
+   - **fiber 级 unload**（`dispose_async` / `refresh_async`）：future 被 drop 时现在会
+     **把 unload 做完**而不是恢复旧状态（A-9）：同步 cleanup 立即执行，异步 cleanup 进入
+     fiber 的 deferred 列表、由下一次 dispose/drain 收尾，`finish_unload` 落到目标态
+     （重载/依赖触发的 unload → `Pending`，dispose → `Disposed`）并 `remove_owner`/notify idle
+     ——不会再出现永久 `Unloading` 或假 `Active` 的半拆解态。
+
+**panic 遏制矩阵（v0.4.2）**
+
+| 边界 | 行为 |
+|---|---|
+| `apply`/`apply_async` panic | 遏制：激活失败 + 回滚，fiber `Failed`（CORE-028/029） |
+| 直接调用 `dispose`/`dispose_async` 时的 cleanup panic | 收尾完成后重抛首个 panic（CORE-030/011） |
+| 由 refresh/retire 路径触发的依赖方 unload panic | 记录并遏制；provider 仍到达目标态（0.4.2） |
+| 父 fiber sweep 子 fiber 时的 panic | 逐子遏制、继续 sweep，父落目标态后重抛首个 payload（0.4.2） |
+| `Registry::replace` / `replace_plugin` 的 reload panic | 遏制为 `Err(PluginFailed("… reload panicked: …"))` + 回滚；回滚失败才 `Rollback`（0.4.2） |
+| listener / internal hook / exporter / accessor / schema / availability check | 记录后遏制，各自回退（继续 dispatch、跳过、视为 absent/unavailable 等） |
+| waterfall 中间件 panic | **中止整条链并重抛**（fail-closed，唯一例外；两 lane 一致） |
+| `dispose_all` 同时有 Err 与 panic | panic 优先：记录 error 后重抛首个 payload（0.4.2） |
+| `Drop` 中的 cleanup panic | 记录/尽力清理；unwind 期间的双 panic 会 abort（见下） |
 
 **不能承诺**（进程内物理上做不到）：
 
 - `panic=abort` / `-C panic=abort` 构建：任何 panic 直接 abort；`catch_unwind` 失效。
 - 栈溢出（递归/深 Drop）、OOM/allocator abort、`process::abort/exit`、SIGSEGV（插件
   `unsafe` UB）、双重 panic（Drop 中 panic）。
+- **极深依赖链的 dispose 递归栈溢出**（既有边界，v0.4.1 同型，0.4.2 未修）：依赖链 dispose
+  走 `take_effects → retire_unready → unload` 相互递归，栈深度约等于依赖链层数。实测在
+  2 MiB 栈的 worker 上 debug 构建约 **480 层**、release 约 **2200 层**即 abort（栈溢出
+  不可捕获）。依赖链达到数百~数千层时请**分层/分批 dispose**（例如先拆子树、逐批
+  `dispose()`，或把深链拆成多棵浅树）；不要依赖单次顶层 dispose 完成全部回收。
 - 死循环、死锁、线程/fd/内存无上限泄漏——没有安全的方式在进程内终止 Rust 线程。
 - 插件 `unsafe` 代码的内存破坏：同一地址空间内无法隔离。
 
@@ -73,7 +120,19 @@ Cordis 在进程内提供的是 **unwinding panic 的故障遏制（fault contai
 - 不要在插件里无限阻塞；需要长任务时用可取消的任务 + 心跳（见 §6 路线图）。
 - `Fiber::dispose()` 是阻塞边：async 宿主必须安装 `BlockingExecutor`（或只用
   `dispose_async()`），否则 current_thread runtime 会死锁（已知限制）。
-- 同一 fiber 的 `dispose/restart/update` 不要并发调用（v0.2 未串行化；见路线图）。
+  `AsyncDisposer::dispose_blocking()` 会 join 在飞 teardown，并在 teardown 被取消后
+  **重试**恢复的未启动 cleanup（S-1）；但在该 disposer **自己的 cleanup 内**调用它
+  `dispose_blocking()` 会立即返回（自 join 短路，S-2，避免自等死锁）。
+- 同一 fiber 的 `dispose/restart/update` 由内核**互斥**（v0.3.0+）：跨线程并发会得到
+  `CordisError::LifecycleBusy`，宿主无需自己加锁，但需要决定重试/串行化策略。
+- **不要在 `internal/plugin` create hook 内同步等待 `when_idle()`**（v0.4.2）：注册→激活
+  窗口现在算 in-flight，guard 由发起注册的调用者持有，同步等待会**自我死锁**（0.4.1 在该
+  窗口会立即返回，这是可观察变化）；`is_idle()` 本身不阻塞，只会在该窗口返回 `false`。
+  需要等待请从 hook 外部调用，或延后到激活完成之后。
+- **注册窗口的其它边界（v0.4.2）**：create hook 内新 fiber 仍是 `Pending` 且没有 fiber 级
+  in-flight 操作，因此 `fiber.await_settled()` 会**立即返回 `Ok(())`**；
+  `Registry::stalled_fibers()`/`Context::stalled_fibers()` 也**看不到**注册窗口（只检查
+  fiber 级 `pending_ops` 与 `Loading`/`Unloading`）。不要把"注册中"误判为"已稳定/已卡死"。
 
 ## 5. 分层隔离（要做到"Linux 内核级"必须叠加）
 
@@ -98,7 +157,8 @@ Cordis 在进程内提供的是 **unwinding panic 的故障遏制（fault contai
 | 内核自身 `unsafe` UB | ✅ 可判定（本 crate）| crate 级 `#![forbid(unsafe_code)]` | 依赖/宿主代码的 unsafe 不在覆盖范围（用 cargo-audit/geiger 做供应链审计）|
 | 整数溢出（静默回绕）| ✅ 可判定 | release `overflow-checks = true` → 溢出 panic，可被 containment 观测 | 不是"消除崩溃"，而是"把静默错误变成可观测错误" |
 | 异步死锁（持锁跨 await）| ⚠️ 常见模式可 lint | clippy `await_holding_lock = deny`、`mutex_integer = deny`，CI `-D warnings` | 通用死锁不可判定，仍需 L2 watchdog/超时 |
-| 栈溢出 | ❌ 不可判定 | 最大插件加载深度 `MAX_PLUGIN_DEPTH=256` 限制一类必然递归；运行时仍可能因插件自身递归爆栈 | 需 L3/L4 |
+| 栈溢出 | ❌ 不可判定 | 最大插件加载深度 `MAX_PLUGIN_DEPTH=256` 限制一类必然递归（0.4.2 起按 fiber 父链而非 context 链计数，root 级 plugin 起始 depth=1，约 254 层嵌套后拒绝）；运行时仍可能因插件自身递归爆栈 | 需 L3/L4 |
+| 深依赖链 unload 递归栈溢出 | ❌ 不可判定（依赖链长度） | 0.4.2 未修（0.4.1 同型）：`take_effects→retire_unready→unload` 递归深度≈依赖链层数，2 MiB 栈实测 debug≈480 层、release≈2200 层 abort；建议数百~数千层依赖链分层/分批 dispose | 需 L3/L4 或分层设计 |
 | OOM / 分配器 abort | ❌ 不可判定 | 无编译期方案（Rust 分配错误默认 abort，不能 unwind）| 需 L3 cgroup/rlimit 或 L4 内存上限 |
 | 死锁 / 无限循环 | ❌ 停机问题 | 协作 checkpoint + `when_idle` + 宿主 watchdog（L2）| 内核不能强杀线程 |
 | 外部 kill / SEGV / UB | ❌ | 进程边界外处理 | L3/L4 |
@@ -138,8 +198,8 @@ RUSTFLAGS="-C panic=abort" cargo check --lib   # 必须失败
 | 能力自省 | `IsolationCapabilities::detect()` | panic 策略 / 遏制能力 / unsafe / 进程 & WASM（恒 false，属 embedder）|
 | 资源配额 | `FiberQuota` + `Context::set_quota` / `Registry::set_quota` | effects / listeners / child fibers 上限，超限 `QuotaExceeded` 并回滚 |
 | 心跳 | `Fiber::heartbeat()` / `Context::heartbeat()` | 长任务上报活动 |
-| watchdog 观测 | `Registry::stalled_fibers(timeout)` / `Context::stalled_fibers(timeout)` | 返回 `StalledFiber { fiber, idle_for }`，**不强杀** |
-| 静默等待 | `Registry::when_idle()` / `Context::when_idle()` | 关闭/健康检查 |
+| watchdog 观测 | `Registry::stalled_fibers(timeout)` / `Context::stalled_fibers(timeout)` | 返回 `StalledFiber { fiber, idle_for }`，**不强杀**；只看 fiber 级 in-flight，**不覆盖**注册窗口（v0.4.2）|
+| 静默等待 | `Registry::when_idle()` / `Context::when_idle()` | 关闭/健康检查；覆盖注册→激活窗口（v0.4.2），**不要在 create hook 内同步等待**（自我死锁）|
 | 协作取消 | `Fiber::cancel()` + `Context::checkpoint()` | supervisor 可先 cancel 再重启/隔离 |
 
 CI 另加 `cargo audit`（RustSec）作业，对依赖做供应链漏洞门禁。
@@ -165,10 +225,13 @@ CI 另加 `cargo audit`（RustSec）作业，对依赖做供应链漏洞门禁�
 ## 7. 复现与验证
 
 - 隔离探针：`target/scratch/redteam-isolation/`（`iso` = unwind 构建、`aborter` = abort 构建，
-  `run.sh` 逐个场景，`timeout` 作 watch-dog）。
-- 内核内遏制测试：`tests/containment.rs`（11 边界）、`tests/hardening.rs`
-  （CORE-028..039）、以及 v0.3 新增的退化测试。
-- 结论复跑：`CARGO_HOME=/data/Cordis/target/scratch/cargo-home cargo test --workspace`。
+  `run.sh` 逐个场景，`timeout` 作 watch-dog；该目录是 gitignored 的本地探针产物）。
+- 内核内遏制测试：`tests/containment.rs`（11 个边界用例）、`tests/hardening.rs`
+  （CORE-028…039）、v0.3 新增的退化测试，以及 v0.4.2 的加固回归套件
+  `tests/regression_core.rs` / `tests/regression_semantics.rs`（部分需要内部状态的
+  用例以 `src/fiber.rs` 内的 unit test 断言，见 CHANGELOG）。
+- 结论复跑：`cargo test`（默认构建）与 `cargo test --features supervision`
+  （启用 L2 API 的全部用例）；两套都应全绿。
 
 ## 8. 与 Linux 内核类比（为什么这个答案是诚实的）
 

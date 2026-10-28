@@ -57,16 +57,20 @@ Cordis 把「动态组合」拆成两个正交维度：
 
 ## 快速开始
 
+```bash
+cargo add zeokeel-cordis
+```
+
 ```toml
 [dependencies]
-zeokeel-cordis = "0.4.1"
+zeokeel-cordis = "0.4.2"
 serde_json = "1"   # 插件配置是 serde_json::Value
 ```
 
 > crates.io 包名 `zeokeel-cordis` 与库目标名 `zeokeel_cordis` 一致：代码里统一
 > `use zeokeel_cordis::...`。
 > 需要跟仓库最新未发布代码时，可换成 git 依赖：
-> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.4.1" }`。
+> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.4.2" }`。
 
 最小插件（完整可运行版本：[`examples/hello.rs`](examples/hello.rs)）：
 
@@ -112,6 +116,7 @@ fn main() -> Result<()> {
 | 事件 | `ctx.on/once/on_async`、`emit/bail`、`parallel_async/serial_async`、`waterfall` |
 | fiber 生命周期 | `Fiber::{state, restart, update, replace_plugin, dispose, dispose_async}` |
 | 注册表 | `Registry::{size, fibers, replace, dispose_all, is_idle, when_idle}` |
+| 日志 | `ctx.logger()`、`ctx.log_exporter(TracingExporter)`（默认无导出器，见下）|
 | 关闭 | `Context::dispose_all()`（推荐）、`when_idle()` |
 
 类型与签名细节以 rustdoc 为准：`cargo doc --open`。
@@ -130,7 +135,7 @@ fn main() -> Result<()> {
 观测），**默认关闭**——核心内核不含任何监督策略：
 
 ```toml
-zeokeel-cordis = { version = "0.4.1", features = ["supervision"] }
+zeokeel-cordis = { version = "0.4.2", features = ["supervision"] }
 ```
 
 详见 [`docs/KERNEL-ISOLATION.md`](docs/KERNEL-ISOLATION.md)。
@@ -152,8 +157,15 @@ zeokeel-cordis = { version = "0.4.1", features = ["supervision"] }
 
 ## 质量与严格构建
 
-- **311 个测试**（默认构建；启用 `--features supervision` 时 **317 个**）：
-  `cargo test` / `cargo test --features supervision`
+- **全量测试**：`cargo test`（默认构建）与 `cargo test --features supervision` 两套都必须全绿；
+  0.4.2 实测：默认构建 **365 passed / 0 failed**、`--features supervision` **371 passed / 0 failed**
+  （均含 7 个 doc-tests；0.4.1 基线为 311 / 317；本版新增 `tests/regression_core.rs`（24 例）与
+  `tests/regression_semantics.rs`（26 例）两套回归用例，并更新了 `redteam*`/`concurrency` 的
+  取消/回滚语义断言）
+- **0.4.2 加固**：21 项生命周期/语义缺陷修复——refresh 闩锁、卸载/清场 panic 遏制、
+  早退路径 finalize、provider-ACTIVE 注入门、`ctx.set` 类型校验、异步 waterfall fail-closed、
+  `dispose_blocking` join 等，逐条见 [CHANGELOG](CHANGELOG.md) 与
+  [`spec/CORDIS-CORE.md`](spec/CORDIS-CORE.md) §6
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings`（两种 feature 组合都跑）
 - `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
 - 编译器强制 `panic = "unwind"`（`panic=abort` 直接编译失败，CI 反证）；
@@ -165,11 +177,20 @@ zeokeel-cordis = { version = "0.4.1", features = ["supervision"] }
 ## 已知限制（精简版）
 
 - **未 dispose 的 fiber 会保留其图**：退出时调用 `dispose_all()`（dispose+drop 路径实测 0 泄漏）。
+- **默认不安装日志导出器**：根上下文只有 `Logger` 服务和 1000 条 ring buffer；不调用
+  `ctx.log_exporter(Arc::new(TracingExporter))?` 时 `ctx.logger().info(..)` 这类记录不会
+  打印到终端、也不会进入 `tracing`（内核自身的 `tracing` 诊断日志是另一条独立通道）。
 - **同步生命周期是阻塞边界**：异步宿主请用 `*_async` API 或安装 `BlockingExecutor`。
-- **取消卸载最多丢失在飞的那一个 cleanup future**（Rust Future drop 语义）；其余会重试。
+- **取消卸载的语义（v0.4.2，按粒度区分）**：取消 `refresh_async`/`dispose_async`（future
+  被 drop）会把 unload **做完**——同步 cleanup 立即执行、异步 cleanup 转入 deferred 由下一次
+  dispose 收尾、fiber 落到 `Pending`/`Disposed` 并通知 idle（不再卡 `Unloading`/假 `Active`）；
+  在飞的那一个 async cleanup future 不可恢复。`AsyncDisposer` 句柄层面的取消则恢复未启动
+  cleanup、由下一次 dispose 重试。
 - **无 ABI / 动态加载**：插件是静态链接的 `Arc<dyn Plugin>`；动态插件需宿主进程/WASM 隔离。
 - **进程内不可遏制**：`panic=abort` 构建已被编译期拒绝；栈溢出、OOM、依赖中的 UB、死循环、
   外部 kill 只能靠 L3/L4 隔离（见隔离文档）。
+- **极深依赖链 dispose 会递归爆栈**（既有边界，0.4.1 同型）：栈深≈依赖链层数，2 MiB 栈
+  debug≈480 层 / release≈2200 层 abort；数百~数千层的依赖链请分层/分批 dispose。
 - **事件作用域过滤 = isolate 映射相等**（非子树）；无类型化事件表。
 - **无抢占**：watchdog/取消是协作式的；内核不会强杀插件线程。
 
@@ -197,7 +218,8 @@ GitHub topics —
 
 ## 状态与许可证
 
-- 当前版本 **v0.4.1**（CORE-001…CORE-051）；v0.4.x 为语义冻结线。
+- 当前版本 **v0.4.2**（CORE-001…CORE-051；0.4.2 为修复/加固补丁，未新增 CORE 用例）；
+  v0.4.x 为语义冻结线。
 - MIT，见 [LICENSE](LICENSE)；论文版权归原作者。
 
 维护仓库：<https://github.com/zeokeel/zeokeel-cordis>（提交作者 `zeokeel-dev`）。
