@@ -8,6 +8,16 @@
 **v0.4.x 语义冻结**：不再新增语义能力；仅接受 bugfix、安全修复、性能改进（不改变语义）
 与文档修正。
 
+## [0.4.1] - 2026-10-28
+
+### Fixed
+
+- `src/l2.rs` 模块文档里的 `Fiber::heartbeat` 内联链接在 `supervision` feature 下无法解析
+  （0.4.0 的 docs.rs 页面把它渲染成纯文本）；改为 `crate::Fiber::heartbeat`。
+- CI 与 release workflow 增加 `cargo doc --no-deps --all-features` 且
+  `RUSTDOCFLAGS=-D warnings` 的闸门，与 docs.rs 实际使用的构建配置（`all-features`）
+  保持一致，避免只有默认 feature 配置通过文档检查。
+
 ## [0.4.0] - 2026-10-28
 
 ### Changed（破坏性）
