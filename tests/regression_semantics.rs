@@ -1192,12 +1192,16 @@ fn fix15_self_join_from_fiber_cleanup_returns_instead_of_deadlocking() {
 // S-3: a poisoned provider lock must not disable the service
 // ---------------------------------------------------------------------------
 
-/// S-3 (audit B-3): `provider_is_active` mapped a poisoned provider mutex to
-/// "inactive", turning one contained panic (a panicking `Plugin::inject()`
-/// during `replace_plugin` poisons the fiber mutex) into a permanent, silent
-/// service outage. A poisoned lock is not evidence of inactivity.
+/// C2 + S-3 (audit B-3): a panicking `Plugin::inject()` is contained (it must
+/// not escape, and it must not poison any kernel lock). The replacement still
+/// activates with "no declared dependencies", and services keep working.
+///
+/// The S-3 fallback (`provider_is_active` treats a poisoned lock as active) is
+/// no longer reachable through the public API now that C2 contains embedder
+/// metadata panics; it stays as defence in depth and is covered by a
+/// `service.rs` unit test.
 #[test]
-fn fix12b_poisoned_provider_lock_does_not_disable_the_service() {
+fn fix12b_panicking_inject_is_contained_and_keeps_services_working() {
     struct Provider;
     impl Plugin for Provider {
         fn name(&self) -> &'static str {
@@ -1205,22 +1209,25 @@ fn fix12b_poisoned_provider_lock_does_not_disable_the_service() {
         }
 
         fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
-            ctx.provide(GREETING, Arc::new("hi".to_string()))?;
+            ctx.provide(GREETING, Arc::new("first".to_string()))?;
             Ok(())
         }
     }
 
-    struct PanicInject;
-    impl Plugin for PanicInject {
+    /// Replacement plugin: `inject()` panics (C2 must contain it), `apply`
+    /// provides the service again so the dependent can reactivate.
+    struct PanickingInjectProvider;
+    impl Plugin for PanickingInjectProvider {
         fn name(&self) -> &'static str {
-            "fix12b-panic-inject"
+            "fix12b-panic-inject-provider"
         }
 
         fn inject(&self) -> &'static [&'static str] {
             panic!("fix12b inject boom")
         }
 
-        fn apply(&self, _ctx: Context, _config: Value) -> Result<()> {
+        fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+            ctx.provide(GREETING, Arc::new("second".to_string()))?;
             Ok(())
         }
     }
@@ -1229,24 +1236,54 @@ fn fix12b_poisoned_provider_lock_does_not_disable_the_service() {
     let provider = root
         .plugin(Arc::new(Provider), Value::Null)
         .expect("provider");
-    assert!(root.service_available("fix12.greeting"));
+    let consumer = root
+        .plugin(
+            Arc::new(NeedsGreeting {
+                applied: Arc::new(AtomicUsize::new(0)),
+            }),
+            Value::Null,
+        )
+        .expect("consumer");
+    assert_eq!(consumer.state(), FiberState::Active);
 
-    // `replace_plugin` calls `Plugin::inject()` while holding the fiber's own
-    // `FiberData` lock, so the embedder panic poisons that mutex.
-    let panicked = catch_unwind(AssertUnwindSafe(|| {
-        provider.replace_plugin(Arc::new(PanicInject))
+    // C2: the embedder panic is contained, so this is an ordinary successful
+    // replace (no panic escapes this `Result` API).
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        provider.replace_plugin(Arc::new(PanickingInjectProvider))
     }));
     assert!(
-        panicked.is_err(),
-        "the embedder panic escapes replace_plugin"
+        outcome.is_ok(),
+        "C2: Plugin::inject panics are contained, not propagated"
     );
-
-    root.refresh();
+    let replaced = outcome.unwrap();
+    assert!(
+        replaced.is_ok(),
+        "the replacement activates without declared dependencies: {replaced:?}"
+    );
+    assert_eq!(provider.state(), FiberState::Active);
     assert!(
         root.service_available("fix12.greeting"),
-        "S-3: a poisoned provider lock must not make the service non-injectable forever"
+        "the service is provided again by the replacement"
     );
-    assert!(root.get(GREETING).is_some(), "the value is still readable");
+    assert_eq!(
+        root.get(GREETING).expect("readable").as_str(),
+        "second",
+        "the replacement's value is live"
+    );
+    assert_eq!(
+        consumer.state(),
+        FiberState::Active,
+        "the dependent reactivated"
+    );
+
+    // The fiber stays fully usable after the contained metadata panic.
+    consumer.dispose().expect("dispose consumer");
+    provider.dispose().expect("dispose provider");
+    assert_eq!(
+        root.registry().size(),
+        0,
+        "both plugin runtimes are released after disposal"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,4 +1381,508 @@ fn fix11_registration_window_keeps_when_idle_blocked() {
         .recv_timeout(Duration::from_secs(10))
         .expect("when_idle wakes once the registration window closes");
     waiter.join().expect("idle waiter");
+}
+
+// ---------------------------------------------------------------------------
+// C4 (0.4.3): `when_idle` inside a registration frame does not wait for itself
+// ---------------------------------------------------------------------------
+
+/// Audit R3-A/C4: calling `when_idle()` from inside an `internal/plugin` create
+/// hook used to wait for the registration that the calling thread itself holds
+/// (a self-deadlock). The registry now excludes the caller's own registrations
+/// from the quiescence check; external waiters still wait (FIX-11b).
+#[test]
+fn c4_when_idle_inside_a_registration_frame_does_not_wait_for_itself() {
+    let root = Context::root();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls = calls.clone();
+    let _hook = root
+        .on_internal_plugin(Arc::new(move |fiber: &Fiber| {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+            let ctx = fiber.context().expect("create hook sees the fiber context");
+            // Must return promptly: waiting for our own registration can never
+            // complete while this hook is running.
+            block_on(ctx.when_idle());
+        }))
+        .expect("internal/plugin hook");
+
+    let (tx, rx) = mpsc::channel();
+    let load_root = root.clone();
+    let loader = std::thread::spawn(move || {
+        let result = load_root.plugin(Arc::new(Noop), Value::Null).map(|_| ());
+        let _ = tx.send(result);
+    });
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("C4: when_idle inside a create hook must not wait for its own registration")
+        .expect("plugin load");
+    loader.join().expect("loader thread");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+// ---------------------------------------------------------------------------
+// F1/F4/F5 (0.4.3): cancelled async cascades park frames in `Unloading`;
+// quiescence entry points recover them while waiting, and a cancelled recovery
+// must not latch
+// ---------------------------------------------------------------------------
+
+/// Child plugin with two async cleanups:
+///
+/// - the first registered runs **last** and is counted (optionally gated on
+///   `restored_gate`): it stays unstarted when the cascade is cancelled, is
+///   restored by the cancel-safe unload, and is re-run by the recovery pass;
+/// - the last registered runs **first**: it signals `started` and waits on
+///   `inflight_gate`, so the first poll of the dispose future returns `Pending`.
+///   That cleanup is in flight when the future is cancelled and cannot be
+///   recovered (Rust has no cancel-safe await), which is the documented A-9
+///   limitation.
+struct F1Child {
+    runs: Arc<AtomicUsize>,
+    started: Mutex<Option<mpsc::Sender<()>>>,
+    inflight_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    restored_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl Plugin for F1Child {
+    fn name(&self) -> &'static str {
+        "f1-child"
+    }
+
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        let restored_runs = self.runs.clone();
+        let started = self.started.lock().unwrap().take();
+        let inflight_gate = self.inflight_gate.lock().unwrap().take();
+        let restored_gate = self.restored_gate.lock().unwrap().take();
+        ctx.effect_async(move || {
+            vec![
+                cleanup_async(move || {
+                    let runs = restored_runs.clone();
+                    let gate = restored_gate;
+                    async move {
+                        if let Some(gate) = gate {
+                            let _ = gate.await;
+                        }
+                        runs.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+                cleanup_async(move || {
+                    let started = started;
+                    let gate = inflight_gate;
+                    async move {
+                        if let Some(started) = started {
+                            let _ = started.send(());
+                        }
+                        if let Some(gate) = gate {
+                            let _ = gate.await;
+                        }
+                    }
+                }),
+            ]
+        })?;
+        Ok(())
+    }
+}
+
+/// Parent plugin: loads the gated child, so disposing the parent cascades into
+/// the child's async teardown.
+struct F1Parent {
+    runs: Arc<AtomicUsize>,
+    started: Mutex<Option<mpsc::Sender<()>>>,
+    inflight_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    restored_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl Plugin for F1Parent {
+    fn name(&self) -> &'static str {
+        "f1-parent"
+    }
+
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        ctx.plugin(
+            Arc::new(F1Child {
+                runs: self.runs.clone(),
+                started: Mutex::new(self.started.lock().unwrap().take()),
+                inflight_gate: Mutex::new(self.inflight_gate.lock().unwrap().take()),
+                restored_gate: Mutex::new(self.restored_gate.lock().unwrap().take()),
+            }),
+            Value::Null,
+        )?;
+        Ok(())
+    }
+}
+
+/// Fixture for one cascade that can be cancelled mid-teardown.
+struct F1Cascade {
+    root: Context,
+    parent: Fiber,
+    runs: Arc<AtomicUsize>,
+    started: mpsc::Receiver<()>,
+    inflight_gate: Option<tokio::sync::oneshot::Sender<()>>,
+    restored_gate: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+fn start_f1_cascade_on(root: &Context) -> F1Cascade {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (started_tx, started_rx) = mpsc::channel();
+    let (inflight_tx, inflight_rx) = tokio::sync::oneshot::channel();
+    let (restored_tx, restored_rx) = tokio::sync::oneshot::channel();
+    let parent = root
+        .plugin(
+            Arc::new(F1Parent {
+                runs: runs.clone(),
+                started: Mutex::new(Some(started_tx)),
+                inflight_gate: Mutex::new(Some(inflight_rx)),
+                restored_gate: Mutex::new(Some(restored_rx)),
+            }),
+            Value::Null,
+        )
+        .expect("parent fiber");
+    assert_eq!(parent.state(), FiberState::Active);
+    F1Cascade {
+        root: root.clone(),
+        parent,
+        runs,
+        started: started_rx,
+        inflight_gate: Some(inflight_tx),
+        restored_gate: Some(restored_tx),
+    }
+}
+
+fn start_f1_cascade() -> F1Cascade {
+    start_f1_cascade_on(&Context::root())
+}
+
+impl F1Cascade {
+    /// Cancel the parent `dispose_async` mid-cascade (the child's in-flight
+    /// cleanup is still gated).
+    fn cancel(&mut self) {
+        let parent = self.parent.clone();
+        block_on(std::future::poll_fn(|cx| {
+            let mut future = Box::pin(parent.dispose_async());
+            let _ = future.as_mut().poll(cx);
+            std::task::Poll::Ready(())
+        }));
+        self.started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the child async cleanup started");
+    }
+
+    fn release_inflight(&mut self) {
+        if let Some(gate) = self.inflight_gate.take() {
+            let _ = gate.send(());
+        }
+    }
+
+    fn release_restored(&mut self) {
+        if let Some(gate) = self.restored_gate.take() {
+            let _ = gate.send(());
+        }
+    }
+
+    fn release_all(&mut self) {
+        self.release_inflight();
+        self.release_restored();
+    }
+
+    /// The cancelled cascade must actually leave a frame parked, otherwise the
+    /// test would not exercise the recovery path at all.
+    fn assert_parked(&self) {
+        assert!(
+            unloading_fibers(&self.root) >= 1,
+            "expected a parked Unloading frame after cancelling the cascade"
+        );
+    }
+}
+
+fn unloading_fibers(root: &Context) -> usize {
+    root.registry()
+        .fibers()
+        .into_iter()
+        .filter(|fiber| fiber.state() == FiberState::Unloading)
+        .count()
+}
+
+/// Poll a future exactly once with a no-op waker (used to start a recovery and
+/// then cancel it by dropping the future).
+fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
+    let waker = std::task::Waker::noop();
+    let mut context = std::task::Context::from_waker(waker);
+    future.poll(&mut context)
+}
+
+/// F1 (A-9): a cancelled cascade may leave non-root frames parked in
+/// `Unloading`. `when_idle()` must recover them (bounded, contained) instead of
+/// waiting forever, and the restored cleanup must run exactly once.
+#[test]
+fn f1_when_idle_recovers_parked_cascade_after_cancel() {
+    let mut cascade = start_f1_cascade();
+    cascade.cancel();
+    cascade.assert_parked();
+    cascade.release_all();
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let idle_root = cascade.root.clone();
+    let waiter = std::thread::spawn(move || {
+        block_on(idle_root.when_idle());
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("F1: when_idle must recover parked unloads and return");
+    waiter.join().expect("when_idle waiter");
+    assert_eq!(
+        unloading_fibers(&cascade.root),
+        0,
+        "no fiber may stay parked in Unloading after when_idle"
+    );
+    assert_eq!(
+        cascade.runs.load(Ordering::SeqCst),
+        1,
+        "the restored (unstarted) cleanup runs exactly once during recovery"
+    );
+    cascade.root.dispose_all().expect("cleanup");
+}
+
+/// F1: `refresh_async` runs the same recovery before its refresh pass.
+#[test]
+fn f1_refresh_async_recovers_parked_cascade_after_cancel() {
+    let mut cascade = start_f1_cascade();
+    cascade.cancel();
+    cascade.assert_parked();
+    cascade.release_all();
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let refresh_root = cascade.root.clone();
+    let waiter = std::thread::spawn(move || {
+        block_on(refresh_root.refresh_async());
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("F1: refresh_async must recover parked unloads and return");
+    waiter.join().expect("refresh waiter");
+    assert_eq!(
+        unloading_fibers(&cascade.root),
+        0,
+        "no fiber may stay parked in Unloading after refresh_async"
+    );
+    assert_eq!(cascade.runs.load(Ordering::SeqCst), 1);
+    cascade.root.dispose_all().expect("cleanup");
+}
+
+/// F1 fast path: with nothing parked, `when_idle()` still resolves immediately
+/// (repeatedly), so recovery adds no observable cost.
+#[test]
+fn f1_when_idle_without_parked_unloads_is_immediate() {
+    let root = Context::root();
+    let (done_tx, done_rx) = mpsc::channel();
+    let idle_root = root.clone();
+    let waiter = std::thread::spawn(move || {
+        for _ in 0..5 {
+            block_on(idle_root.when_idle());
+        }
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("when_idle without parked unloads must be immediate");
+    waiter.join().expect("waiter");
+    root.dispose_all().expect("cleanup");
+}
+
+/// F5 (a): parked frames plus an *active* unload at entry. `when_idle()` must
+/// wait for the in-flight unload body to end (recovery would otherwise be
+/// skipped forever) and then recover the parked frames.
+#[test]
+fn f5_when_idle_waits_for_active_unload_then_recovers_parked_frames() {
+    let root = Context::root();
+
+    // Independent fiber whose `dispose_async` is in flight (gated cleanup).
+    // Created *before* the cascade: while an unload body is active, sync
+    // dependency refreshes skip parked recovery (they must not block on async
+    // cleanups), so cancelling afterwards really parks a frame for `when_idle`.
+    let blocker_runs = Arc::new(AtomicUsize::new(0));
+    let (blocker_started_tx, blocker_started_rx) = mpsc::channel();
+    let (blocker_gate_tx, blocker_gate_rx) = tokio::sync::oneshot::channel();
+    let blocker = root
+        .plugin(
+            Arc::new(F1Child {
+                runs: blocker_runs.clone(),
+                started: Mutex::new(Some(blocker_started_tx)),
+                inflight_gate: Mutex::new(Some(blocker_gate_rx)),
+                restored_gate: Mutex::new(None),
+            }),
+            Value::Null,
+        )
+        .expect("blocker fiber");
+    let blocker_thread = std::thread::spawn(move || block_on(blocker.dispose_async()));
+    blocker_started_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("blocker cleanup started");
+
+    let mut cascade = start_f1_cascade_on(&root);
+    cascade.cancel();
+    cascade.assert_parked();
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let idle_root = cascade.root.clone();
+    let waiter = std::thread::spawn(move || {
+        block_on(idle_root.when_idle());
+        let _ = done_tx.send(());
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        done_rx.try_recv().is_err(),
+        "when_idle must wait while an unload body is in flight"
+    );
+
+    let _ = blocker_gate_tx.send(());
+    cascade.release_all();
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("F5: when_idle must recover parked frames once the active unload ends");
+    waiter.join().expect("waiter");
+    blocker_thread
+        .join()
+        .expect("blocker thread")
+        .expect("blocker dispose");
+    assert_eq!(unloading_fibers(&cascade.root), 0);
+    assert_eq!(cascade.runs.load(Ordering::SeqCst), 1);
+    cascade.root.dispose_all().expect("cleanup");
+}
+
+/// F5 (b): a concurrent cancellation parks a **new** frame while `when_idle()`
+/// is already waiting; the wait must observe it (park wakes the waiter) and
+/// recover it instead of returning/hanging without it.
+#[test]
+fn f5_when_idle_recovers_parked_frames_that_appear_while_waiting() {
+    let root = Context::root();
+
+    // Keep the registry busy so `when_idle()` genuinely waits.
+    let blocker_runs = Arc::new(AtomicUsize::new(0));
+    let (blocker_started_tx, blocker_started_rx) = mpsc::channel();
+    let (blocker_gate_tx, blocker_gate_rx) = tokio::sync::oneshot::channel();
+    let blocker = root
+        .plugin(
+            Arc::new(F1Child {
+                runs: blocker_runs.clone(),
+                started: Mutex::new(Some(blocker_started_tx)),
+                inflight_gate: Mutex::new(Some(blocker_gate_rx)),
+                restored_gate: Mutex::new(None),
+            }),
+            Value::Null,
+        )
+        .expect("blocker fiber");
+    let blocker_thread = std::thread::spawn(move || block_on(blocker.dispose_async()));
+    blocker_started_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("blocker cleanup started");
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let idle_root = root.clone();
+    let waiter = std::thread::spawn(move || {
+        block_on(idle_root.when_idle());
+        let _ = done_tx.send(());
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(done_rx.try_recv().is_err(), "when_idle must be waiting");
+
+    // A cancellation during the wait parks a new frame.
+    let mut cascade = start_f1_cascade_on(&root);
+    cascade.cancel();
+    cascade.assert_parked();
+
+    let _ = blocker_gate_tx.send(());
+    cascade.release_all();
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("F5: when_idle must recover frames parked during the wait");
+    waiter.join().expect("waiter");
+    blocker_thread
+        .join()
+        .expect("blocker thread")
+        .expect("blocker dispose");
+    assert_eq!(unloading_fibers(&root), 0);
+    assert_eq!(cascade.runs.load(Ordering::SeqCst), 1);
+    root.dispose_all().expect("cleanup");
+}
+
+/// F5 (c): 20 consecutive cancel → `when_idle()` rounds complete without a
+/// hang and each restores exactly its own cleanup.
+#[test]
+fn f5_twenty_cancel_and_when_idle_rounds_do_not_hang() {
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let root = Context::root();
+        for round in 0..20 {
+            let mut cascade = start_f1_cascade_on(&root);
+            cascade.cancel();
+            cascade.assert_parked();
+            cascade.release_all();
+            block_on(root.when_idle());
+            assert_eq!(
+                unloading_fibers(&root),
+                0,
+                "round {round} must fully recover parked frames"
+            );
+            assert_eq!(
+                cascade.runs.load(Ordering::SeqCst),
+                1,
+                "round {round} runs the restored cleanup exactly once"
+            );
+        }
+        let _ = done_tx.send(());
+        root
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(40))
+        .expect("F5: 20 cancel -> when_idle rounds must not hang");
+    let root = worker.join().expect("round worker");
+    root.dispose_all().expect("cleanup");
+}
+
+/// F4: cancelling a `when_idle()` future in the middle of recovery must not
+/// latch the recovery section. The old manual `recovering_parked` flag stayed
+/// `true` forever in that case, so every later `when_idle()` skipped recovery
+/// and hung on the permanently `Unloading` frame.
+///
+/// A-9 note: the cleanup that was in flight when the recovery was cancelled is
+/// lost (Rust has no cancel-safe await), so the retried recovery may complete the
+/// frame without re-running that cleanup; the discriminating assertion is that
+/// the retried `when_idle()` returns (watchdog) and leaves no `Unloading` frame.
+#[test]
+fn f4_cancelled_recovery_does_not_latch_the_next_when_idle() {
+    let mut cascade = start_f1_cascade();
+    cascade.cancel();
+    cascade.assert_parked();
+
+    // Start recovery and cancel it while it is awaiting the gated cleanup.
+    let idle_ctx = cascade.root.clone();
+    let mut future = Box::pin(idle_ctx.when_idle());
+    assert!(
+        poll_once(future.as_mut()).is_pending(),
+        "recovery must be pending (awaiting the gated cleanup)"
+    );
+    drop(future);
+
+    cascade.release_all();
+    let (done_tx, done_rx) = mpsc::channel();
+    let idle_root = cascade.root.clone();
+    let waiter = std::thread::spawn(move || {
+        block_on(idle_root.when_idle());
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("F4: a cancelled recovery must not latch the next when_idle");
+    waiter.join().expect("waiter");
+    assert_eq!(
+        unloading_fibers(&cascade.root),
+        0,
+        "no frame may stay parked after the retried recovery"
+    );
+    assert!(
+        cascade.runs.load(Ordering::SeqCst) <= 1,
+        "the restored cleanup must never run twice"
+    );
+    cascade.root.dispose_all().expect("cleanup");
 }

@@ -2119,32 +2119,1555 @@ impl Plugin for B3PanickyInject {
 /// effects unreachable, provided services never withdrawn). It is now computed
 /// before the lock, so the panic still propagates but the fiber stays healthy.
 #[test]
-fn b3_panicking_inject_does_not_poison_the_fiber_lock() {
+fn b3_panicking_inject_is_contained_and_does_not_poison_the_fiber_lock() {
     let root = Context::root();
     let fiber = root
         .plugin(Arc::new(B3Base), Value::Null)
         .expect("base plugin");
     assert_eq!(fiber.state(), FiberState::Active);
 
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        fiber.replace_plugin(Arc::new(B3PanickyInject))
-    }));
-    assert!(
-        outcome.is_err(),
-        "the embedder panic itself still propagates"
-    );
-    assert_eq!(
-        fiber.state(),
-        FiberState::Active,
-        "B-3: the fiber lock must not be poisoned by a panicking inject()"
-    );
-    assert!(
-        !fiber.get_effects().is_empty(),
-        "B-3: the fiber's effects must stay reachable"
-    );
+    // B-3 / C2: the panicking `inject()` is computed before the lock and is
+    // contained: the replacement activates with no dependency declarations.
+    fiber
+        .replace_plugin(Arc::new(B3PanickyInject))
+        .expect("C2: a panicking inject() must be contained by the replace");
+    assert_eq!(fiber.state(), FiberState::Active);
+    assert_eq!(fiber.name(), "b3-panicky-inject");
     assert!(fiber.error().is_none());
+    // Lock-health probe: the effect tree stays reachable (the replacement plugin
+    // registers no effects, so an empty list is correct).
+    assert_eq!(fiber.get_effects().len(), 0);
 
-    fiber.dispose().expect("dispose after the panic");
+    fiber.dispose().expect("dispose after the contained panic");
     assert_eq!(fiber.state(), FiberState::Disposed);
     assert!(root.registry().keys().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// C4: `when_idle()` inside a registration frame must not wait for itself
+// ---------------------------------------------------------------------------
+
+struct C4Noop;
+
+impl Plugin for C4Noop {
+    fn name(&self) -> &'static str {
+        "c4-noop"
+    }
+
+    fn apply(&self, _ctx: Context, _config: Value) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// C4: a host that calls `when_idle()` from inside its own `internal/plugin`
+/// create hook used to deadlock (>3s) because the registration window it is
+/// standing in keeps the registry busy. `when_idle` now excludes *this thread's
+/// own* registrations; `is_idle()` stays strict and external waiters still wait.
+#[test]
+fn c4_when_idle_inside_registration_frame_does_not_wait_for_itself() {
+    watchdog("c4", Duration::from_secs(30), || {
+        let root = Context::root();
+        let registry = root.registry();
+        let hook_entered = Arc::new(Latch::default());
+        let hook_release = Arc::new(Latch::default());
+        let elapsed: Arc<Mutex<Option<std::time::Duration>>> = Arc::new(Mutex::new(None));
+        let strict_idle = Arc::new(AtomicBool::new(true));
+        let _hook = {
+            let registry = registry.clone();
+            let entered = hook_entered.clone();
+            let release = hook_release.clone();
+            let elapsed = elapsed.clone();
+            let strict_idle = strict_idle.clone();
+            root.on_internal_plugin(Arc::new(move |_fiber: &Fiber| {
+                // C4: the registration window is *not* idle for a strict check…
+                strict_idle.store(registry.is_idle(), Ordering::SeqCst);
+                // …but waiting from inside it must not deadlock.
+                let started = std::time::Instant::now();
+                block_on(async {
+                    let registry = registry.clone();
+                    registry.when_idle().await;
+                });
+                *elapsed.lock().unwrap() = Some(started.elapsed());
+                entered.open();
+                release.wait();
+            }))
+            .expect("plugin hook")
+        };
+
+        let loader = {
+            let root = root.clone();
+            std::thread::spawn(move || root.plugin(Arc::new(C4Noop), Value::Null))
+        };
+        hook_entered.wait();
+        // An *external* waiter (outside the registration window) must still
+        // wait: FIX-11b guarantee is unchanged.
+        let ctx = root.clone();
+        let mut external = Box::pin(async move { ctx.when_idle().await });
+        let waker = std::task::Waker::noop();
+        let mut task_cx = std::task::Context::from_waker(waker);
+        assert!(
+            matches!(
+                std::future::Future::poll(external.as_mut(), &mut task_cx),
+                std::task::Poll::Pending
+            ),
+            "FIX-11b: an external when_idle must still wait for the registration"
+        );
+        drop(external);
+        hook_release.open();
+        loader.join().expect("loader thread").expect("plugin");
+        let elapsed = elapsed.lock().unwrap().expect("hook ran");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "C4: when_idle inside the create hook must return immediately, took {elapsed:?}"
+        );
+        assert!(
+            !strict_idle.load(Ordering::SeqCst),
+            "C4: is_idle() must stay strict (false) during the registration window"
+        );
+        block_on(root.when_idle());
+    });
+}
+
+// ---------------------------------------------------------------------------
+// C5: `AccessorWriteRejected` is a distinct public error
+// ---------------------------------------------------------------------------
+
+#[test]
+fn c5_accessor_write_rejected_is_distinct_from_service_write_forbidden() {
+    let rejected = CordisError::AccessorWriteRejected("c5.accessor".to_string());
+    let message = rejected.to_string();
+    assert!(message.contains("c5.accessor"), "{message}");
+    assert!(
+        !message.contains("another fiber"),
+        "the accessor-rejection message must not read like ServiceWriteForbidden: {message}"
+    );
+    assert_ne!(
+        rejected.to_string(),
+        CordisError::ServiceWriteForbidden("c5.accessor".to_string()).to_string()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C1: iterative (non-recursive) unload cascade
+// ---------------------------------------------------------------------------
+
+/// One link of a deep dependency chain: injects `dep`, provides `svc`, records
+/// its cleanup label in `trace` and provides a synthetic service value.
+struct ChainLink {
+    svc: &'static str,
+    dep: Option<&'static str>,
+    label: &'static str,
+    trace: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Plugin for ChainLink {
+    fn name(&self) -> &'static str {
+        self.label
+    }
+
+    fn inject(&self) -> &'static [&'static str] {
+        static EMPTY: &[&str] = &[];
+        match self.dep {
+            Some(dep) => {
+                // `inject` must return a `'static` slice; the chain test leaks
+                // exactly one one-element slice per link.
+                Box::leak(vec![dep].into_boxed_slice())
+            }
+            None => EMPTY,
+        }
+    }
+
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        let svc = ServiceKey::new(self.svc);
+        ctx.provide_checked(svc, Arc::new(1u32), || true)?;
+        let trace = self.trace.clone();
+        let label = self.label;
+        ctx.effect(move || {
+            vec![cleanup(move || {
+                trace.lock().unwrap().push(label);
+            })]
+        })?;
+        Ok(())
+    }
+}
+
+/// Build a chain `P0 provides s0 ← D1 provides s1 ← … ← Dn provides sn` and run
+/// `scope` with the fibers in order `[P0, D1, …, Dn]`.
+fn with_chain<F>(n: usize, trace: Arc<Mutex<Vec<&'static str>>>, scope: F)
+where
+    F: FnOnce(&Context, Vec<Fiber>),
+{
+    let root = Context::root();
+    let mut fibers = Vec::with_capacity(n + 1);
+    let mut previous: Option<&'static str> = None;
+    for index in 0..=n {
+        let svc: &'static str = Box::leak(format!("c1-chain.svc.{index}").into_boxed_str());
+        let label: &'static str = Box::leak(format!("L{index}").into_boxed_str());
+        let plugin = Arc::new(ChainLink {
+            svc,
+            dep: previous,
+            label,
+            trace: trace.clone(),
+        });
+        let fiber = root.plugin(plugin, Value::Null).expect("chain link");
+        assert_eq!(
+            fiber.state(),
+            FiberState::Active,
+            "chain link {index} must activate"
+        );
+        fibers.push(fiber);
+        previous = Some(svc);
+    }
+    scope(&root, fibers);
+}
+
+/// C1: a 1500-deep dependency chain must dispose **iteratively** (the old
+/// recursive retire path overflowed the stack around a few hundred links on a
+/// 2 MiB worker thread and aborted the process). Dependents are drained before
+/// the provider, deepest first.
+#[test]
+fn c1_deep_chain_dispose_is_iterative_and_ordered() {
+    watchdog("c1_deep", Duration::from_secs(180), || {
+        const N: usize = 1500;
+        let trace: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        with_chain(N, trace.clone(), |root, fibers| {
+            let base = fibers[0].clone();
+            let started = std::time::Instant::now();
+            base.dispose().expect("dispose the chain base");
+            let elapsed = started.elapsed();
+            let recorded = trace.lock().unwrap().clone();
+            let mut expected: Vec<&'static str> = (1..=N)
+                .rev()
+                .map(|i| Box::leak(format!("L{i}").into_boxed_str()) as &'static str)
+                .collect();
+            expected.push("L0");
+            assert_eq!(
+                recorded, expected,
+                "C1: dependents must drain before the provider, deepest first"
+            );
+            assert_eq!(base.state(), FiberState::Disposed);
+            for (index, fiber) in fibers.iter().enumerate().skip(1) {
+                assert_eq!(
+                    fiber.state(),
+                    FiberState::Pending,
+                    "dependent {index} must end Pending after the cascade"
+                );
+            }
+            eprintln!("c1_deep N={N} dispose elapsed={elapsed:?}");
+            let _ = root.dispose_all();
+            assert_eq!(root.registry().size(), 0);
+            assert_eq!(root.registry().fiber_count(), 0);
+            assert!(root.registry().is_idle());
+        });
+    });
+}
+
+/// C1: a panicking dependent cleanup is contained (FIX-2): the provider still
+/// reaches `Disposed`, the dependent reaches its target state, and the panic is
+/// not re-raised by the provider's `dispose`.
+#[test]
+fn c1_dependent_cleanup_panic_is_contained() {
+    struct Base;
+
+    impl Plugin for Base {
+        fn name(&self) -> &'static str {
+            "c1-panic-base"
+        }
+
+        fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+            ctx.provide_checked(ServiceKey::new("c1-panic.svc"), Arc::new(1u32), || true)?;
+            Ok(())
+        }
+    }
+
+    struct Dependent;
+
+    impl Plugin for Dependent {
+        fn name(&self) -> &'static str {
+            "c1-panic-dependent"
+        }
+
+        fn inject(&self) -> &'static [&'static str] {
+            &["c1-panic.svc"]
+        }
+
+        fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+            ctx.effect(|| vec![cleanup(|| panic!("c1 dependent cleanup boom"))])?;
+            Ok(())
+        }
+    }
+
+    let root = Context::root();
+    let base = root.plugin(Arc::new(Base), Value::Null).expect("base");
+    let dependent = root
+        .plugin(Arc::new(Dependent), Value::Null)
+        .expect("dependent");
+    assert_eq!(dependent.state(), FiberState::Active);
+    base.dispose()
+        .expect("FIX-2: the dependent's cleanup panic must be contained");
+    assert_eq!(base.state(), FiberState::Disposed);
+    assert_eq!(dependent.state(), FiberState::Pending);
+    assert!(root.registry().is_idle());
+    let _ = root.dispose_all();
+    assert!(root.registry().keys().is_empty());
+}
+
+/// C1 + A-9: cancelling a deep-cascade `dispose_async` (the base's async cleanup
+/// parks) must still finish the base teardown; the dependents were already
+/// drained by the cascade, and a retry drains the deferred cleanups.
+#[test]
+fn c1_cancelled_deep_cascade_still_completes() {
+    struct AsyncBase {
+        svc: &'static str,
+        latch: Arc<AsyncLatch>,
+    }
+
+    impl Plugin for AsyncBase {
+        fn name(&self) -> &'static str {
+            "c1-async-base"
+        }
+
+        fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+            ctx.provide_checked(ServiceKey::new(self.svc), Arc::new(1u32), || true)?;
+            let latch = self.latch.clone();
+            ctx.effect_async_labeled("c1-async-cleanup", move || {
+                vec![zeokeel_cordis::cleanup_async(move || {
+                    let latch = latch.clone();
+                    async move {
+                        latch.wait().await;
+                    }
+                })]
+            })?;
+            Ok(())
+        }
+    }
+
+    struct Follower {
+        svc: &'static str,
+        deps: &'static [&'static str],
+    }
+
+    impl Plugin for Follower {
+        fn name(&self) -> &'static str {
+            "c1-async-follower"
+        }
+
+        fn inject(&self) -> &'static [&'static str] {
+            self.deps
+        }
+
+        fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+            ctx.provide_checked(ServiceKey::new(self.svc), Arc::new(1u32), || true)?;
+            Ok(())
+        }
+    }
+
+    let root = Context::root();
+    let latch = Arc::new(AsyncLatch::default());
+    let base = root
+        .plugin(
+            Arc::new(AsyncBase {
+                svc: "c1-async.svc.0",
+                latch: latch.clone(),
+            }),
+            Value::Null,
+        )
+        .expect("async base");
+    let follower = root
+        .plugin(
+            Arc::new(Follower {
+                svc: "c1-async.svc.1",
+                deps: Box::leak(vec!["c1-async.svc.0"].into_boxed_slice()),
+            }),
+            Value::Null,
+        )
+        .expect("follower");
+    assert_eq!(follower.state(), FiberState::Active);
+
+    let mut dispose = Box::pin(base.dispose_async());
+    let waker = std::task::Waker::noop();
+    let mut task_cx = std::task::Context::from_waker(waker);
+    assert!(
+        matches!(
+            std::future::Future::poll(dispose.as_mut(), &mut task_cx),
+            std::task::Poll::Pending
+        ),
+        "the cascade parks on the base's async cleanup"
+    );
+    // The cascade began and drained the dependent before the base parked.
+    assert_eq!(follower.state(), FiberState::Pending);
+    assert_eq!(base.state(), FiberState::Unloading);
+    drop(dispose); // cancel
+    assert_eq!(
+        base.state(),
+        FiberState::Disposed,
+        "A-9: a cancelled cascade still lands the base on Disposed"
+    );
+    assert!(root.registry().is_idle());
+    // Retry drains the deferred async cleanup.
+    latch.open();
+    block_on(base.dispose_async()).expect("retry dispose");
+    let _ = root.dispose_all();
+    assert!(root.registry().keys().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// R3-A4: dynamic child loading must not grow the parent's bookkeeping
+// ---------------------------------------------------------------------------
+
+struct R3a4Child {
+    svc: &'static str,
+}
+
+impl Plugin for R3a4Child {
+    fn name(&self) -> &'static str {
+        "r3a4-child"
+    }
+
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        ctx.effect_labeled("r3a4-child-effect", || vec![cleanup(|| {})])?;
+        let _ = self.svc;
+        Ok(())
+    }
+}
+
+fn r3a4_churn(root: &Context, iterations: usize) -> usize {
+    let mut max_effects = 0usize;
+    for _ in 0..iterations {
+        let child = root
+            .plugin(Arc::new(R3a4Child { svc: "r3a4.svc" }), Value::Null)
+            .expect("dynamic child");
+        assert_eq!(child.state(), FiberState::Active);
+        child.dispose().expect("child dispose");
+        max_effects = max_effects.max(root.fiber().get_effects().len());
+    }
+    max_effects
+}
+
+/// R3-A4: a long-lived root repeatedly loading and disposing plugins used to
+/// accumulate one ownership effect (+ one `children` entry) per load forever
+/// (60k churn: 60001 reported effects, +54MB RSS). After the fix the parent's
+/// effect list stays O(1) (only live children).
+#[test]
+fn r3a4_dynamic_plugin_churn_keeps_parent_bookkeeping_bounded() {
+    watchdog("r3a4-churn", Duration::from_secs(180), || {
+        let root = Context::root();
+        let baseline = root.fiber().get_effects().len();
+        let max_effects = r3a4_churn(&root, 1_000);
+        assert_eq!(
+            max_effects, baseline,
+            "R3-A4: parent effect list must not grow with disposed children (max={max_effects}, baseline={baseline})"
+        );
+        assert_eq!(
+            root.registry().fiber_count(),
+            0,
+            "all dynamically loaded fibers are disposed"
+        );
+        assert_eq!(root.fiber().state(), FiberState::Active);
+        assert!(root.registry().is_idle());
+        let _ = root.dispose_all();
+        assert!(root.registry().keys().is_empty());
+    });
+}
+
+/// R3-A4 (long run, 10k loads): the bookkeeping must stay bounded and the
+/// process must not grow linearly with churn. RSS is sampled around the churn
+/// loop; a generous bound keeps the check robust under a parallel test runner
+/// while still catching the old unbounded growth (933B/load ≈ 9.3MB per 10k;
+/// 10x that bound still fails the pre-fix build by a wide margin at 60k+).
+#[test]
+fn r3a4_long_churn_keeps_memory_and_effects_bounded() {
+    watchdog("r3a4-long", Duration::from_secs(300), || {
+        fn rss_kb() -> u64 {
+            let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+            statm
+                .split_whitespace()
+                .nth(1)
+                .and_then(|pages| pages.parse::<u64>().ok())
+                .map(|pages| pages * 4)
+                .unwrap_or(0)
+        }
+        let root = Context::root();
+        let _warmup = r3a4_churn(&root, 1_000);
+        let rss_before = rss_kb();
+        let max_effects = r3a4_churn(&root, 10_000);
+        let rss_after = rss_kb();
+        assert!(
+            max_effects <= 2,
+            "R3-A4: 10k churn grew the parent effect list to {max_effects}"
+        );
+        let growth = rss_after.saturating_sub(rss_before);
+        eprintln!(
+            "R3-A4 evidence: 10k dynamic loads -> parent effects max={max_effects}, RSS growth={growth}KB (pre-fix audit: 60001 effects, +54.7MB at 60k)"
+        );
+        assert!(
+            growth < 64 * 1024,
+            "R3-A4: 10k dynamic loads grew RSS by {growth}KB (unbounded bookkeeping?)"
+        );
+        let _ = root.dispose_all();
+        assert!(root.registry().keys().is_empty());
+    });
+}
+
+/// R3-A4: parent-first disposal is still handled by the ownership effect, and a
+/// later child dispose (already disposed) is an idempotent no-op — the detach
+/// path must be best-effort while the parent is Unloading/Disposed.
+#[test]
+fn r3a4_parent_dispose_then_child_dispose_is_idempotent() {
+    struct Parent {
+        child: Arc<Mutex<Option<Fiber>>>,
+    }
+
+    impl Plugin for Parent {
+        fn name(&self) -> &'static str {
+            "r3a4-parent"
+        }
+
+        fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+            let child = ctx.plugin(
+                Arc::new(R3a4Child {
+                    svc: "r3a4.parent-svc",
+                }),
+                Value::Null,
+            )?;
+            *self.child.lock().unwrap() = Some(child);
+            Ok(())
+        }
+    }
+
+    let root = Context::root();
+    let root_baseline = root.fiber().get_effects().len();
+    let slot = Arc::new(Mutex::new(None));
+    let parent = root
+        .plugin(
+            Arc::new(Parent {
+                child: slot.clone(),
+            }),
+            Value::Null,
+        )
+        .expect("parent");
+    let child = slot.lock().unwrap().clone().expect("child");
+    assert_eq!(child.state(), FiberState::Active);
+
+    parent.dispose().expect("parent dispose");
+    assert_eq!(parent.state(), FiberState::Disposed);
+    assert_eq!(child.state(), FiberState::Disposed);
+    // The child was disposed through the parent's ownership cascade; repeating
+    // it (and detaching again) must be a silent no-op.
+    child.dispose().expect("idempotent child dispose");
+    assert_eq!(child.state(), FiberState::Disposed);
+    assert_eq!(
+        root.fiber().get_effects().len(),
+        root_baseline,
+        "R3-A4: no ownership entry may survive on the root"
+    );
+    let _ = root.dispose_all();
+    assert!(root.registry().keys().is_empty());
+}
+
+/// R3-A4: a parent sweep racing the child's own dispose must stay panic-free and
+/// converge (both fibers disposed, registry empty, parent bookkeeping clean).
+#[test]
+fn r3a4_parent_sweep_races_child_self_dispose() {
+    watchdog("r3a4-race", Duration::from_secs(60), || {
+        for _ in 0..40 {
+            let root = Context::root();
+            let child = root
+                .plugin(
+                    Arc::new(R3a4Child {
+                        svc: "r3a4.race-svc",
+                    }),
+                    Value::Null,
+                )
+                .expect("child");
+            let parent = root.fiber();
+            let child_for_thread = child.clone();
+            let disposer = std::thread::spawn(move || {
+                let _ = catch_unwind(AssertUnwindSafe(|| child_for_thread.dispose()));
+            });
+            let _ = catch_unwind(AssertUnwindSafe(|| parent.dispose()));
+            disposer.join().expect("child disposer thread");
+            assert_eq!(parent.state(), FiberState::Disposed);
+            assert_eq!(child.state(), FiberState::Disposed);
+            assert!(
+                parent.get_effects().is_empty(),
+                "R3-A4: parent bookkeeping leaked under the dispose race"
+            );
+            let _ = root.dispose_all();
+            assert!(root.registry().keys().is_empty());
+        }
+    });
+}
+
+/// R3-A4: a cancelled `dispose_async` of the child (A-9 completes the teardown)
+/// must still detach the child from the parent.
+#[test]
+fn r3a4_cancelled_child_dispose_still_detaches() {
+    struct Parent {
+        child: Arc<Mutex<Option<Fiber>>>,
+    }
+
+    impl Plugin for Parent {
+        fn name(&self) -> &'static str {
+            "r3a4-cancel-parent"
+        }
+
+        fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+            let latch = Arc::new(AsyncLatch::default());
+            // Keep the latch alive inside the child cleanup.
+            let child = ctx.plugin(
+                Arc::new(R3a4Child {
+                    svc: "r3a4.cancel-svc",
+                }),
+                Value::Null,
+            )?;
+            let _ = latch;
+            *self.child.lock().unwrap() = Some(child);
+            Ok(())
+        }
+    }
+
+    let root = Context::root();
+    let slot = Arc::new(Mutex::new(None));
+    let parent = root
+        .plugin(
+            Arc::new(Parent {
+                child: slot.clone(),
+            }),
+            Value::Null,
+        )
+        .expect("parent");
+    let child = slot.lock().unwrap().clone().expect("child");
+    // Cancel a dispose_async before it runs: it is just never polled, which is
+    // the "future dropped" case; the retry must dispose and detach.
+    let mut dispose = Box::pin(child.dispose_async());
+    let waker = std::task::Waker::noop();
+    let mut task_cx = std::task::Context::from_waker(waker);
+    let _ = std::future::Future::poll(dispose.as_mut(), &mut task_cx);
+    drop(dispose);
+    assert_eq!(child.state(), FiberState::Disposed);
+    assert!(
+        parent.get_effects().is_empty(),
+        "R3-A4: cancelled child dispose must still detach the ownership entry from the parent"
+    );
+    let _ = root.dispose_all();
+    assert!(root.registry().keys().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// R1: deep plugin nesting must not overflow a 2 MiB worker-thread stack
+// ---------------------------------------------------------------------------
+
+/// R1: activating a deep `ctx.plugin` nesting chain used to overflow a 2 MiB
+/// thread stack (the default for `std::thread`) and abort the process — a plain
+/// `catch_unwind` cannot save the host. The activation path is now small enough
+/// (and the unload cascade of the resulting ownership tree is iterative) that
+/// the documented `MAX_PLUGIN_DEPTH` guard is reached safely on a 2 MiB stack.
+#[test]
+fn r1_deep_plugin_chain_activates_on_a_2mib_thread() {
+    struct Deep {
+        depth: usize,
+        activated: Arc<AtomicUsize>,
+    }
+
+    impl Plugin for Deep {
+        fn name(&self) -> &'static str {
+            "r1-deep"
+        }
+
+        fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+            // Count how deep the activation actually went.
+            self.activated.fetch_add(1, Ordering::SeqCst);
+            if self.depth > 0 {
+                let _ = ctx.plugin(
+                    Arc::new(Deep {
+                        depth: self.depth - 1,
+                        activated: self.activated.clone(),
+                    }),
+                    Value::Null,
+                );
+            }
+            Ok(())
+        }
+    }
+
+    let activated = Arc::new(AtomicUsize::new(0));
+    let activated_in_thread = activated.clone();
+    let handle = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(move || {
+            let root = Context::root();
+            let fiber = root
+                .plugin(
+                    Arc::new(Deep {
+                        depth: 400,
+                        activated: activated_in_thread,
+                    }),
+                    Value::Null,
+                )
+                .expect("activation on a 2 MiB stack must not abort");
+            assert_eq!(fiber.state(), FiberState::Active);
+            // The ownership tree built by the chain is unloaded iteratively: a
+            // deep parent->child hierarchy must not recurse either.
+            let _ = root.dispose_all();
+            assert!(root.registry().keys().is_empty());
+            assert!(root.registry().is_idle());
+        })
+        .expect("spawn 2 MiB thread");
+    handle
+        .join()
+        .expect("R1: deep plugin nesting overflowed the 2 MiB thread stack");
+    assert!(
+        activated.load(Ordering::SeqCst) >= 100,
+        "the chain did not actually nest deeply (activated={})",
+        activated.load(Ordering::SeqCst)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C3: disposed nested effects must not leave ghost nodes in the effect tree
+// ---------------------------------------------------------------------------
+
+struct C3NestedPlugin {
+    child: Arc<Mutex<Option<zeokeel_cordis::Disposer>>>,
+}
+
+impl Plugin for C3NestedPlugin {
+    fn name(&self) -> &'static str {
+        "c3-nested"
+    }
+
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        let child_slot = self.child.clone();
+        let nested_ctx = ctx.clone();
+        ctx.effect_labeled("c3-parent", move || {
+            let child = nested_ctx
+                .effect_labeled("c3-child", || vec![cleanup(|| {})])
+                .expect("nested effect");
+            *child_slot.lock().unwrap() = Some(child);
+            vec![cleanup(|| {})]
+        })?;
+        Ok(())
+    }
+}
+
+/// C3: a user-disposed nested effect stayed in its parent's `EffectMeta.children`
+/// forever (the parent node tree is not rewritten by the disposer). The reported
+/// tree must match the live registrations.
+#[test]
+fn c3_disposed_nested_effect_is_not_reported_in_the_tree() {
+    let root = Context::root();
+    let slot = Arc::new(Mutex::new(None));
+    let fiber = root
+        .plugin(
+            Arc::new(C3NestedPlugin {
+                child: slot.clone(),
+            }),
+            Value::Null,
+        )
+        .expect("nested plugin");
+    let tree = fiber.get_effects();
+    let parent = tree
+        .iter()
+        .find(|meta| meta.label == "c3-parent")
+        .expect("parent effect reported");
+    assert_eq!(
+        parent
+            .children
+            .iter()
+            .map(|child| child.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["c3-child"],
+        "the live nested effect must be reported"
+    );
+
+    let child = slot
+        .lock()
+        .unwrap()
+        .take()
+        .expect("nested disposer captured");
+    child.dispose();
+
+    let tree = fiber.get_effects();
+    let parent = tree
+        .iter()
+        .find(|meta| meta.label == "c3-parent")
+        .expect("parent effect still live");
+    assert!(
+        parent.children.is_empty(),
+        "C3: disposed nested effect still reported as a ghost: {:?}",
+        parent.children
+    );
+    let _ = root.dispose_all();
+    assert!(root.registry().keys().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// C2: a panicking `Plugin::key()` is contained and degrades to a placeholder
+// ---------------------------------------------------------------------------
+
+struct C2PanickyKey;
+
+impl Plugin for C2PanickyKey {
+    fn name(&self) -> &'static str {
+        "c2-panicky-key"
+    }
+
+    fn key(&self) -> PluginKey {
+        panic!("C2 key boom");
+    }
+
+    fn apply(&self, _ctx: Context, _config: Value) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// C2: `Plugin::key()` is embedder code called by `ctx.plugin`; a panic must be
+/// contained and degrade to `PluginKey::Named("<panicked plugin>")` instead of
+/// unwinding out of the registration API.
+#[test]
+fn c2_panicking_key_degrades_to_a_placeholder_runtime() {
+    let root = Context::root();
+    let fiber = root
+        .plugin(Arc::new(C2PanickyKey), Value::Null)
+        .expect("C2: a panicking key() must not abort ctx.plugin");
+    assert_eq!(fiber.state(), FiberState::Active);
+    assert_eq!(fiber.name(), "c2-panicky-key");
+    assert!(
+        root.registry().has(PluginKey::Named("<panicked plugin>")),
+        "C2: a panicking key() registers under the documented placeholder runtime"
+    );
+    fiber.dispose().expect("dispose");
+    assert!(root.registry().keys().is_empty());
+}
+
+/// C1: audit order trace — a three-level chain `B (provider) ← D1 ← D2`
+/// disposes its dependents **before** the provider, deepest first:
+/// `["D2", "D1", "B"]`.
+#[test]
+fn c1_three_level_cascade_order_is_dependents_first() {
+    let trace: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+    let root = Context::root();
+    let mut previous: Option<&'static str> = None;
+    let mut fibers = Vec::new();
+    for (index, label) in ["B", "D1", "D2"].into_iter().enumerate() {
+        let svc: &'static str = Box::leak(format!("c1-order.svc.{index}").into_boxed_str());
+        let plugin = Arc::new(ChainLink {
+            svc,
+            dep: previous,
+            label,
+            trace: trace.clone(),
+        });
+        let fiber = root.plugin(plugin, Value::Null).expect("order link");
+        assert_eq!(fiber.state(), FiberState::Active);
+        fibers.push(fiber);
+        previous = Some(svc);
+    }
+    fibers[0].dispose().expect("dispose provider");
+    assert_eq!(
+        trace.lock().unwrap().as_slice(),
+        ["D2", "D1", "B"],
+        "C1: dependents must unload before the provider, deepest first"
+    );
+    assert_eq!(fibers[1].state(), FiberState::Pending);
+    assert_eq!(fibers[2].state(), FiberState::Pending);
+    let _ = root.dispose_all();
+    assert!(root.registry().keys().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// F1 (round 4): a cancelled async cascade parks fibers as `Unloading`; a later
+// root operation / when_idle must recover them (never a permanent Unloading)
+// ---------------------------------------------------------------------------
+
+/// One link of an F1 chain: async cleanup that records the run and waits on a
+/// gate, so a cancelled cascade can be parked mid-cleanup deterministically.
+struct F1Link {
+    svc: &'static str,
+    dep: Option<&'static str>,
+    label: &'static str,
+    gate: Arc<AsyncLatch>,
+    runs: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Plugin for F1Link {
+    fn name(&self) -> &'static str {
+        self.label
+    }
+
+    fn inject(&self) -> &'static [&'static str] {
+        static EMPTY: &[&str] = &[];
+        match self.dep {
+            Some(dep) => Box::leak(vec![dep].into_boxed_slice()),
+            None => EMPTY,
+        }
+    }
+
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        ctx.provide_checked(ServiceKey::new(self.svc), Arc::new(1u32), || true)?;
+        let gate = self.gate.clone();
+        let runs = self.runs.clone();
+        let label = self.label;
+        ctx.effect_async_labeled("f1-cleanup", move || {
+            vec![zeokeel_cordis::cleanup_async(move || {
+                let gate = gate.clone();
+                let runs = runs.clone();
+                async move {
+                    runs.lock().unwrap().push(label);
+                    gate.wait().await;
+                }
+            })]
+        })?;
+        Ok(())
+    }
+}
+
+fn f1_chain_on(
+    root: &Context,
+    n: usize,
+    gate: Arc<AsyncLatch>,
+    runs: Arc<Mutex<Vec<&'static str>>>,
+) -> Vec<Fiber> {
+    let mut fibers = Vec::with_capacity(n + 1);
+    let mut previous: Option<&'static str> = None;
+    for index in 0..=n {
+        let svc: &'static str = Box::leak(format!("f1-chain.svc.{index}").into_boxed_str());
+        let label: &'static str = Box::leak(format!("F{index}").into_boxed_str());
+        let plugin = Arc::new(F1Link {
+            svc,
+            dep: previous,
+            label,
+            gate: gate.clone(),
+            runs: runs.clone(),
+        });
+        let fiber = root.plugin(plugin, Value::Null).expect("f1 link");
+        assert_eq!(fiber.state(), FiberState::Active, "F1 link {index}");
+        fibers.push(fiber);
+        previous = Some(svc);
+    }
+    fibers
+}
+
+/// Build an F1 chain `P0 ← D1 ← … ← Dn` (all `Active`) on a fresh root context.
+fn f1_chain(
+    n: usize,
+    gate: Arc<AsyncLatch>,
+    runs: Arc<Mutex<Vec<&'static str>>>,
+) -> (Context, Vec<Fiber>) {
+    let root = Context::root();
+    let fibers = f1_chain_on(&root, n, gate, runs);
+    (root, fibers)
+}
+
+fn f1_park_mid_cascade(provider: &Fiber) {
+    let mut dispose = Box::pin(provider.dispose_async());
+    let waker = std::task::Waker::noop();
+    let mut task_cx = std::task::Context::from_waker(waker);
+    assert!(
+        matches!(
+            std::future::Future::poll(dispose.as_mut(), &mut task_cx),
+            std::task::Poll::Pending
+        ),
+        "the cascade must park on the deepest dependent's async cleanup"
+    );
+    drop(dispose); // cancel mid-cascade
+}
+
+/// F1: retrying the root `dispose_async` recovers every parked dependent
+/// (`Pending`, never a permanent `Unloading`) and every cleanup runs exactly
+/// once (the root's own deferred cleanups finish here too).
+#[test]
+fn f1_retried_root_dispose_async_recovers_parked_cascade() {
+    watchdog("f1-retry", Duration::from_secs(60), || {
+        let gate = Arc::new(AsyncLatch::default());
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        let (root, fibers) = f1_chain(8, gate.clone(), runs.clone());
+        let provider = fibers[0].clone();
+        f1_park_mid_cascade(&provider);
+
+        assert_eq!(
+            provider.state(),
+            FiberState::Disposed,
+            "root A-9 completion"
+        );
+        assert!(
+            fibers[1..]
+                .iter()
+                .any(|fiber| fiber.state() == FiberState::Unloading),
+            "F1 setup: a dependent must be parked as Unloading"
+        );
+
+        gate.open();
+        block_on(provider.dispose_async()).expect("retried root dispose");
+        assert_eq!(provider.state(), FiberState::Disposed);
+        for (index, fiber) in fibers.iter().enumerate().skip(1) {
+            assert_eq!(
+                fiber.state(),
+                FiberState::Pending,
+                "parked dependent {index} must be recovered to its cascade target"
+            );
+        }
+        // Recovered dependents end `Pending` (their cascade target) and stay
+        // registered for a later provider re-activation.
+        assert_eq!(root.registry().fiber_count(), fibers.len() - 1);
+        let mut recorded = runs.lock().unwrap().clone();
+        recorded.sort_unstable();
+        let mut expected: Vec<&'static str> = (0..=8)
+            .map(|i| Box::leak(format!("F{i}").into_boxed_str()) as &'static str)
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(
+            recorded, expected,
+            "F1: every cleanup must run exactly once across cancel + retry"
+        );
+        let _ = root.dispose_all();
+        assert!(root.registry().keys().is_empty());
+    });
+}
+
+/// F1: `dispose_all` is also a recovery point (it must not observe a permanent
+/// `Unloading` left behind by a cancelled cascade).
+#[test]
+fn f1_dispose_all_recovers_parked_cascade() {
+    watchdog("f1-dispose-all", Duration::from_secs(60), || {
+        let gate = Arc::new(AsyncLatch::default());
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        let (root, fibers) = f1_chain(6, gate.clone(), runs.clone());
+        f1_park_mid_cascade(&fibers[0]);
+        assert!(fibers[1..]
+            .iter()
+            .any(|fiber| fiber.state() == FiberState::Unloading));
+
+        gate.open();
+        root.dispose_all()
+            .expect("dispose_all after a cancelled cascade");
+        for fiber in &fibers {
+            assert_eq!(fiber.state(), FiberState::Disposed);
+        }
+        assert!(root.registry().keys().is_empty());
+        let recorded = runs.lock().unwrap().len();
+        assert!(
+            recorded >= fibers.len() - 1,
+            "F1: dispose_all recovery must finish the deferred cleanups (ran={recorded})"
+        );
+    });
+}
+
+/// F1: `refresh_async` is a recovery point too: parked unloads are finished
+/// before the dependency re-evaluation, and nothing stays `Unloading`.
+#[test]
+fn f1_refresh_async_recovers_parked_cascade() {
+    watchdog("f1-refresh", Duration::from_secs(60), || {
+        let gate = Arc::new(AsyncLatch::default());
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        let (root, fibers) = f1_chain(6, gate.clone(), runs.clone());
+        f1_park_mid_cascade(&fibers[0]);
+        assert!(fibers[1..]
+            .iter()
+            .any(|fiber| fiber.state() == FiberState::Unloading));
+
+        gate.open();
+        block_on(root.refresh_async());
+        assert!(
+            fibers
+                .iter()
+                .all(|fiber| fiber.state() != FiberState::Unloading),
+            "F1: refresh_async must recover parked Unloading fibers"
+        );
+        assert_eq!(fibers[0].state(), FiberState::Disposed);
+        assert_eq!(root.registry().fiber_count(), fibers.len() - 1);
+        assert!(root.registry().is_idle());
+        let _ = root.dispose_all();
+        assert!(root.registry().keys().is_empty());
+    });
+}
+
+// ---------------------------------------------------------------------------
+// F4/F5 (round 5): recovery latch RAII + recovery-aware when_idle loop
+// ---------------------------------------------------------------------------
+
+fn poll_once_pin<F: std::future::Future>(
+    future: std::pin::Pin<&mut F>,
+) -> std::task::Poll<F::Output> {
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    std::future::Future::poll(future, &mut cx)
+}
+
+/// F4: if the recovery pass is cancelled while awaiting a parked fiber's gated
+/// cleanup, the single-recoverer latch must be released (RAII), so the next
+/// `when_idle` recovers the parked fibers instead of hanging forever.
+#[test]
+fn f4_cancelled_recovery_releases_the_latch_for_the_next_when_idle() {
+    watchdog("f4-latch", Duration::from_secs(60), || {
+        let gate = Arc::new(AsyncLatch::default());
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        let (root, fibers) = f1_chain(4, gate.clone(), runs.clone());
+        f1_park_mid_cascade(&fibers[0]);
+        assert!(fibers[1..]
+            .iter()
+            .any(|fiber| fiber.state() == FiberState::Unloading));
+
+        // First `when_idle`: recovery starts, unloads the first parked fiber and
+        // parks on its gated cleanup. Drop the future mid-recovery.
+        let mut first = Box::pin(root.when_idle());
+        assert!(
+            poll_once_pin(first.as_mut()).is_pending(),
+            "F4 setup: the first when_idle must start recovery and wait on the gate"
+        );
+        drop(first);
+
+        gate.open();
+        // Old (manual begin/end) implementation left the latch set and this
+        // second call skipped recovery forever -> the watchdog would fire.
+        let (done_tx, done_rx) = mpsc::channel();
+        let idle_root = root.clone();
+        std::thread::spawn(move || {
+            block_on(idle_root.when_idle());
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("F4: when_idle must recover after a cancelled recovery pass");
+        assert!(
+            fibers
+                .iter()
+                .all(|fiber| fiber.state() != FiberState::Unloading),
+            "F4: no fiber may stay parked in Unloading after the recovery retry"
+        );
+        assert_eq!(
+            runs.lock().unwrap().len(),
+            4,
+            "F4: each restored cleanup must run exactly once"
+        );
+        let _ = root.dispose_all();
+        assert!(root.registry().keys().is_empty());
+    });
+}
+
+struct F5Blocker {
+    started: Mutex<Option<mpsc::Sender<()>>>,
+    gate: Arc<AsyncLatch>,
+    runs: Arc<AtomicUsize>,
+}
+
+impl Plugin for F5Blocker {
+    fn name(&self) -> &'static str {
+        "f5-blocker"
+    }
+
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        let started = self.started.lock().unwrap().take();
+        let gate = self.gate.clone();
+        let runs = self.runs.clone();
+        ctx.effect_async_labeled("f5-blocker-cleanup", move || {
+            vec![zeokeel_cordis::cleanup_async(move || {
+                let started = started;
+                let gate = gate.clone();
+                let runs = runs.clone();
+                async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    if let Some(started) = started {
+                        let _ = started.send(());
+                    }
+                    gate.wait().await;
+                }
+            })]
+        })?;
+        Ok(())
+    }
+}
+
+/// F5: `when_idle` must keep recovering while it waits, not only at entry.
+///
+/// Scenario: another unload body is in flight when `when_idle` enters (recovery
+/// is skipped), and *then* a cancelled cascade parks new frames. The waiter must
+/// be woken by `park_unload`/unload-completion, recover both parked sets once
+/// the in-flight unload ends, and return without hanging.
+#[test]
+fn f5_when_idle_recovers_parked_frames_that_appear_while_waiting() {
+    watchdog("f5-wait", Duration::from_secs(60), || {
+        let root = Context::root();
+
+        // A separate unload body that stays in flight across the whole scenario.
+        let blocker_gate = Arc::new(AsyncLatch::default());
+        let blocker_runs = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker = root
+            .plugin(
+                Arc::new(F5Blocker {
+                    started: Mutex::new(Some(started_tx)),
+                    gate: blocker_gate.clone(),
+                    runs: blocker_runs.clone(),
+                }),
+                Value::Null,
+            )
+            .expect("blocker");
+        let blocker_for_thread = blocker.clone();
+        let in_flight = std::thread::spawn(move || {
+            let mut dispose = Box::pin(blocker_for_thread.dispose_async());
+            assert!(
+                poll_once_pin(dispose.as_mut()).is_pending(),
+                "F5 setup: the blocker unload stays in flight"
+            );
+            let _ = release_rx.recv();
+            drop(dispose); // cancel: blocker frame becomes parked
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the blocker cleanup started");
+
+        // A dependency chain is cancelled while the blocker unload is in flight
+        // (same registry as the blocker: one root context).
+        let gate = Arc::new(AsyncLatch::default());
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        let fibers = f1_chain_on(&root, 3, gate.clone(), runs.clone());
+        f1_park_mid_cascade(&fibers[0]);
+
+        // Wait for idle: at entry an unload body is active, so the up-front
+        // recovery pass is skipped; the parked frames appear/are noticed later.
+        let (done_tx, done_rx) = mpsc::channel();
+        let idle_root = root.clone();
+        std::thread::spawn(move || {
+            block_on(idle_root.when_idle());
+            let _ = done_tx.send(());
+        });
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Let both the chain cleanups and the blocker cleanup finish, then end
+        // the in-flight unload (which parks the blocker frame and wakes waiters).
+        gate.open();
+        blocker_gate.open();
+        release_tx.send(()).expect("release blocker thread");
+        in_flight.join().expect("blocker thread");
+        done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("F5: when_idle must recover parked frames that appear while waiting");
+
+        for (index, fiber) in fibers.iter().enumerate() {
+            assert_ne!(
+                fiber.state(),
+                FiberState::Unloading,
+                "F5: chain fiber {index} must not stay Unloading"
+            );
+        }
+        assert_ne!(
+            blocker.state(),
+            FiberState::Unloading,
+            "F5: the cancelled blocker must be recovered too"
+        );
+        let mut recorded = runs.lock().unwrap().clone();
+        recorded.sort_unstable();
+        assert_eq!(
+            recorded,
+            vec!["F1", "F2", "F3"],
+            "F5: every restored dependent cleanup must run exactly once"
+        );
+        // The provider's own deferred cleanup is A-9 retry work: an explicit
+        // retry drains it exactly once (no double run of the dependents).
+        block_on(fibers[0].dispose_async()).expect("retried provider dispose");
+        let mut recorded = runs.lock().unwrap().clone();
+        recorded.sort_unstable();
+        assert_eq!(
+            recorded,
+            vec!["F0", "F1", "F2", "F3"],
+            "F5: retained provider cleanup must run exactly once on retry"
+        );
+        assert_eq!(
+            blocker_runs.load(Ordering::SeqCst),
+            1,
+            "F5: the blocker cleanup ran once (in flight before cancellation)"
+        );
+        let _ = root.dispose_all();
+        assert!(root.registry().keys().is_empty());
+    });
+}
+
+/// F5: 20 consecutive cancel -> when_idle rounds must never hang and must leave
+/// no `Unloading` fiber behind (discriminator for the shared recovery latch).
+#[test]
+fn f5_repeated_cancel_then_when_idle_does_not_hang() {
+    watchdog("f5-loop", Duration::from_secs(120), || {
+        for round in 0..20 {
+            let gate = Arc::new(AsyncLatch::default());
+            let runs = Arc::new(Mutex::new(Vec::new()));
+            let (root, fibers) = f1_chain(3, gate.clone(), runs.clone());
+            f1_park_mid_cascade(&fibers[0]);
+            gate.open();
+            let (done_tx, done_rx) = mpsc::channel();
+            let idle_root = root.clone();
+            std::thread::spawn(move || {
+                block_on(idle_root.when_idle());
+                let _ = done_tx.send(());
+            });
+            done_rx
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap_or_else(|_| panic!("F5: round {round} when_idle hung"));
+            // Dependents are recovered with their cleanups (P0's own deferred
+            // cleanup is A-9 retry work, drained below exactly once).
+            assert_eq!(
+                runs.lock().unwrap().len(),
+                3,
+                "F5 round {round}: dependent cleanups must run exactly once"
+            );
+            for fiber in &fibers {
+                assert_ne!(fiber.state(), FiberState::Unloading);
+            }
+            block_on(fibers[0].dispose_async()).expect("retried provider dispose");
+            assert_eq!(
+                runs.lock().unwrap().len(),
+                4,
+                "F5 round {round}: provider cleanup runs exactly once on retry"
+            );
+            let _ = root.dispose_all();
+            assert!(root.registry().keys().is_empty());
+        }
+    });
+}
+
+/// F4 (E scenario): cancelling the recovery pass started from `refresh_async`
+/// must not lose the took-out batch — a later `when_idle` must still recover
+/// every parked fiber (no permanently `Unloading` entry).
+#[test]
+fn f4_cancelled_refresh_recovery_is_retried_by_when_idle() {
+    watchdog("f4-refresh-cancel", Duration::from_secs(60), || {
+        let gate = Arc::new(AsyncLatch::default());
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        let (root, fibers) = f1_chain(3, gate.clone(), runs.clone());
+        f1_park_mid_cascade(&fibers[0]);
+        assert!(fibers[1..]
+            .iter()
+            .any(|fiber| fiber.state() == FiberState::Unloading));
+
+        // First poll of refresh_async: refresh_all_async starts the recovery and
+        // parks on the first parked fiber's gated cleanup. Cancel it there.
+        let mut refresh = Box::pin(root.refresh_async());
+        assert!(
+            poll_once_pin(refresh.as_mut()).is_pending(),
+            "F4 setup: refresh_async recovery must park on the gate"
+        );
+        drop(refresh);
+
+        gate.open();
+        let (done_tx, done_rx) = mpsc::channel();
+        let idle_root = root.clone();
+        std::thread::spawn(move || {
+            block_on(idle_root.when_idle());
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("F4: when_idle must recover frames lost by a cancelled recovery");
+        for (index, fiber) in fibers.iter().enumerate() {
+            assert_ne!(
+                fiber.state(),
+                FiberState::Unloading,
+                "F4: fiber {index} was lost by the cancelled recovery"
+            );
+        }
+        assert_eq!(
+            runs.lock().unwrap().len(),
+            3,
+            "F4: recovered dependents' cleanups run exactly once"
+        );
+        let _ = root.dispose_all();
+        assert!(root.registry().keys().is_empty());
+    });
+}
+
+// ---------------------------------------------------------------------------
+// F5 (round 5, A finding): the RAW public `Registry::when_idle` must also be
+// recovery-aware — a parked cancelled cascade must not hang it.
+// ---------------------------------------------------------------------------
+
+/// A raw `registry.when_idle()` waiter (not `Context::when_idle`) must recover
+/// parked frames: enter while an unload body is in flight, cancel a cascade to
+/// park frames, then let everything finish — the raw waiter returns without a
+/// permanent `Unloading`. Also checks the immediate-return fast path.
+#[test]
+fn f5_raw_registry_when_idle_recovers_parked_cascade() {
+    watchdog("f5-raw", Duration::from_secs(60), || {
+        let root = Context::root();
+        let registry = root.registry();
+        // Public API invariant: the waiter stays `Send` (hosts poll it on a
+        // worker thread; the recovery-aware state machine must not break that).
+        fn assert_send<T: Send>(value: &T) -> bool {
+            let _ = value;
+            true
+        }
+        {
+            let waiter = registry.when_idle();
+            assert!(assert_send(&waiter));
+        }
+        // Fast path: a genuinely idle registry resolves immediately (repeatedly).
+        for _ in 0..3 {
+            block_on(registry.when_idle());
+        }
+
+        // An unrelated unload body stays in flight while the raw waiter enters.
+        let blocker_gate = Arc::new(AsyncLatch::default());
+        let blocker_runs = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let blocker = root
+            .plugin(
+                Arc::new(F5Blocker {
+                    started: Mutex::new(Some(started_tx)),
+                    gate: blocker_gate.clone(),
+                    runs: blocker_runs.clone(),
+                }),
+                Value::Null,
+            )
+            .expect("blocker");
+        let blocker_for_thread = blocker.clone();
+        let in_flight = std::thread::spawn(move || {
+            let mut dispose = Box::pin(blocker_for_thread.dispose_async());
+            assert!(poll_once_pin(dispose.as_mut()).is_pending());
+            let _ = release_rx.recv();
+            drop(dispose);
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("blocker cleanup started");
+
+        let gate = Arc::new(AsyncLatch::default());
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        let fibers = f1_chain_on(&root, 3, gate.clone(), runs.clone());
+        f1_park_mid_cascade(&fibers[0]);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let raw_registry = registry.clone();
+        std::thread::spawn(move || {
+            block_on(raw_registry.when_idle());
+            let _ = done_tx.send(());
+        });
+        std::thread::sleep(Duration::from_millis(100));
+
+        gate.open();
+        blocker_gate.open();
+        release_tx.send(()).expect("release blocker");
+        in_flight.join().expect("blocker thread");
+        done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("F5: raw Registry::when_idle must recover parked frames");
+
+        for (index, fiber) in fibers.iter().enumerate() {
+            assert_ne!(
+                fiber.state(),
+                FiberState::Unloading,
+                "F5 raw: chain fiber {index} must not stay Unloading"
+            );
+        }
+        assert_ne!(blocker.state(), FiberState::Unloading);
+        assert_eq!(
+            runs.lock().unwrap().len(),
+            3,
+            "F5 raw: restored dependent cleanups run exactly once"
+        );
+        let _ = root.dispose_all();
+        assert!(root.registry().keys().is_empty());
+    });
+}
+
+/// F5 (A probe `whenidle-preexisting-parked`): the waiter enters while a slow
+/// unload is in flight and **no** parked frame exists yet; the cancellation that
+/// parks frames happens *during* the wait. The waiter must be woken by the
+/// parking/unload-completion, recover the new parked set and return — for both
+/// `Context::when_idle` and the raw `Registry::when_idle`.
+#[test]
+fn f5_when_idle_sees_parked_frames_parked_after_entry() {
+    watchdog("f5-preexisting", Duration::from_secs(120), || {
+        fn scenario(raw_registry_api: bool) {
+            let root = Context::root();
+            let registry = root.registry();
+
+            // 1) A slow unload is in flight (active_unloads > 0), no parked yet.
+            let blocker_gate = Arc::new(AsyncLatch::default());
+            let blocker_runs = Arc::new(AtomicUsize::new(0));
+            let (started_tx, started_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let blocker = root
+                .plugin(
+                    Arc::new(F5Blocker {
+                        started: Mutex::new(Some(started_tx)),
+                        gate: blocker_gate.clone(),
+                        runs: blocker_runs.clone(),
+                    }),
+                    Value::Null,
+                )
+                .expect("blocker");
+            let blocker_for_thread = blocker.clone();
+            let in_flight = std::thread::spawn(move || {
+                let mut dispose = Box::pin(blocker_for_thread.dispose_async());
+                assert!(poll_once_pin(dispose.as_mut()).is_pending());
+                let _ = release_rx.recv();
+                drop(dispose);
+            });
+            started_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("blocker cleanup started");
+
+            // 2) The waiter enters now: no parked exists, recovery is skipped
+            //    and the loop waits behind the in-flight unload.
+            let (done_tx, done_rx) = mpsc::channel();
+            let wait_root = root.clone();
+            let wait_registry = registry.clone();
+            std::thread::spawn(move || {
+                if raw_registry_api {
+                    block_on(wait_registry.when_idle());
+                } else {
+                    block_on(wait_root.when_idle());
+                }
+                let _ = done_tx.send(());
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                done_rx.try_recv().is_err(),
+                "F5 preexisting: when_idle must wait behind the in-flight unload"
+            );
+
+            // 3) A cancellation parks a new frame while the waiter sleeps.
+            let gate = Arc::new(AsyncLatch::default());
+            let runs = Arc::new(Mutex::new(Vec::new()));
+            let fibers = f1_chain_on(&root, 3, gate.clone(), runs.clone());
+            f1_park_mid_cascade(&fibers[0]);
+            assert!(fibers[1..]
+                .iter()
+                .any(|fiber| fiber.state() == FiberState::Unloading));
+
+            // 4) Let everything finish: the unload ends, its frame parks, waiters
+            //    are notified, and the parked set becomes recoverable.
+            gate.open();
+            blocker_gate.open();
+            release_tx.send(()).expect("release blocker");
+            in_flight.join().expect("blocker thread");
+            done_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("F5 preexisting: when_idle missed the parked wake");
+            for (index, fiber) in fibers.iter().enumerate() {
+                assert_ne!(
+                    fiber.state(),
+                    FiberState::Unloading,
+                    "F5 preexisting: fiber {index} stuck in Unloading"
+                );
+            }
+            assert_ne!(blocker.state(), FiberState::Unloading);
+            assert_eq!(
+                runs.lock().unwrap().len(),
+                3,
+                "F5 preexisting: restored dependent cleanups run exactly once"
+            );
+            assert_eq!(
+                blocker_runs.load(Ordering::SeqCst),
+                1,
+                "F5 preexisting: blocker cleanup ran exactly once"
+            );
+            assert!(registry.is_idle(), "F5 preexisting: registry must be idle");
+            let _ = root.dispose_all();
+            assert!(root.registry().keys().is_empty());
+        }
+        scenario(false);
+        scenario(true);
+    });
 }

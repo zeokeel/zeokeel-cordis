@@ -334,6 +334,23 @@ impl AsyncDisposer {
         }
     }
 
+    /// Discard an effect that will never be disposed by its owner.
+    ///
+    /// R3-A4: the child-owned `ctx.plugin` ownership effect lives in the
+    /// *parent* fiber's effect list; when the child disposes itself the parent
+    /// detaches that effect and drops it. Dropping an undisposed disposer would
+    /// run `dispose_blocking` (an extra embedder blocking-executor call) and its
+    /// cleanup would re-dispose the already-disposed child (re-triggering the
+    /// deferred drain that belongs to the user's retry). Discarding drops the
+    /// cleanups without running them and marks the disposer settled, so `Drop`
+    /// is a quiet no-op.
+    pub(crate) fn discard(&self) {
+        if let Ok(mut slot) = self.inner.lock() {
+            slot.take();
+        }
+        self.state.finish_drain();
+    }
+
     async fn wait_done(&self) {
         std::future::poll_fn(|cx| {
             if self.state.is_settled() {

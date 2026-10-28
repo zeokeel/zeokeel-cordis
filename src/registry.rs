@@ -14,7 +14,7 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 #[cfg(feature = "supervision")]
 use std::time::Duration;
 
@@ -24,12 +24,34 @@ use crate::context::Context;
 use crate::error::Result;
 use crate::fiber::{
     activate_fiber, activate_fiber_async, dependencies_ready, dependencies_satisfied,
-    unload_contained, unload_contained_async, Fiber, FiberState,
+    recover_parked_unloads_async, recover_parked_unloads_blocking, unload_contained,
+    unload_contained_async, Fiber, FiberData, FiberRef, FiberState,
 };
 #[cfg(feature = "supervision")]
 use crate::l2::{FiberQuota, StalledFiber};
 
 static IDLE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+// ---------------------------------------------------------------------------
+// C4: per-thread plugin-registration ownership
+// ---------------------------------------------------------------------------
+//
+// `ctx.plugin(...)` holds a `RegistrationGuard` for the whole
+// "create → internal/plugin hook → activate" window (FIX-11b). A host that
+// calls `when_idle()` *from inside that same window* (typically from an
+// `internal/plugin` hook) can never make progress by waiting: the registration
+// that keeps the registry busy is blocked on the very thread that is waiting.
+// The registry therefore records which **thread created** each in-flight
+// registration; the quiescence check used by `when_idle` excludes this thread's
+// own registrations (and only those), so a hook can observe "everything except
+// my own registration is quiet" instead of deadlocking. Other threads'
+// registrations are still counted, so external waiters keep the FIX-11b
+// guarantee.
+//
+// The owner is recorded on the `Registry` (not in a thread-local) because the
+// guard is held across `.await` in `plugin_async` and a multi-thread runtime may
+// poll/drop the future on a different worker thread: the decrement must target
+// the *creating* thread's count, not the dropping thread's.
 
 /// Stable identity of one plugin runtime.
 ///
@@ -179,36 +201,175 @@ pub enum PluginKind {
     Async(Arc<dyn AsyncPlugin>),
 }
 
+// ---------------------------------------------------------------------------
+// C2: contained plugin metadata callbacks
+// ---------------------------------------------------------------------------
+//
+// `Plugin::name/key/inject/config_schema` are **embedder** code. The kernel calls
+// them from plugin creation, replacement, restart, diagnostics and dependency
+// resolution, so a panicking metadata callback must not unwind through a
+// `Result` API or poison kernel locks. Contract (documented on the methods):
+// a panic is logged and degrades deterministically:
+//   * `name()`  -> `"<panicked plugin>"` (diagnostics/runtime display name),
+//   * `key()`   -> `PluginKey::Named("<panicked plugin>")` (all panicking-key
+//                  plugins then share one runtime; they are broken anyway),
+//   * `inject()` -> `&[]` (the plugin activates without dependency gating),
+//   * `config_schema()` -> `None` (raw config accepted, no validation).
+// The degradation is logged at `error!` level; it is best-effort isolation, not
+// a replacement for fixing the plugin.
+
+/// Display name used when a plugin's `name()` callback panics (C2).
+pub(crate) const PANICKED_PLUGIN_NAME: &str = "<panicked plugin>";
+
+/// Contained `Plugin::name` / `AsyncPlugin::name` (C2).
+pub(crate) fn plugin_name_contained(plugin: &dyn Plugin) -> &'static str {
+    match catch_unwind(AssertUnwindSafe(|| plugin.name())) {
+        Ok(name) => name,
+        Err(payload) => {
+            crate::fiber::log_cleanup_panic("Plugin::name metadata callback", payload.as_ref());
+            PANICKED_PLUGIN_NAME
+        }
+    }
+}
+
+/// Contained `AsyncPlugin::name` (C2).
+pub(crate) fn async_plugin_name_contained(plugin: &dyn AsyncPlugin) -> &'static str {
+    match catch_unwind(AssertUnwindSafe(|| plugin.name())) {
+        Ok(name) => name,
+        Err(payload) => {
+            crate::fiber::log_cleanup_panic(
+                "AsyncPlugin::name metadata callback",
+                payload.as_ref(),
+            );
+            PANICKED_PLUGIN_NAME
+        }
+    }
+}
+
+/// Contained `Plugin::key` (C2): a panicking key degrades to the shared
+/// panicked-plugin runtime instead of unwinding out of `ctx.plugin`.
+///
+/// C2 caveat: every plugin whose `Plugin::key()` panics is registered under the
+/// same shared `PluginKey::Named("<panicked plugin>")` runtime. Per-runtime
+/// registry operations (`keys`, `replace`, `delete`, size accounting) therefore
+/// treat all such degraded plugins as ONE runtime: `replace`/`delete` affect
+/// them together and no individual targeting is possible. This is deliberate
+/// best-effort isolation of already-broken plugins, not a supported setup.
+pub(crate) fn plugin_key_contained(plugin: &dyn Plugin) -> PluginKey {
+    match catch_unwind(AssertUnwindSafe(|| plugin.key())) {
+        Ok(key) => key,
+        Err(payload) => {
+            crate::fiber::log_cleanup_panic("Plugin::key metadata callback", payload.as_ref());
+            PluginKey::Named(PANICKED_PLUGIN_NAME)
+        }
+    }
+}
+
+/// Contained `AsyncPlugin::key` (C2). Same shared-degraded-runtime caveat as
+/// [`plugin_key_contained`].
+pub(crate) fn async_plugin_key_contained(plugin: &dyn AsyncPlugin) -> PluginKey {
+    match catch_unwind(AssertUnwindSafe(|| plugin.key())) {
+        Ok(key) => key,
+        Err(payload) => {
+            crate::fiber::log_cleanup_panic("AsyncPlugin::key metadata callback", payload.as_ref());
+            PluginKey::Named(PANICKED_PLUGIN_NAME)
+        }
+    }
+}
+
+/// Contained `Plugin::inject` (C2): a panicking dependency declaration degrades
+/// to "no dependencies" (logged) instead of failing the lifecycle operation.
+pub(crate) fn plugin_inject_contained(plugin: &dyn Plugin) -> &'static [&'static str] {
+    match catch_unwind(AssertUnwindSafe(|| plugin.inject())) {
+        Ok(inject) => inject,
+        Err(payload) => {
+            crate::fiber::log_cleanup_panic("Plugin::inject metadata callback", payload.as_ref());
+            &[]
+        }
+    }
+}
+
+/// Contained `AsyncPlugin::inject` (C2).
+pub(crate) fn async_plugin_inject_contained(plugin: &dyn AsyncPlugin) -> &'static [&'static str] {
+    match catch_unwind(AssertUnwindSafe(|| plugin.inject())) {
+        Ok(inject) => inject,
+        Err(payload) => {
+            crate::fiber::log_cleanup_panic(
+                "AsyncPlugin::inject metadata callback",
+                payload.as_ref(),
+            );
+            &[]
+        }
+    }
+}
+
+/// Contained `Plugin::config_schema` (C2): a panicking schema accessor degrades
+/// to "no schema" (raw config accepted), logged.
+pub(crate) fn plugin_schema_contained(
+    plugin: &dyn Plugin,
+) -> Option<Arc<dyn crate::config::ConfigSchema>> {
+    match catch_unwind(AssertUnwindSafe(|| plugin.config_schema())) {
+        Ok(schema) => schema,
+        Err(payload) => {
+            crate::fiber::log_cleanup_panic(
+                "Plugin::config_schema metadata callback",
+                payload.as_ref(),
+            );
+            None
+        }
+    }
+}
+
+/// Contained `AsyncPlugin::config_schema` (C2).
+pub(crate) fn async_plugin_schema_contained(
+    plugin: &dyn AsyncPlugin,
+) -> Option<Arc<dyn crate::config::ConfigSchema>> {
+    match catch_unwind(AssertUnwindSafe(|| plugin.config_schema())) {
+        Ok(schema) => schema,
+        Err(payload) => {
+            crate::fiber::log_cleanup_panic(
+                "AsyncPlugin::config_schema metadata callback",
+                payload.as_ref(),
+            );
+            None
+        }
+    }
+}
+
 impl PluginKind {
-    /// Display/diagnostic name.
+    /// Display/diagnostic name (C2: a panicking callback degrades to
+    /// `PANICKED_PLUGIN_NAME`, logged).
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Sync(plugin) => plugin.name(),
-            Self::Async(plugin) => plugin.name(),
+            Self::Sync(plugin) => plugin_name_contained(plugin.as_ref()),
+            Self::Async(plugin) => async_plugin_name_contained(plugin.as_ref()),
         }
     }
 
-    /// Registry identity.
+    /// Registry identity (C2: a panicking callback degrades to
+    /// [`PluginKey::Named`] with `PANICKED_PLUGIN_NAME`, logged).
     pub fn key(&self) -> PluginKey {
         match self {
-            Self::Sync(plugin) => plugin.key(),
-            Self::Async(plugin) => plugin.key(),
+            Self::Sync(plugin) => plugin_key_contained(plugin.as_ref()),
+            Self::Async(plugin) => async_plugin_key_contained(plugin.as_ref()),
         }
     }
 
-    /// Declared service dependencies.
+    /// Declared service dependencies (C2: a panicking callback degrades to no
+    /// dependencies, logged).
     pub fn inject(&self) -> &'static [&'static str] {
         match self {
-            Self::Sync(plugin) => plugin.inject(),
-            Self::Async(plugin) => plugin.inject(),
+            Self::Sync(plugin) => plugin_inject_contained(plugin.as_ref()),
+            Self::Async(plugin) => async_plugin_inject_contained(plugin.as_ref()),
         }
     }
 
-    /// Optional config schema.
+    /// Optional config schema (C2: a panicking callback degrades to no schema,
+    /// logged).
     pub fn config_schema(&self) -> Option<Arc<dyn crate::config::ConfigSchema>> {
         match self {
-            Self::Sync(plugin) => plugin.config_schema(),
-            Self::Async(plugin) => plugin.config_schema(),
+            Self::Sync(plugin) => plugin_schema_contained(plugin.as_ref()),
+            Self::Async(plugin) => async_plugin_schema_contained(plugin.as_ref()),
         }
     }
 
@@ -265,20 +426,83 @@ pub struct Registry {
     /// `activate`). While this is non-zero the registry is not quiescent
     /// (FIX-11b), so `when_idle` cannot return before activation starts.
     pending_registrations: AtomicUsize,
+    /// C4: in-flight registrations per **creating** thread. Used by
+    /// `when_idle` to exclude the caller's own registrations (waiting for them
+    /// would self-deadlock). Kept on the registry, not in a thread-local, so a
+    /// guard that is dropped on another thread decrements the right owner.
+    registration_owners: Mutex<HashMap<std::thread::ThreadId, usize>>,
+    /// F1: fibers left `Unloading` by a **cancelled** async cascade (their
+    /// remaining frames were parked instead of blocking on reactor cleanups).
+    /// `dispose_all` / `refresh_all(_async)` / a root `dispose(_async)` / the
+    /// next `when_idle` recover them, so a cancel can never leave a permanent
+    /// `Unloading` that blocks quiescence (A-9). Entries are weak and pruned, so
+    /// the list stays proportional to concurrently parked fibers.
+    parked_unloads: Mutex<Vec<(Weak<Mutex<FiberData>>, FiberState)>>,
+    /// F1: single-recoverer guard. A second recoverer (another thread, or a
+    /// nested call from a cleanup) returns immediately; the first one finishes
+    /// the recovery and any leftover parked fiber is picked up by the next call.
+    recovering_parked: AtomicBool,
+    /// F1: number of unload/cascade bodies currently running on any thread.
+    /// Recovery is skipped while one is active: a cancellation unwinds through
+    /// `withdraw`/`refresh_dependents` on the cancelling thread, and recovering
+    /// other fibers from that nested refresh would run reactor-backed cleanups
+    /// inside `Drop` (deadlock). The parked fibers stay recoverable by the next
+    /// root operation (`dispose_all`/`refresh_*`/`dispose(_async)`/`when_idle`).
+    active_unloads: AtomicUsize,
 }
 
-/// Future returned by [`Registry::when_idle`]; unregisters its waker on drop.
-pub struct IdleWait<'a> {
+/// Future returned by `Registry::wait_idle_or_recoverable` (F5).
+///
+/// Resolves when the registry is idle **or** there is a parked unload that can
+/// be recovered right now (`parked && !active_unloads`). `when_idle` uses it
+/// instead of the plain `IdleWait` so a cancel that produces new parked frames
+/// while we are waiting is noticed and recovered, instead of being missed by a
+/// single up-front recovery pass.
+pub struct IdleOrRecoverableWait<'a> {
     registry: &'a Registry,
     id: u64,
 }
 
-impl Drop for IdleWait<'_> {
+impl Drop for IdleOrRecoverableWait<'_> {
     fn drop(&mut self) {
         if let Ok(mut waiters) = self.registry.idle_waiters.lock() {
             waiters.retain(|(id, _)| *id != self.id);
         }
     }
+}
+
+impl std::future::Future for IdleOrRecoverableWait<'_> {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        let this = self.get_mut();
+        if this.registry.is_recoverable_or_idle() {
+            return std::task::Poll::Ready(());
+        }
+        if let Ok(mut waiters) = this.registry.idle_waiters.lock() {
+            waiters.retain(|(id, _)| *id != this.id);
+            waiters.push((this.id, cx.waker().clone()));
+        }
+        if this.registry.is_recoverable_or_idle() {
+            std::task::Poll::Ready(())
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+/// Future returned by [`Registry::when_idle`]; unregisters its waker on drop.
+///
+/// F5/raw-API fix: the *public* `Registry::when_idle` is recovery-aware too —
+/// a cancelled cascade can park fibers as `Unloading`, and a raw waiter that
+/// only re-polled the plain idle condition would hang forever. The future is a
+/// small state machine: it first runs the recovery-aware idle loop
+/// (`when_idle_recovering`), and that loop awaits the raw waiter above.
+pub struct IdleWait<'a> {
+    future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>,
 }
 
 impl std::future::Future for IdleWait<'_> {
@@ -289,18 +513,7 @@ impl std::future::Future for IdleWait<'_> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
         let this = self.get_mut();
-        if this.registry.is_idle() {
-            return std::task::Poll::Ready(());
-        }
-        if let Ok(mut waiters) = this.registry.idle_waiters.lock() {
-            waiters.retain(|(id, _)| *id != this.id);
-            waiters.push((this.id, cx.waker().clone()));
-        }
-        if this.registry.is_idle() {
-            std::task::Poll::Ready(())
-        } else {
-            std::task::Poll::Pending
-        }
+        this.future.as_mut().poll(cx)
     }
 }
 
@@ -347,12 +560,20 @@ impl Drop for RefreshGuard<'_> {
 /// registration+activation window; `is_idle` reports busy while it is alive.
 pub(crate) struct RegistrationGuard<'a> {
     registry: &'a Registry,
+    /// C4: thread that started the registration. `plugin_async` keeps this guard
+    /// across `.await`; a multi-thread runtime may drop (or poll) the future on
+    /// another worker, so the decrement must target the creating thread's count.
+    created_thread: std::thread::ThreadId,
 }
 
 impl Drop for RegistrationGuard<'_> {
     fn drop(&mut self) {
-        // Decrement first, then wake waiters so a re-poll observes the new
-        // state (the last registration may be the only thing keeping it busy).
+        // C4: release exactly the creating thread's count (idempotent / no
+        // underflow), then decrement and wake waiters so a re-poll observes the
+        // new state (the last registration may be the only thing keeping it
+        // busy).
+        self.registry
+            .release_registration_owner(self.created_thread);
         self.registry
             .pending_registrations
             .fetch_sub(1, Ordering::SeqCst);
@@ -514,7 +735,24 @@ impl Registry {
     /// operation guard exists), so `when_idle()` never reports a settled kernel
     /// for a plugin that has not started activating yet.
     pub fn is_idle(&self) -> bool {
-        if self.pending_registrations.load(Ordering::SeqCst) != 0 {
+        self.is_idle_excluding(0)
+    }
+
+    /// Quiescence with `own` registrations of the calling thread excluded (C4).
+    ///
+    /// Used only by [`IdleWait`]: a host waiting from inside its own plugin
+    /// registration window must not wait for that registration. `is_idle()` is
+    /// intentionally strict (the window is not idle for anybody else).
+    fn is_idle_excluding(&self, own: usize) -> bool {
+        let total = self.pending_registrations.load(Ordering::SeqCst);
+        self.is_idle_excluding_with_total(own, total)
+    }
+
+    /// F3: quiescence check from one `(own, total)` snapshot (see
+    /// [`Registry::quiescence_snapshot`]) so a concurrent registration cannot
+    /// slip between the two reads.
+    pub(crate) fn is_idle_excluding_with_total(&self, own: usize, total: usize) -> bool {
+        if total.saturating_sub(own) != 0 {
             return false;
         }
         let fibers = self
@@ -564,11 +802,68 @@ impl Registry {
         }
     }
 
-    /// Resolve once every fiber (including the root fiber) is idle.
-    pub fn when_idle(&self) -> IdleWait<'_> {
-        IdleWait {
+    /// F5: `true` when the caller can make progress: either the registry is
+    /// idle (own registrations excluded) or a parked unload can be recovered
+    /// now. Used by the recovery-aware idle wait.
+    pub(crate) fn is_recoverable_or_idle(&self) -> bool {
+        let (own, total) = self.quiescence_snapshot();
+        if self.is_idle_excluding_with_total(own, total) {
+            return true;
+        }
+        !self.has_active_unload() && self.has_parked_unloads()
+    }
+
+    /// F5: resolve when idle **or** a parked unload became recoverable.
+    pub(crate) fn wait_idle_or_recoverable(&self) -> IdleOrRecoverableWait<'_> {
+        IdleOrRecoverableWait {
             registry: self,
             id: IDLE_SEQ.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// Recovery-aware idle loop: returns when genuinely idle, recovers parked
+    /// unloads whenever they become recoverable, and otherwise waits on the raw
+    /// idle waiter (woken by lifecycle changes / parking). Livelock-bounded; on
+    /// exhaustion it logs and falls back to the raw wait (a later operation
+    /// still recovers).
+    async fn when_idle_recovering(&self) {
+        let limit = self.fiber_count().saturating_add(8).max(16);
+        for _ in 0..limit {
+            let (own, total) = self.quiescence_snapshot();
+            if self.is_idle_excluding_with_total(own, total) {
+                return;
+            }
+            if self.has_parked_unloads() {
+                if self.has_active_unload() {
+                    self.wait_idle_or_recoverable().await;
+                    continue;
+                }
+                crate::fiber::recover_parked_unloads_async(self).await;
+                continue;
+            }
+            // A raw idle wait here would miss a cancel that parks frames while
+            // we sleep behind an in-flight unload (A finding: lost wakeup ->
+            // permanent hang). Wait for "idle OR recoverable parked" instead so
+            // the loop re-checks and recovers.
+            self.wait_idle_or_recoverable().await;
+        }
+        tracing::error!(
+            target: "zeokeel_cordis::registry",
+            "when_idle recovery loop hit its bound; falling back to the recoverable idle wait"
+        );
+        let _ = crate::fiber::recover_parked_unloads_async(self).await;
+        self.wait_idle_or_recoverable().await;
+    }
+
+    /// Resolve once every fiber (including the root fiber) is idle.
+    ///
+    /// F5 (raw API): recovery-aware. A cancelled async cascade can park fibers
+    /// as `Unloading`; waiting for pure quiescence would never return. This
+    /// future runs the same bounded recovery loop as `Context::when_idle`, so
+    /// the public registry API cannot hang on a parked cascade either.
+    pub fn when_idle(&self) -> IdleWait<'_> {
+        IdleWait {
+            future: Box::pin(self.when_idle_recovering()),
         }
     }
 
@@ -977,6 +1272,8 @@ impl Registry {
     /// Child trees are reclaimed per fiber; the first error is returned after
     /// every attempt so a single broken cleanup cannot stop the shutdown.
     pub fn dispose_all(&self) -> Result<()> {
+        // F1: finish fibers parked by a cancelled cascade before shutting down.
+        recover_parked_unloads_blocking(self);
         let fibers = self
             .fibers
             .lock()
@@ -1212,7 +1509,143 @@ impl Registry {
     /// (FIX-11b: `is_idle`/`when_idle` must see the registration window).
     pub(crate) fn begin_registration(&self) -> RegistrationGuard<'_> {
         self.pending_registrations.fetch_add(1, Ordering::SeqCst);
-        RegistrationGuard { registry: self }
+        // C4: record which thread owns the registration, so a `when_idle()`
+        // reached from inside the window (e.g. an `internal/plugin` hook)
+        // excludes it instead of deadlocking, and a guard dropped on another
+        // thread still decrements the right owner.
+        let created_thread = std::thread::current().id();
+        if let Ok(mut owners) = self.registration_owners.lock() {
+            *owners.entry(created_thread).or_insert(0) += 1;
+        }
+        RegistrationGuard {
+            registry: self,
+            created_thread,
+        }
+    }
+
+    /// C4: release one registration count owned by `thread` (no underflow).
+    fn release_registration_owner(&self, thread: std::thread::ThreadId) {
+        if let Ok(mut owners) = self.registration_owners.lock() {
+            if let Some(count) = owners.get_mut(&thread) {
+                if *count > 1 {
+                    *count -= 1;
+                } else {
+                    owners.remove(&thread);
+                }
+            }
+        }
+    }
+
+    /// C4/F3: snapshot `(own registration count of this thread, total pending
+    /// registrations)` under **one** lock.
+    ///
+    /// Reading the two values separately had a TOCTOU window in `when_idle`:
+    /// a registration created on this thread between the reads made the waiter
+    /// exclude a registration it does not own (returning "idle" too early), or
+    /// count one it does own (self-deadlock). The owner map lock is also held
+    /// across the total read, so the pair is taken from one consistent epoch
+    /// (`begin_registration`/`Drop` update the owner map and the atomic in a
+    /// fixed order: the snapshot is conservative in the rare cross-update
+    /// window because `saturating_sub` can only *under*-subtract).
+    pub(crate) fn quiescence_snapshot(&self) -> (usize, usize) {
+        let current = std::thread::current().id();
+        let Ok(owners) = self.registration_owners.lock() else {
+            return (0, self.pending_registrations.load(Ordering::SeqCst));
+        };
+        let own = owners.get(&current).copied().unwrap_or(0);
+        let total = self.pending_registrations.load(Ordering::SeqCst);
+        (own, total)
+    }
+
+    /// F1: remember a fiber whose cascade was cancelled mid-unload, together
+    /// with the state its frame was targeting (dependents end `Pending`, owned
+    /// children end `Disposed`). Deduplicated and pruned so repeated cancels
+    /// cannot grow the list without bound.
+    pub(crate) fn park_unload(&self, data: &FiberRef, target: FiberState) {
+        let Ok(mut parked) = self.parked_unloads.lock() else {
+            return;
+        };
+        parked.retain(|(weak, _)| weak.strong_count() > 0);
+        let duplicate = parked.iter().any(|(weak, _)| {
+            weak.upgrade()
+                .map(|candidate| Arc::ptr_eq(&candidate, data))
+                .unwrap_or(false)
+        });
+        if !duplicate {
+            parked.push((Arc::downgrade(data), target));
+        }
+        drop(parked);
+        // F5: wake `when_idle` waiters so they can run the recovery pass.
+        self.notify_idle();
+    }
+
+    /// F5: whether any parked unload is waiting for recovery (dead entries are
+    /// pruned). Used by the recovery-aware idle wait.
+    pub(crate) fn has_parked_unloads(&self) -> bool {
+        let Ok(mut parked) = self.parked_unloads.lock() else {
+            return false;
+        };
+        parked.retain(|(weak, _)| weak.strong_count() > 0);
+        !parked.is_empty()
+    }
+
+    /// F1: take every parked fiber that is still `Unloading` (deduplicated),
+    /// with the state its frame was targeting. Dead weak entries and entries
+    /// whose fiber already left `Unloading` are dropped, so the caller only sees
+    /// work that still needs finishing.
+    pub(crate) fn take_parked_unloads(&self) -> Vec<(Fiber, FiberState)> {
+        let entries = match self.parked_unloads.lock() {
+            Ok(mut parked) => std::mem::take(&mut *parked),
+            Err(_) => return Vec::new(),
+        };
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut fibers = Vec::new();
+        for (weak, target) in entries {
+            let Some(data) = weak.upgrade() else {
+                continue;
+            };
+            let Ok(fiber) = data.lock() else {
+                continue;
+            };
+            if fiber.state != FiberState::Unloading {
+                continue;
+            }
+            let id = fiber.id;
+            drop(fiber);
+            if seen.insert(id) {
+                fibers.push((Fiber { data }, target));
+            }
+        }
+        fibers
+    }
+
+    /// F1: enter the single-recoverer section; `false` means another recoverer
+    /// is already running (or the lock is poisoned), so the caller just skips.
+    pub(crate) fn begin_recovery(&self) -> bool {
+        !self.recovering_parked.swap(true, Ordering::SeqCst)
+    }
+
+    /// F1: leave the single-recoverer section.
+    pub(crate) fn end_recovery(&self) {
+        self.recovering_parked.store(false, Ordering::SeqCst);
+    }
+
+    /// F1: mark an unload/cascade body as running (see `active_unloads`).
+    pub(crate) fn begin_unload_activity(&self) {
+        self.active_unloads.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// F1: pair of [`Registry::begin_unload_activity`]; wakes the
+    /// recovery-aware idle waiters once the last unload body finishes (F5).
+    pub(crate) fn end_unload_activity(&self) {
+        if self.active_unloads.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.notify_idle();
+        }
+    }
+
+    /// F1: whether any unload/cascade body is currently running.
+    pub(crate) fn has_active_unload(&self) -> bool {
+        self.active_unloads.load(Ordering::SeqCst) != 0
     }
 
     /// Enter the refresh fixed point, or mark the registry dirty when another
@@ -1232,6 +1665,12 @@ impl Registry {
     }
 
     pub(crate) fn refresh_all(&self) {
+        // F1/F4: a **sync** refresh must not recover parked frames: recovery may
+        // need to drain reactor-backed async cleanups, and blocking on them from
+        // a synchronous caller (possibly a reactor thread) deadlocks. Recovery is
+        // owned by the awaitable quiescence entry points (`when_idle`,
+        // `refresh_all_async`) and by `dispose_all`; a parked fiber is simply not
+        // scanned here (it is `Unloading`, not `Active`/`Pending`).
         let Some(_refresh) = self.begin_refresh() else {
             return;
         };
@@ -1294,14 +1733,22 @@ impl Registry {
     ///
     /// Used by provider withdrawal to retire dependents (leaf first) before the
     /// provider's own effects are drained.
-    pub(crate) fn retire_unready_contained(&self) -> bool {
-        let fibers = self
-            .fibers
-            .lock()
-            .map(|fibers| fibers.clone())
-            .unwrap_or_default();
-        let mut progressed = false;
-        for fiber in fibers {
+    /// First `Active` sync fiber whose injected services are no longer
+    /// satisfied (C1: iterative unload cascade candidate).
+    ///
+    /// The unload cascade begins every transitively-unready fiber (mark
+    /// `Unloading` + withdraw its services + take its effects) in a fixed-point
+    /// loop, then drains them in reverse begin order. Scanning for the first
+    /// candidate each round keeps the begin order a topological order: a fiber
+    /// can only become unready after one of its providers was begun, so
+    /// providers always precede their dependents in the frame list.
+    ///
+    /// Async fibers are intentionally not returned: the previous
+    /// `retire_unready_contained` also retired sync dependents only; async
+    /// dependents are re-evaluated by `refresh_async` (parity).
+    pub(crate) fn find_unready_active(&self) -> Option<Fiber> {
+        let fibers = self.fibers.lock().ok()?;
+        for fiber in fibers.iter() {
             if fiber.state() != FiberState::Active {
                 continue;
             }
@@ -1320,14 +1767,26 @@ impl Registry {
             if matches!(plugin, PluginKind::Sync(_))
                 && !dependencies_satisfied(&ctx, deps, &recorded)
             {
-                let _ = unload_contained(&fiber.data, FiberState::Pending);
-                progressed = true;
+                return Some(fiber.clone());
             }
         }
-        progressed
+        None
     }
 
     pub(crate) async fn refresh_all_async(&self) {
+        // F1/F5: recover parked unloads (awaiting reactor-backed deferred
+        // cleanups). If an unload body is in flight, wait until it ends and try
+        // again (bounded) instead of missing parked frames that appear later.
+        for _ in 0..8 {
+            if !self.has_parked_unloads() {
+                break;
+            }
+            if self.has_active_unload() {
+                self.wait_idle_or_recoverable().await;
+                continue;
+            }
+            recover_parked_unloads_async(self).await;
+        }
         let Some(_refresh) = self.begin_refresh() else {
             return;
         };
@@ -1405,5 +1864,163 @@ mod registration_window_tests {
             registry.is_idle(),
             "the registry is idle again once the registration finished"
         );
+    }
+
+    fn poll_once<F: std::future::Future>(
+        future: std::pin::Pin<&mut F>,
+    ) -> std::task::Poll<F::Output> {
+        let waker = std::task::Waker::noop();
+        let mut cx = std::task::Context::from_waker(waker);
+        std::future::Future::poll(future, &mut cx)
+    }
+
+    /// C4: a registration guard created on thread A and dropped on thread B must
+    /// decrement A's count (the `plugin_async` future may be dropped by another
+    /// runtime worker). Before the Registry-level `ThreadId -> count` map this
+    /// leaked the creating thread's count and could make that thread's later
+    /// `when_idle` report idle while other threads still had registrations.
+    #[test]
+    fn cross_thread_drop_releases_the_creating_thread_registration() {
+        // Leaked so the guard (which borrows the registry) can be moved to
+        // another thread; the test process is short-lived.
+        let registry: &'static Registry = Box::leak(Box::new(Registry::new()));
+        let guard = registry.begin_registration();
+        assert_eq!(registry.pending_registrations.load(Ordering::SeqCst), 1);
+        let dropper = std::thread::spawn(move || {
+            // Sanity: the dropping thread does not own the registration.
+            assert_eq!(registry.quiescence_snapshot().0, 0);
+            drop(guard);
+        });
+        dropper.join().expect("dropper");
+        assert_eq!(
+            registry.pending_registrations.load(Ordering::SeqCst),
+            0,
+            "the creating thread's count must be released from the dropping thread"
+        );
+        assert!(
+            registry.registration_owners.lock().unwrap().is_empty(),
+            "no per-thread owner entry may leak"
+        );
+        assert!(registry.is_idle());
+    }
+
+    /// C4: `when_idle` excludes only *this* thread's own registrations. A
+    /// registration owned by **another** thread keeps the waiter pending.
+    #[test]
+    fn when_idle_excludes_only_the_callers_own_registrations() {
+        let registry: &'static Registry = Box::leak(Box::new(Registry::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let guard = registry.begin_registration();
+            started_tx.send(()).expect("started");
+            release_rx.recv().expect("release");
+            drop(guard);
+        });
+        started_rx.recv().expect("registration started");
+        let mut waiter = Box::pin(registry.when_idle());
+        assert!(
+            poll_once(waiter.as_mut()).is_pending(),
+            "FIX-11b: another thread's registration must keep when_idle pending"
+        );
+        drop(waiter);
+        release_tx.send(()).expect("release");
+        holder.join().expect("holder");
+        assert!(registry.is_idle());
+        let mut ready = Box::pin(registry.when_idle());
+        assert!(poll_once(ready.as_mut()).is_ready());
+    }
+
+    /// F3/C4 stress: 50 rounds of cross-thread registration ownership with a
+    /// `when_idle` poll in each window (the snapshot must never exclude another
+    /// thread's registration, and the per-thread map must never leak).
+    #[test]
+    fn idle_snapshot_excludes_only_others_under_cross_thread_churn() {
+        let registry: &'static Registry = Box::leak(Box::new(Registry::new()));
+        for _ in 0..50 {
+            let (created_tx, created_rx) = std::sync::mpsc::channel();
+            let (drop_tx, drop_rx) = std::sync::mpsc::channel();
+            let creator = std::thread::spawn(move || {
+                let guard = registry.begin_registration();
+                created_tx.send(()).expect("created");
+                // Hand the guard to a *different* thread, which drops it.
+                let dropper = std::thread::spawn(move || {
+                    drop_rx.recv().expect("release");
+                    drop(guard);
+                });
+                drop(dropper);
+            });
+            created_rx.recv().expect("guard created");
+            // Another thread owns the registration: an external waiter parks.
+            let mut waiter = Box::pin(registry.when_idle());
+            assert!(
+                poll_once(waiter.as_mut()).is_pending(),
+                "F3: another thread's registration must keep when_idle pending"
+            );
+            drop(waiter);
+            drop_tx.send(()).expect("release");
+            creator.join().expect("creator");
+            // Let the dropper finish before asserting.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !registry.is_idle() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(
+                registry.is_idle(),
+                "F3: registry must be idle after the round"
+            );
+            assert!(
+                registry.registration_owners.lock().unwrap().is_empty(),
+                "F3: the per-thread owner map must not leak entries"
+            );
+        }
+    }
+
+    /// C4: a registration held across yields of a multi-thread runtime (so the
+    /// guard may be polled/dropped on a different worker) still releases exactly
+    /// once, and an external `when_idle` waits for the whole window.
+    #[test]
+    fn tokio_multi_thread_migration_does_not_leak_the_registration() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("multi-thread runtime");
+        let registry: &'static Registry = Box::leak(Box::new(Registry::new()));
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        runtime.block_on(async move {
+            let started_task = started.clone();
+            let release_task = release.clone();
+            let task = tokio::spawn(async move {
+                let _guard = registry.begin_registration();
+                started_task.store(true, Ordering::SeqCst);
+                // Yield enough times to let the scheduler move the task between
+                // worker threads while the guard is held.
+                while !release_task.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(registry.pending_registrations.load(Ordering::SeqCst), 1);
+            });
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            // While the (possibly migrated) registration is in flight, an
+            // external waiter on this thread parks.
+            let mut waiter = Box::pin(registry.when_idle());
+            assert!(
+                poll_once(waiter.as_mut()).is_pending(),
+                "the migrated registration must still keep an external waiter pending"
+            );
+            drop(waiter);
+            release.store(true, Ordering::SeqCst);
+            task.await.expect("registration task");
+        });
+        assert_eq!(
+            registry.pending_registrations.load(Ordering::SeqCst),
+            0,
+            "a migrated registration must not leak its count"
+        );
+        assert!(registry.registration_owners.lock().unwrap().is_empty());
+        assert!(registry.is_idle());
     }
 }

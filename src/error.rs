@@ -39,6 +39,12 @@ pub enum CordisError {
     /// completely. The message contains the original reload error *and* the
     /// error raised by the rollback itself.
     Rollback(String),
+    /// A computed accessor (`Context::accessor`) **rejected** a write: its
+    /// setter returned `false`. Distinct from [`CordisError::ServiceWriteForbidden`]
+    /// (another fiber owns the service) and [`CordisError::AccessorReadOnly`]
+    /// (the accessor has no setter at all): the owner inspected the new value
+    /// and refused it.
+    AccessorWriteRejected(String),
 }
 
 impl fmt::Display for CordisError {
@@ -67,6 +73,9 @@ impl fmt::Display for CordisError {
             }
             Self::Rollback(message) => {
                 write!(f, "replace rollback failed: {message}")
+            }
+            Self::AccessorWriteRejected(name) => {
+                write!(f, "computed accessor rejected the write: {name}")
             }
             Self::AsyncPluginNeedsAsync(name) => {
                 write!(

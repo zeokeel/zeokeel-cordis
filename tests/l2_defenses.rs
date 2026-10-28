@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use std::sync::Mutex;
 use zeokeel_cordis::{
     cleanup, Context, FiberQuota, FiberState, IsolationCapabilities, Plugin, Result,
 };
@@ -234,4 +235,323 @@ fn heartbeat_prevents_false_stall_reports() {
 
     handle.join().expect("thread").expect("fiber");
     root.dispose_all().expect("cleanup");
+}
+
+// ---------------------------------------------------------------------------
+// Audit R3B P2-1: supervision quotas count *live* resources
+// ---------------------------------------------------------------------------
+
+struct EffectRecycler {
+    ctx_slot: Arc<Mutex<Option<Context>>>,
+    kept: Arc<Mutex<Vec<zeokeel_cordis::Disposer>>>,
+}
+
+impl Plugin for EffectRecycler {
+    fn name(&self) -> &'static str {
+        "l2-effect-recycler"
+    }
+
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        *self.ctx_slot.lock().unwrap() = Some(ctx.clone());
+        // Audit R3B P2-1a: registering and releasing effects repeatedly must not
+        // accumulate against `max_effects` (disposed entries are not live).
+        for _ in 0..10 {
+            let disposer = ctx.effect(|| vec![cleanup(|| {})])?;
+            disposer.dispose();
+        }
+        // Exactly `max_effects` live effects are allowed.
+        for _ in 0..2 {
+            let disposer = ctx.effect(|| vec![cleanup(|| {})])?;
+            self.kept.lock().unwrap().push(disposer);
+        }
+        assert!(
+            ctx.effect(|| vec![cleanup(|| {})]).is_err(),
+            "a third *live* effect exceeds max_effects(2)"
+        );
+        Ok(())
+    }
+}
+
+#[test]
+fn disposed_effects_free_the_effect_quota_slot() {
+    let root = Context::root();
+    root.set_quota(FiberQuota::unlimited().max_effects(2));
+    let ctx_slot = Arc::new(Mutex::new(None));
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    let fiber = root
+        .plugin(
+            Arc::new(EffectRecycler {
+                ctx_slot: ctx_slot.clone(),
+                kept: kept.clone(),
+            }),
+            Value::Null,
+        )
+        .expect("fiber");
+    assert_eq!(
+        fiber.state(),
+        FiberState::Active,
+        "released effects must not trip the quota: {:?}",
+        fiber.error()
+    );
+
+    // Releasing the kept effects frees their slots for new registrations.
+    for disposer in kept.lock().unwrap().drain(..) {
+        disposer.dispose();
+    }
+    let ctx = ctx_slot.lock().unwrap().clone().expect("plugin context");
+    ctx.effect(|| vec![cleanup(|| {})])
+        .expect("the recovered slot is reusable");
+    root.dispose_all().expect("cleanup");
+}
+
+struct ListenerRecycler {
+    ctx_slot: Arc<Mutex<Option<Context>>>,
+    kept: Arc<Mutex<Option<zeokeel_cordis::Disposer>>>,
+}
+
+impl Plugin for ListenerRecycler {
+    fn name(&self) -> &'static str {
+        "l2-listener-recycler"
+    }
+
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        *self.ctx_slot.lock().unwrap() = Some(ctx.clone());
+        // Audit R3B P2-1b: disposing the listener disposer must free the slot
+        // immediately (not only when the fiber unloads).
+        for _ in 0..10 {
+            let disposer = ctx.on("l2.recycle", |_| zeokeel_cordis::EventResult::Continue)?;
+            disposer.dispose();
+            // Double dispose is idempotent and must not double-decrement.
+            disposer.dispose();
+        }
+        // One live listener is exactly the quota limit.
+        let kept = ctx.on("l2.recycle", |_| zeokeel_cordis::EventResult::Continue)?;
+        assert!(
+            ctx.on("l2.recycle", |_| zeokeel_cordis::EventResult::Continue)
+                .is_err(),
+            "a second *live* listener exceeds max_listeners(1)"
+        );
+        *self.kept.lock().unwrap() = Some(kept);
+        Ok(())
+    }
+}
+
+#[test]
+fn disposed_listeners_free_the_listener_quota_slot() {
+    let root = Context::root();
+    root.set_quota(FiberQuota::unlimited().max_listeners(1));
+    let ctx_slot = Arc::new(Mutex::new(None));
+    let kept_slot = Arc::new(Mutex::new(None));
+    let fiber = root
+        .plugin(
+            Arc::new(ListenerRecycler {
+                ctx_slot: ctx_slot.clone(),
+                kept: kept_slot.clone(),
+            }),
+            Value::Null,
+        )
+        .expect("fiber");
+    assert_eq!(
+        fiber.state(),
+        FiberState::Active,
+        "released listeners must not trip the quota: {:?}",
+        fiber.error()
+    );
+    assert_eq!(
+        root.events().listener_count(),
+        1,
+        "the kept listener is registered, the recycled ones are gone"
+    );
+
+    // Disposing the last listener frees its slot for a new listener, and the
+    // quota is still enforced for *live* listeners afterwards.
+    let ctx = ctx_slot.lock().unwrap().clone().expect("plugin context");
+    let kept = kept_slot
+        .lock()
+        .unwrap()
+        .take()
+        .expect("kept listener disposer");
+    kept.dispose();
+    assert_eq!(root.events().listener_count(), 0);
+    let disposer = ctx
+        .on("l2.recycle2", |_| zeokeel_cordis::EventResult::Continue)
+        .expect("the freed slot is reusable");
+    assert!(
+        ctx.on("l2.recycle2", |_| zeokeel_cordis::EventResult::Continue)
+            .is_err(),
+        "the live-listener quota is still enforced"
+    );
+    disposer.dispose();
+    root.dispose_all().expect("cleanup");
+}
+
+struct OnceListenerRecycler;
+
+impl Plugin for OnceListenerRecycler {
+    fn name(&self) -> &'static str {
+        "l2-once-recycler"
+    }
+
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        // Audit R3B P2-1b: a `once` listener is removed by the event bus after
+        // its first invocation, without disposing the user-facing disposer, so
+        // the quota slot has to be released then as well.
+        for _ in 0..5 {
+            ctx.once("l2.once", |_| zeokeel_cordis::EventResult::Continue)?;
+            ctx.emit("l2.once", &[]);
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn once_listener_frees_its_quota_slot_when_it_auto_removes() {
+    let root = Context::root();
+    root.set_quota(FiberQuota::unlimited().max_listeners(1));
+    let fiber = root
+        .plugin(Arc::new(OnceListenerRecycler), Value::Null)
+        .expect("fiber");
+    assert_eq!(
+        fiber.state(),
+        FiberState::Active,
+        "auto-removed once listeners must free their slot: {:?}",
+        fiber.error()
+    );
+    assert_eq!(
+        root.events().listener_count(),
+        0,
+        "the event bus removed every once listener"
+    );
+    root.dispose_all().expect("cleanup");
+}
+
+/// Concurrent disposal of one listener disposer releases its slot exactly once
+/// and keeps the slot reusable afterwards (audit R3B P2-1b: idempotent +
+/// concurrency-safe bookkeeping, no double-decrement with the unload path).
+#[test]
+fn listener_quota_release_is_idempotent_and_concurrency_safe() {
+    struct HolderPlugin {
+        ctx_slot: Arc<Mutex<Option<Context>>>,
+        disposer: Arc<Mutex<Option<zeokeel_cordis::Disposer>>>,
+    }
+    impl Plugin for HolderPlugin {
+        fn name(&self) -> &'static str {
+            "l2-listener-holder"
+        }
+
+        fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+            *self.ctx_slot.lock().unwrap() = Some(ctx.clone());
+            let disposer = ctx.on("l2.race", |_| zeokeel_cordis::EventResult::Continue)?;
+            *self.disposer.lock().unwrap() = Some(disposer);
+            Ok(())
+        }
+    }
+
+    let root = Context::root();
+    root.set_quota(FiberQuota::unlimited().max_listeners(1));
+    let ctx_slot = Arc::new(Mutex::new(None));
+    let disposer_slot = Arc::new(Mutex::new(None));
+    let fiber = root
+        .plugin(
+            Arc::new(HolderPlugin {
+                ctx_slot: ctx_slot.clone(),
+                disposer: disposer_slot.clone(),
+            }),
+            Value::Null,
+        )
+        .expect("fiber");
+    assert_eq!(fiber.state(), FiberState::Active);
+
+    let disposer = disposer_slot
+        .lock()
+        .unwrap()
+        .take()
+        .expect("registered listener disposer");
+    let first = disposer.clone();
+    let second = disposer.clone();
+    let a = std::thread::spawn(move || first.dispose());
+    let b = std::thread::spawn(move || second.dispose());
+    a.join().expect("dispose thread");
+    b.join().expect("dispose thread");
+    assert_eq!(root.events().listener_count(), 0);
+
+    let ctx = ctx_slot.lock().unwrap().clone().expect("plugin context");
+    let reuse = ctx
+        .on("l2.race2", |_| zeokeel_cordis::EventResult::Continue)
+        .expect("the slot is free exactly once after concurrent release");
+    reuse.dispose();
+
+    // The fiber unload path must not decrement again (saturating bookkeeping).
+    root.dispose_all().expect("cleanup");
+}
+
+struct ChildRecycler {
+    ctx_slot: Arc<Mutex<Option<Context>>>,
+    kept: Arc<Mutex<Option<zeokeel_cordis::Fiber>>>,
+}
+
+impl Plugin for ChildRecycler {
+    fn name(&self) -> &'static str {
+        "l2-child-recycler"
+    }
+
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        *self.ctx_slot.lock().unwrap() = Some(ctx.clone());
+        // Audit R3B P2-1c: a disposed child used to stay in the parent's weak
+        // child list and keep consuming `max_child_fibers` forever, so "unload
+        // the old child plugin, load a new one" failed. Churn 100 children: the
+        // quota must never be consumed by *historical* creations.
+        for _ in 0..100 {
+            let child = ctx.plugin(Arc::new(ChildPlugin), Value::Null)?;
+            child.dispose()?;
+        }
+        let kept = ctx.plugin(Arc::new(ChildPlugin), Value::Null)?;
+        assert!(
+            ctx.plugin(Arc::new(ChildPlugin), Value::Null).is_err(),
+            "a second *live* child exceeds max_child_fibers(1)"
+        );
+        *self.kept.lock().unwrap() = Some(kept);
+        Ok(())
+    }
+}
+
+#[test]
+fn disposed_child_fibers_free_the_child_quota_slot() {
+    let root = Context::root();
+    root.set_quota(FiberQuota::unlimited().max_child_fibers(1));
+    let ctx_slot = Arc::new(Mutex::new(None));
+    let kept_slot = Arc::new(Mutex::new(None));
+    let fiber = root
+        .plugin(
+            Arc::new(ChildRecycler {
+                ctx_slot: ctx_slot.clone(),
+                kept: kept_slot.clone(),
+            }),
+            Value::Null,
+        )
+        .expect("fiber");
+    assert_eq!(
+        fiber.state(),
+        FiberState::Active,
+        "disposed children must not trip the quota: {:?}",
+        fiber.error()
+    );
+
+    // Disposing the last live child (which also detaches its ownership effect /
+    // weak handle, R3-A4) lowers the live count: a new child is allowed, the
+    // quota is still enforced for two live children.
+    let ctx = ctx_slot.lock().unwrap().clone().expect("plugin context");
+    let kept = kept_slot.lock().unwrap().take().expect("kept child");
+    kept.dispose().expect("dispose kept child");
+    let replacement = ctx
+        .plugin(Arc::new(ChildPlugin), Value::Null)
+        .expect("the freed child slot is reusable");
+    assert!(
+        ctx.plugin(Arc::new(ChildPlugin), Value::Null).is_err(),
+        "the live-child quota is still enforced"
+    );
+    replacement.dispose().expect("dispose replacement");
+
+    root.dispose_all().expect("cleanup");
+    assert_eq!(root.registry().fiber_count(), 0);
 }

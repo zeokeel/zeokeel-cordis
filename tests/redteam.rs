@@ -1183,9 +1183,10 @@ impl Plugin for NameBomb {
     }
 }
 
-/// Register item 11: `Fiber::name()` must call `Plugin::name()` outside the
-/// `FiberData` lock, so a panicking name cannot poison the fiber or make its
-/// state lie.
+/// Register item 11 / C2: `Fiber::name()` must call `Plugin::name()` outside the
+/// `FiberData` lock, contain a panicking name (metadata callbacks are contained
+/// since C2) and degrade to the documented placeholder name instead of poisoning
+/// the fiber or unwinding into the host.
 #[test]
 fn rt21_fiber_name_does_not_call_user_code_under_the_lock() {
     let root = Context::root();
@@ -1202,9 +1203,10 @@ fn rt21_fiber_name_does_not_call_user_code_under_the_lock() {
 
     armed.store(true, Ordering::SeqCst);
     let name = catch_unwind(AssertUnwindSafe(|| fiber.name()));
-    assert!(
-        name.is_err(),
-        "test setup: the probe plugin name should panic while armed"
+    let name = name.expect("C2: a panicking name() must be contained, not re-raised");
+    assert_eq!(
+        name, "<panicked plugin>",
+        "C2: a panicking name() degrades to the documented placeholder"
     );
 
     assert_eq!(

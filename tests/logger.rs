@@ -214,3 +214,33 @@ fn tracing_exporter_forwards_to_tracing() {
     assert!(text.contains("forwarded to tracing"), "output: {text}");
     assert!(text.contains("tracing.demo"), "output: {text}");
 }
+
+/// Audit R3B P3-3: an out-of-range numeric logger level must not silently widen
+/// filtering (it used to fall through `LogLevel::from_u8` to `Debug`); it clamps
+/// to the safe end (`Error`). Documented codes 0..=3 keep their meaning.
+#[test]
+fn invalid_numeric_logger_level_clamps_to_error() {
+    let root = Context::root();
+    let exporter = Arc::new(CountingExporter::default());
+    let _disposer = root.log_exporter(exporter.clone()).expect("exporter");
+
+    let clamped = root.intercept("logger", json!({"level": 99}));
+    let logger = clamped.logger();
+    logger.debug("debug must be filtered", Value::Null);
+    logger.info("info must be filtered", Value::Null);
+    logger.warn("warn must be filtered", Value::Null);
+    assert_eq!(
+        exporter.count(),
+        0,
+        "level 99 clamps to Error, it must not widen filtering to Debug"
+    );
+    logger.error("error is visible", Value::Null);
+    assert_eq!(exporter.count(), 1);
+
+    // In-range numeric levels keep their documented semantics.
+    let verbose = root.intercept("logger", json!({"level": 3}));
+    verbose
+        .logger()
+        .debug("debug visible at level 3", Value::Null);
+    assert_eq!(exporter.count(), 2);
+}

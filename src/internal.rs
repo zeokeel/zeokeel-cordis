@@ -24,6 +24,24 @@
 //! Hooks are registered with the `Context::on_internal_*` methods and are
 //! removed with the owning fiber, exactly like event listeners.
 //!
+//! ## Semantics worth knowing before writing a hook
+//!
+//! - **`internal/get`: `None` means "service absent".** A get hook that returns
+//!   `None` (or a `next.next()` that yields `None`) reports the service as not
+//!   visible; it does **not** mean "skip this hook". A hook that wants the
+//!   remaining hooks to run must call [`GetNext::next`] and pass its value on.
+//! - **`internal/get` uses a global re-entrancy latch.** While any get hook is
+//!   running, further `ctx.get`/`get_named` calls (even for *other* names) go
+//!   straight to the store and **bypass every get hook**; the latch is not a
+//!   per-name recursion guard.
+//! - **A panicking `internal/update` hook cannot veto.** Hook panics are
+//!   contained (`tracing::error!`) and the chain continues with the incoming
+//!   config, so the terminal still commits the raw config and restarts — a
+//!   policy hook that must reject an update has to skip `next` explicitly.
+//! - The other waterfall hooks (`config`/`get`/`set`) follow the same
+//!   panic-containment rule: a panic degrades to "continue with the incoming
+//!   value" (see the private `contained` helper), never to an error.
+//!
 //! Dispatch mode names match Cordis `DispatchMode`.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -193,6 +211,12 @@ impl ConfigNext<'_> {
 ///
 /// The terminal (the actual config store + restart) runs at most once; a hook
 /// that never calls [`UpdateNext::next`] vetoes the update.
+///
+/// **Panic = allow:** a panicking hook is contained (logged, not propagated) and
+/// the chain continues with the incoming config, so the terminal still commits
+/// the new raw config and restarts. A policy hook that must reject dangerous
+/// configs therefore has to veto explicitly (`return` without `next`) instead of
+/// relying on a panic.
 pub struct UpdateNext<'a> {
     hooks: &'a [UpdateHook],
     fiber: &'a Fiber,
@@ -236,6 +260,15 @@ impl UpdateNext<'_> {
 }
 
 /// Continuation of the `internal/get` waterfall.
+///
+/// `None` is the "service absent/invisible" answer, not "skip this hook": only
+/// calling [`GetNext::next`] runs the remaining hooks and, eventually, the store
+/// terminal.
+///
+/// The whole waterfall runs behind a **global** re-entrancy latch
+/// (`InternalBus::get_depth`): a get hook that calls `ctx.get(other)` bypasses
+/// the get hooks of `other` and reads the store directly. This prevents
+/// unbounded recursion at the price of not seeing hooks while one is running.
 pub struct GetNext<'a> {
     hooks: &'a [GetHook],
     ctx: &'a Context,

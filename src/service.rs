@@ -327,3 +327,49 @@ impl Context {
         provide_service(self, service)
     }
 }
+
+#[cfg(test)]
+mod provider_gate_tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::context::Context;
+
+    /// S-3 (audit B-3): a *poisoned* provider lock is not evidence that the
+    /// provider went inactive — it must not make the service permanently
+    /// non-injectable. C2 now contains the embedder metadata panics that used to
+    /// poison the lock, so the state is constructed directly here to keep the
+    /// defensive `Err(_) => true` fallback covered.
+    #[test]
+    fn poisoned_provider_lock_counts_as_active() {
+        let root = Context::root();
+        let data = root.fiber().data.clone();
+        // Poison the provider fiber's lock: panic while holding it.
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = data.lock().expect("lock the provider fiber");
+            panic!("poison the provider lock");
+        }));
+        assert!(poisoned.is_err(), "the lock must be poisoned");
+
+        let entry = ServiceEntry {
+            value: Arc::new("value".to_string()) as ServiceValue,
+            check: None,
+            schema: None,
+            owner: 0,
+            type_id: std::any::TypeId::of::<String>(),
+            provider: Some(Arc::downgrade(&data)),
+            version: 1,
+            withdrawn: false,
+        };
+        assert!(
+            entry.provider_is_active(),
+            "a poisoned provider lock must count as active (S-3)"
+        );
+        assert!(entry.is_available_for_injection());
+
+        // Keep the process-wide (test-process) state clean for other tests.
+        data.clear_poison();
+        assert!(entry.is_available_for_injection());
+    }
+}

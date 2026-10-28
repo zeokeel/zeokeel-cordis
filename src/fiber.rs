@@ -34,6 +34,11 @@ pub(crate) struct EffectNode {
     /// Parent node when this effect was registered while another effect was
     /// running; `Fiber::get_effects` only reports top-level nodes.
     pub(crate) parent: Option<std::sync::Weak<Mutex<EffectNode>>>,
+    /// R3-A4: for the `ctx.plugin` ownership effect of a child fiber, the child
+    /// id. Lets the parent drop this effect when the child is disposed on its
+    /// own, so a long-lived parent that dynamically loads/disposes plugins does
+    /// not accumulate one effect (and one `children` entry) per load forever.
+    pub(crate) owner_child: Option<u64>,
 }
 
 impl EffectNode {
@@ -42,16 +47,35 @@ impl EffectNode {
             label: label.to_string(),
             children: Vec::new(),
             parent: None,
+            owner_child: None,
         }))
     }
 
-    pub(crate) fn snapshot(&self) -> EffectMeta {
+    /// A `ctx.plugin` ownership node tagged with the owned child fiber id.
+    fn new_owned(label: &'static str, child_id: u64) -> Arc<Mutex<EffectNode>> {
+        Arc::new(Mutex::new(EffectNode {
+            label: label.to_string(),
+            children: Vec::new(),
+            parent: None,
+            owner_child: Some(child_id),
+        }))
+    }
+
+    /// Snapshot this node, keeping only children whose effect is still live.
+    ///
+    /// C3: a user-disposed nested effect used to leave a ghost node in its
+    /// parent's `EffectMeta.children` (the parent's node tree is not pruned by
+    /// the disposer). `live` holds the metadata nodes of the fiber's
+    /// not-yet-disposed effects, so the tree reported by
+    /// [`Fiber::get_effects`] matches the live registrations.
+    pub(crate) fn snapshot_filtered(&self, live: &[Arc<Mutex<EffectNode>>]) -> EffectMeta {
         EffectMeta {
             label: self.label.clone(),
             children: self
                 .children
                 .iter()
-                .filter_map(|child| child.lock().ok().map(|child| child.snapshot()))
+                .filter(|child| live.iter().any(|candidate| Arc::ptr_eq(candidate, child)))
+                .filter_map(|child| child.lock().ok().map(|child| child.snapshot_filtered(live)))
                 .collect(),
         }
     }
@@ -276,6 +300,15 @@ impl Fiber {
         let Ok(data) = self.data.lock() else {
             return Vec::new();
         };
+        // C3: the live set lets the tree snapshot of a parent effect drop nested
+        // effects the user already disposed (the disposer does not rewrite the
+        // parent's `children` vector).
+        let live: Vec<Arc<Mutex<EffectNode>>> = data
+            .effects
+            .iter()
+            .filter(|effect| !effect.is_disposed())
+            .map(|effect| Arc::clone(&effect.meta))
+            .collect();
         data.effects
             .iter()
             .filter(|effect| !effect.is_disposed())
@@ -284,7 +317,7 @@ impl Fiber {
                 if meta.parent.is_some() {
                     return None;
                 }
-                Some(meta.snapshot())
+                Some(meta.snapshot_filtered(&live))
             })
             .collect()
     }
@@ -576,6 +609,9 @@ impl Fiber {
     /// call is still deterministic; use [`Fiber::dispose_async`] from async code
     /// so reactor-backed cleanups can make progress.
     pub fn dispose(&self) -> Result<()> {
+        // F1: a root dispose is also a recovery point for fibers parked by an
+        // earlier cancelled cascade, so "retry the root dispose" heals the rest.
+        self.recover_parked_before_root_operation();
         let _guard = begin_operation(&self.data);
         let _lifecycle = begin_lifecycle(&self.data)?;
         unload_fiber(&self.data, FiberState::Disposed)
@@ -585,9 +621,31 @@ impl Fiber {
     /// registration order, and every async cleanup is awaited before the fiber
     /// is marked `Disposed`. Idempotent.
     pub async fn dispose_async(&self) -> Result<()> {
+        // F1: recover fibers parked by an earlier cancelled cascade first.
+        let registry = self
+            .data
+            .lock()
+            .ok()
+            .and_then(|fiber| fiber.registry.clone());
+        if let Some(registry) = registry {
+            recover_parked_unloads_async(&registry).await;
+        }
         let _guard = begin_operation(&self.data);
         let _lifecycle = begin_lifecycle(&self.data)?;
         unload_fiber_async(&self.data, FiberState::Disposed).await
+    }
+
+    /// F1: blocking recovery hook used by [`Fiber::dispose`] (and indirectly by
+    /// `dispose_all`/`refresh_all`, which call the helper themselves).
+    fn recover_parked_before_root_operation(&self) {
+        let registry = self
+            .data
+            .lock()
+            .ok()
+            .and_then(|fiber| fiber.registry.clone());
+        if let Some(registry) = registry {
+            recover_parked_unloads_blocking(&registry);
+        }
     }
 
     /// Unload then activate again with the current config (hot reload).
@@ -1126,6 +1184,187 @@ fn request_child_dispose(weak: &Weak<Mutex<FiberData>>) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// R3-A4: dynamically-loaded child ownership bookkeeping
+// ---------------------------------------------------------------------------
+
+/// Amortized pruning: once the parent's effect list grows past this length, a
+/// registration pass drops ownership effects whose cleanup already ran.
+const OWNERSHIP_PRUNE_THRESHOLD: usize = 1024;
+
+/// Register the `ctx.plugin` ownership effect that keeps a dynamically loaded
+/// child fibre tied to its parent (R3-A4).
+///
+/// The effect is tagged with the child id in its [`EffectNode`], so
+/// [`detach_child_ownership`] can remove exactly this effect when the child is
+/// disposed on its own — without that, a long-lived parent would accumulate one
+/// effect node + one `children` weak entry per load (unbounded on
+/// dynamic-loading / hot-reload hosts). Behaviour is otherwise identical to the
+/// former `ctx.effect_async_labeled("ctx.plugin", ..)` registration in
+/// `context.rs`: on parent unload the cleanup disposes the child, and a busy
+/// child is flagged for its owner to finalize.
+pub(crate) fn register_child_ownership(parent: &Context, child: &Fiber) -> Result<()> {
+    let child_id = child.id();
+    let weak_child = Arc::downgrade(&child.data);
+    let node = EffectNode::new_owned("ctx.plugin", child_id);
+    // Nest under the currently running effect, like any other effect body.
+    {
+        let parent_fiber = parent
+            .inner
+            .fiber
+            .data
+            .lock()
+            .map_err(|_| CordisError::Disposed)?;
+        if let Some(top) = parent_fiber.effect_stack.last() {
+            if let Ok(mut top) = top.lock() {
+                top.children.push(Arc::clone(&node));
+            }
+            if let Ok(mut guard) = node.lock() {
+                guard.parent = Some(Arc::downgrade(top));
+            }
+        }
+    }
+    let disposer = AsyncDisposer::new(vec![crate::async_effects::cleanup_async(move || {
+        let weak_child = weak_child.clone();
+        async move {
+            if let Some(data) = weak_child.upgrade() {
+                let child = Fiber { data };
+                // R3-A4: the parent may be draining this ownership effect only
+                // to detach a child that already disposed itself; re-disposing
+                // it would drain its deferred cleanups early (they belong to an
+                // explicit retry, A-9).
+                if child.state() == FiberState::Disposed {
+                    return;
+                }
+                if child.dispose_async().await.is_err() {
+                    if let Ok(fiber) = child.data.lock() {
+                        fiber.dispose_requested.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+    })]);
+    let mut parent_fiber = parent
+        .inner
+        .fiber
+        .data
+        .lock()
+        .map_err(|_| CordisError::Disposed)?;
+    if parent_fiber.state == FiberState::Disposed || parent_fiber.state == FiberState::Unloading {
+        return Err(CordisError::InactiveEffect);
+    }
+    #[cfg(feature = "supervision")]
+    if let Some(max) = parent.inner.registry.quota_limits().max_effects {
+        if parent_fiber.effects.len() >= max {
+            return Err(CordisError::QuotaExceeded("effects".to_string()));
+        }
+    }
+    prune_disposed_ownership_effects(&mut parent_fiber);
+    let activation = current_activation_epoch(parent_fiber.id)
+        .unwrap_or_else(|| parent_fiber.activation_epoch.load(Ordering::SeqCst));
+    parent_fiber.effects.push(FiberEffect {
+        kind: EffectKind::Async(disposer),
+        meta: node,
+        activation,
+    });
+    Ok(())
+}
+
+/// Amortized safety net for [`detach_child_ownership`]: when the parent effect
+/// list grows large, drop ownership effects whose cleanup already ran. Only
+/// `owner_child`-tagged effects are considered, so a live nested effect can never
+/// be pruned here.
+fn prune_disposed_ownership_effects(fiber: &mut FiberData) {
+    if fiber.effects.len() < OWNERSHIP_PRUNE_THRESHOLD {
+        return;
+    }
+    fiber.effects.retain(|effect| {
+        let owned = effect
+            .meta
+            .lock()
+            .map(|node| node.owner_child.is_some())
+            .unwrap_or(false);
+        !(owned && effect.is_disposed())
+    });
+}
+
+/// Remove a disposed child's ownership effect from its parent (R3-A4).
+///
+/// Best-effort and idempotent: the parent may already be unloading/disposed (its
+/// effect list is then already drained). Locks are only taken briefly and in the
+/// established order parent-fiber → parent.children → node; the dropped
+/// disposers run outside the parent lock.
+fn detach_child_ownership(data: &FiberRef) {
+    let (child_id, parent_data) = {
+        let Ok(fiber) = data.lock() else {
+            return;
+        };
+        (
+            fiber.id,
+            fiber.parent_ref().map(|ctx| ctx.inner.fiber.data.clone()),
+        )
+    };
+    let Some(parent_data) = parent_data else {
+        return;
+    };
+    let mut removed_effects: Vec<FiberEffect> = Vec::new();
+    let mut removed_nodes: Vec<Arc<Mutex<EffectNode>>> = Vec::new();
+    {
+        let Ok(mut parent) = parent_data.lock() else {
+            return;
+        };
+        let mut kept = Vec::with_capacity(parent.effects.len());
+        for effect in std::mem::take(&mut parent.effects) {
+            let owned = effect
+                .meta
+                .lock()
+                .map(|node| node.owner_child == Some(child_id))
+                .unwrap_or(false);
+            if owned {
+                removed_nodes.push(Arc::clone(&effect.meta));
+                removed_effects.push(effect);
+            } else {
+                kept.push(effect);
+            }
+        }
+        parent.effects = kept;
+        // Drop the child from the parent's weak ownership list as well (the
+        // register path pushes one entry per child; unlinking it keeps the list
+        // proportional to the *live* children).
+        if let Ok(mut children) = parent.children.lock() {
+            children.retain(|weak| match weak.upgrade() {
+                Some(child_data) => child_data.lock().map(|f| f.id != child_id).unwrap_or(true),
+                None => false,
+            });
+        };
+    }
+    // Unlink the ownership nodes from their enclosing effect node (if any).
+    for node in removed_nodes {
+        let parent_weak = node.lock().ok().and_then(|guard| guard.parent.clone());
+        if let Some(parent_weak) = parent_weak {
+            if let Some(parent_node) = parent_weak.upgrade() {
+                if let Ok(mut parent_node) = parent_node.lock() {
+                    parent_node
+                        .children
+                        .retain(|child| !Arc::ptr_eq(child, &node));
+                }
+            }
+        }
+    }
+    // The ownership disposers never ran (the child disposed itself). Discard
+    // them instead of dropping them: a plain drop runs the kernel cleanup
+    // (re-disposing the child and draining its deferred cleanups early) and
+    // calls the embedder blocking executor (R3-A4 / A-9 interaction). Done
+    // outside the parent lock; `discard()` leaves `Drop` a quiet no-op.
+    for effect in removed_effects {
+        let _ = catch_unwind(AssertUnwindSafe(move || match effect.kind {
+            EffectKind::Async(disposer) => disposer.discard(),
+            // The ownership effect is always the async lane; safe fallback.
+            other => drop(other),
+        }));
+    }
+}
+
 /// Maximum supported plugin-loading depth (in-process). A recursive
 /// A -> B -> A chain hits this limit and fails with `InvalidPlugin` instead of
 /// overflowing the stack.
@@ -1227,7 +1466,7 @@ async fn sweep_children_async(data: &FiberRef) -> Option<crate::exec::PanicPaylo
 
 /// Report a contained cleanup panic (the operation already reached a safe
 /// state, so the payload is logged instead of unwinding into kernel code).
-fn log_cleanup_panic(operation: &str, payload: &(dyn std::any::Any + Send)) {
+pub(crate) fn log_cleanup_panic(operation: &str, payload: &(dyn std::any::Any + Send)) {
     tracing::error!(
         target: "zeokeel_cordis::fiber",
         "cleanup panicked while {operation}: {}",
@@ -1779,7 +2018,7 @@ pub(crate) async fn activate_by_kind_async(
 /// owning context).
 type DrainBatch = (Vec<FiberEffect>, Vec<AsyncDisposer>, Option<Context>);
 
-fn take_effects(data: &FiberRef) -> Result<Option<DrainBatch>> {
+fn take_effects_begin(data: &FiberRef) -> Result<Option<DrainBatch>> {
     let (effects, deferred, ctx) = {
         let mut fiber = data.lock().map_err(|_| CordisError::Disposed)?;
         if fiber.state == FiberState::Disposed {
@@ -1803,19 +2042,12 @@ fn take_effects(data: &FiberRef) -> Result<Option<DrainBatch>> {
     transition(data, FiberState::Unloading);
     // Withdraw before draining: dependents deactivate while the binding is
     // still present, then the provider's own disposers remove it (Cordis
-    // provider-withdrawal order).
+    // provider-withdrawal order). The transitively-unready dependents are
+    // begun/drained by the caller's iterative cascade (`begin_cascade`), not by
+    // a recursive retire loop here (C1: no unbounded recursion on deep chains).
     if let Some(ctx) = ctx.as_ref() {
         let owner = data.lock().map(|fiber| fiber.id).unwrap_or(0);
         ctx.withdraw_owner_services(owner);
-        // Retire dependents *before* draining this fiber, iterating to a fixed
-        // point. `refresh_dependents` alone can be swallowed by an outer
-        // refresh's re-entrancy guard, which would leave a dependent's binding
-        // removed before its cleanup ran (nested-chain order).
-        for _ in 0..64 {
-            if !ctx.inner.registry.retire_unready_contained() {
-                break;
-            }
-        }
     }
     Ok(Some((effects, deferred, ctx)))
 }
@@ -1830,6 +2062,10 @@ fn finish_unload(data: &FiberRef, ctx: Option<Context>, target: FiberState) -> R
     }
     transition(data, target);
     if target == FiberState::Disposed {
+        // R3-A4: the child was disposed on its own (not through the parent's
+        // ownership effect), so remove that effect + its `children` entry from
+        // the parent now. Bounded bookkeeping for dynamic-loading hosts.
+        detach_child_ownership(data);
         // D-1: detach by fiber id from *every* runtime (a concurrent rebind may
         // have moved the fiber to another runtime, or may push it after this
         // cleanup ran; the rebind paths self-heal that late push). The registry
@@ -1911,26 +2147,755 @@ async fn drain_effects_async(
     first_panic
 }
 
+/// One fiber whose unload was begun by an iterative cascade (C1).
+///
+/// The cascade first *begins* every transitively-unready fiber (mark
+/// `Unloading`, withdraw its services, take its effects) in provider-before-
+/// dependent order, then drains the frames in **reverse begin order**, which is
+/// a valid dependents-before-provider order and keeps the stack O(1) regardless
+/// of the dependency-chain depth.
+struct CascadeFrame {
+    data: FiberRef,
+    effects: Vec<FiberEffect>,
+    deferred: Vec<AsyncDisposer>,
+    ctx: Option<Context>,
+    target: FiberState,
+    /// True for the fiber whose unload the caller requested: only its cleanup
+    /// panic is re-raised (dependents' panics are contained like FIX-2).
+    root: bool,
+}
+
+impl CascadeFrame {
+    /// Complete a frame's teardown synchronously without awaiting anything:
+    /// remaining sync cleanups run inline (contained), remaining async cleanups
+    /// are parked in `deferred_async` for the next dispose (A-9 model), then the
+    /// fiber lands on its target state.
+    fn complete_teardown_sync(self) {
+        let CascadeFrame {
+            data,
+            effects,
+            deferred,
+            ctx,
+            target,
+            root: _,
+        } = self;
+        let mut newly_deferred: Vec<AsyncDisposer> = Vec::new();
+        let mut first_panic = None;
+        for effect in effects.into_iter().rev() {
+            match effect.kind {
+                EffectKind::Sync(disposer) => {
+                    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| disposer.dispose())) {
+                        first_panic.get_or_insert(payload);
+                    }
+                }
+                EffectKind::Async(disposer) => newly_deferred.push(disposer),
+            }
+        }
+        let mut deferred = deferred;
+        newly_deferred.append(&mut deferred);
+        if let Ok(mut fiber) = data.lock() {
+            if fiber.deferred_async.is_empty() {
+                fiber.deferred_async = newly_deferred;
+            } else {
+                fiber.deferred_async.extend(newly_deferred);
+            }
+        }
+        if let Err(error) = finish_unload(&data, ctx, target) {
+            tracing::error!(
+                target: "zeokeel_cordis::fiber",
+                "cancelled cascade frame could not finish its state transition: {error}"
+            );
+        }
+        if let Some(payload) = first_panic {
+            log_cleanup_panic("completing a cancelled cascade frame", payload.as_ref());
+        }
+    }
+
+    /// Drain one frame synchronously and land the fiber on its target state.
+    ///
+    /// FIX-4: a panicking child cleanup is contained by the sweep; the first
+    /// payload (drain before sweep) is returned so the caller can re-raise it at
+    /// a safe point, after the fiber reached its target state.
+    fn drain_blocking(self) -> Result<Option<crate::exec::PanicPayload>> {
+        let drain_panic = drain_effects_blocking(self.effects, self.deferred);
+        let sweep_panic = sweep_children_sync(&self.data);
+        finish_unload(&self.data, self.ctx, self.target)?;
+        Ok(drain_panic.or(sweep_panic))
+    }
+}
+
+/// Maximum cascade rounds, derived from the live fiber count: every round must
+/// begin at least one new fiber, so a chain longer than the registry cannot make
+/// progress and the loop stops instead of scanning forever (C1 bounded fixed
+/// point; the remaining dependents stay Active and a retry/refresh can pick them
+/// up).
+/// F4: RAII latch for the single-recoverer section.
+///
+/// The old code paired `begin_recovery`/`end_recovery` manually; if the async
+/// recovery was cancelled while awaiting a parked fiber's cleanup (or panicked),
+/// `recovering_parked` stayed `true` forever and *every* later recovery entry
+/// skipped -> permanently `Unloading` fibers -> `when_idle` hung forever. The
+/// guard's `Drop` always releases the latch and wakes idle waiters.
+struct RecoveryGuard<'a> {
+    registry: &'a Registry,
+}
+
+impl Drop for RecoveryGuard<'_> {
+    fn drop(&mut self) {
+        self.registry.end_recovery();
+        // F4/F5: let recovery-aware waiters re-run recovery.
+        self.registry.notify_idle();
+    }
+}
+
+fn begin_recovery_guard(registry: &Registry) -> Option<RecoveryGuard<'_>> {
+    if registry.begin_recovery() {
+        Some(RecoveryGuard { registry })
+    } else {
+        None
+    }
+}
+
+/// F5: await quiescence, recovering parked unloads whenever they appear.
+///
+/// `Context::when_idle` used to recover **once** and then await the plain idle
+/// wait. That misses two cases: (a) recovery is skipped because another unload
+/// body is in flight at entry, and (b) a concurrent cancel parks new frames while
+/// we are waiting — the plain wait only re-polls its condition and never runs
+/// recovery, so the wait hung forever.
+///
+/// The loop: return when genuinely idle (own registrations excluded), recover
+/// when a parked unload is recoverable now, otherwise wait on
+/// [`Registry::wait_idle_or_recoverable`] (woken by unload completion / parking).
+/// Livelock-bounded; on exhaustion it logs and falls back to the plain idle wait
+/// (a later operation still recovers).
+pub(crate) async fn when_idle_with_recovery(registry: &Registry) {
+    // The recovery-aware loop lives on `Registry::when_idle` itself (the raw
+    // public API must not hang on parked cascades either, round-5 A finding):
+    // `Context::when_idle` just awaits it. No wrapper logic here to keep a
+    // single implementation of the loop.
+    registry.when_idle().await;
+}
+
+/// F4: re-park a taken parked fiber whose recovery did not finish (cancelled,
+/// contained error or panic) so the batch entry is never lost.
+struct ReparkGuard<'a> {
+    registry: &'a Registry,
+    fiber: Option<Fiber>,
+    target: FiberState,
+}
+
+impl ReparkGuard<'_> {
+    fn disarm(&mut self) {
+        self.fiber = None;
+    }
+}
+
+impl Drop for ReparkGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(fiber) = self.fiber.take() {
+            self.registry.park_unload(&fiber.data, self.target);
+        }
+    }
+}
+
+/// F4: batch guard for the not-yet-processed part of a recovered batch. If the
+/// recovery future is dropped mid-batch, every remaining entry is re-parked
+/// instead of being silently dropped (E: cancelled recovery used to lose a
+/// taken fiber forever -> permanent `Unloading` -> `when_idle` hang).
+struct RecoveryBatch<'a> {
+    registry: &'a Registry,
+    remaining: Vec<(Fiber, FiberState)>,
+}
+
+impl RecoveryBatch<'_> {
+    fn pop(&mut self) -> Option<(Fiber, FiberState)> {
+        self.remaining.pop()
+    }
+}
+
+impl Drop for RecoveryBatch<'_> {
+    fn drop(&mut self) {
+        for (fiber, target) in self.remaining.drain(..) {
+            self.registry.park_unload(&fiber.data, target);
+        }
+    }
+}
+
+/// F1: recover fibers parked by a **cancelled** async cascade.
+///
+/// A cancelled `dispose_async` can leave non-root cascade frames parked as
+/// `Unloading` (their async cleanups cannot run on the cancelling thread); the
+/// registry remembers them and a later root operation finishes them. Without
+/// this, a permanent `Unloading` would block `when_idle()` forever (A-9).
+///
+/// Bounded (`fiber_count + 2` rounds), single-recoverer (`Registry::
+/// begin_recovery`), reentrancy-safe, and contained: each fiber is unloaded
+/// through the normal (sync) path to `Disposed`, deferred cleanups included.
+/// Returns the number of fibers that were recovered; leftovers are logged and
+/// remain recoverable by the next call.
+pub(crate) fn recover_parked_unloads_blocking(registry: &Registry) -> usize {
+    // Never recover from inside another unload/cascade: cancellation unwinds
+    // through `withdraw`/`refresh_dependents`, and running reactor-backed
+    // cleanups there would block or re-enter the cascade (deadlock).
+    if registry.has_active_unload() {
+        return 0;
+    }
+    let Some(_recovery) = begin_recovery_guard(registry) else {
+        return 0;
+    };
+    let limit = registry.fiber_count().saturating_add(2);
+    let mut recovered = 0usize;
+    let mut leftover = false;
+    for _ in 0..limit {
+        let parked = registry.take_parked_unloads();
+        leftover = !parked.is_empty();
+        if parked.is_empty() {
+            break;
+        }
+        let mut batch = RecoveryBatch {
+            registry,
+            remaining: parked,
+        };
+        while let Some((fiber, target)) = batch.pop() {
+            let mut repark = ReparkGuard {
+                registry,
+                fiber: Some(fiber),
+                target,
+            };
+            let data = Arc::clone(&repark.fiber.as_ref().expect("just constructed").data);
+            let outcome = catch_unwind(AssertUnwindSafe(|| unload_fiber(&data, target)));
+            match outcome {
+                Ok(Ok(())) => {
+                    repark.disarm();
+                    recovered += 1;
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(
+                        target: "zeokeel_cordis::fiber",
+                        "cannot recover a parked unload: {error}"
+                    );
+                }
+                Err(payload) => {
+                    log_cleanup_panic("recovering a parked unload", payload.as_ref());
+                }
+            }
+        }
+    }
+    if leftover {
+        tracing::error!(
+            target: "zeokeel_cordis::fiber",
+            "parked unloads still pending after {limit} recovery rounds; \
+             they remain retryable"
+        );
+    }
+    recovered
+}
+
+/// Awaiting counterpart of [`recover_parked_unloads_blocking`] for async entry
+/// points (`when_idle`, `refresh_all_async`, `dispose_async`): reactor-backed
+/// deferred cleanups are awaited instead of blocked on.
+pub(crate) async fn recover_parked_unloads_async(registry: &Registry) -> usize {
+    if registry.has_active_unload() {
+        return 0;
+    }
+    let Some(_recovery) = begin_recovery_guard(registry) else {
+        return 0;
+    };
+    let limit = registry.fiber_count().saturating_add(2);
+    let mut recovered = 0usize;
+    let mut leftover = false;
+    for _ in 0..limit {
+        let parked = registry.take_parked_unloads();
+        leftover = !parked.is_empty();
+        if parked.is_empty() {
+            break;
+        }
+        let mut batch = RecoveryBatch {
+            registry,
+            remaining: parked,
+        };
+        while let Some((fiber, target)) = batch.pop() {
+            let mut repark = ReparkGuard {
+                registry,
+                fiber: Some(fiber),
+                target,
+            };
+            let data = Arc::clone(&repark.fiber.as_ref().expect("just constructed").data);
+            // Cancellation-safety: dropping this future drops `repark` first
+            // (re-park the in-flight fiber), then `batch` (re-park the rest).
+            let outcome = futures_util::FutureExt::catch_unwind(AssertUnwindSafe(
+                unload_fiber_async(&data, target),
+            ))
+            .await;
+            match outcome {
+                Ok(Ok(())) => {
+                    repark.disarm();
+                    recovered += 1;
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(
+                        target: "zeokeel_cordis::fiber",
+                        "cannot recover a parked unload: {error}"
+                    );
+                }
+                Err(payload) => {
+                    log_cleanup_panic("recovering a parked unload", payload.as_ref());
+                }
+            }
+        }
+    }
+    if leftover {
+        tracing::error!(
+            target: "zeokeel_cordis::fiber",
+            "parked unloads still pending after {limit} recovery rounds; \
+             they remain retryable"
+        );
+    }
+    recovered
+}
+
+fn cascade_round_limit(registry: &Registry) -> usize {
+    registry.fiber_count().saturating_add(2)
+}
+
+/// Begin an unload cascade for `data` (phase 1 of the two-phase order-preserving
+/// cascade, C1).
+///
+/// Returns the frames in begin order: the requested fiber first, then every
+/// fiber that transitively loses its injected services, until the fixed point.
+/// The caller drains them in reverse order.
+fn begin_cascade(data: &FiberRef, target: FiberState) -> Result<Option<Vec<CascadeFrame>>> {
+    let Some(root_frame) = begin_frame(data, target, true)? else {
+        return Ok(None);
+    };
+    let mut frames = vec![root_frame];
+    let Some(registry) = data.lock().ok().and_then(|fiber| fiber.registry.clone()) else {
+        return Ok(Some(frames));
+    };
+    let limit = cascade_round_limit(&registry);
+    // Phase 1a: dependency dependents (provider-before-dependent begin order).
+    let mut rounds = 0usize;
+    while rounds < limit {
+        rounds += 1;
+        let Some(dependent) = registry.find_unready_active() else {
+            break;
+        };
+        match begin_frame(&dependent.data, FiberState::Pending, false) {
+            // Already disposed/unloading between the scan and the begin.
+            Ok(None) => continue,
+            Ok(Some(frame)) => frames.push(frame),
+            Err(error) => {
+                rollback_cascade(frames);
+                return Err(error);
+            }
+        }
+    }
+    if rounds >= limit {
+        tracing::error!(
+            target: "zeokeel_cordis::fiber",
+            "unload cascade hit its bounded fixed point ({limit} rounds); \
+             remaining unready dependents stay Active and can be retried"
+        );
+    }
+    // Phase 1b: ownership descendants, collected iteratively (DFS pre-order) so
+    // a deep parent -> child plugin hierarchy unloads without recursion. They
+    // are begun *after* the dependency dependents; reverse draining therefore
+    // still disposes every child before its parent, and the parent's ownership
+    // effects find an already `Disposed` child (no recursive dispose).
+    let mut stack: Vec<Fiber> = child_fibers(data);
+    while let Some(child) = stack.pop() {
+        if frames.len() > limit {
+            tracing::error!(
+                target: "zeokeel_cordis::fiber",
+                "unload cascade hit its frame bound ({limit}); \
+                 remaining children stay alive and can be retried"
+            );
+            break;
+        }
+        match begin_frame(&child.data, FiberState::Disposed, false) {
+            Ok(None) => {}
+            Ok(Some(frame)) => frames.push(frame),
+            Err(error) => {
+                rollback_cascade(frames);
+                return Err(error);
+            }
+        }
+        stack.extend(child_fibers(&child.data));
+    }
+    Ok(Some(frames))
+}
+
+/// Best-effort rollback of a partially-begun cascade: drain every frame in
+/// reverse begin order (contained: the error path must not add another panic).
+fn rollback_cascade(frames: Vec<CascadeFrame>) {
+    for frame in frames.into_iter().rev() {
+        if let Err(error) = frame.drain_blocking() {
+            tracing::error!(
+                target: "zeokeel_cordis::fiber",
+                "cannot finish a rolled-back cascade frame: {error}"
+            );
+        }
+    }
+}
+
+/// Snapshot a fiber's direct children (strong handles for the cascade driver).
+fn child_fibers(data: &FiberRef) -> Vec<Fiber> {
+    let Ok(fiber) = data.lock() else {
+        return Vec::new();
+    };
+    let Ok(children) = fiber.children.lock() else {
+        return Vec::new();
+    };
+    children
+        .iter()
+        .filter_map(|weak| weak.upgrade().map(|data| Fiber { data }))
+        .collect()
+}
+
+/// Begin one cascade frame for `data` if the fiber still needs unloading.
+///
+/// `None` means "nothing to begin": the fiber is already final, or another
+/// cascade already marked it `Unloading` (so its effects were taken there).
+fn begin_frame(data: &FiberRef, target: FiberState, root: bool) -> Result<Option<CascadeFrame>> {
+    let state = match data.lock() {
+        Ok(fiber) => fiber.state,
+        Err(_) => return Err(CordisError::Disposed),
+    };
+    if !root && matches!(state, FiberState::Disposed | FiberState::Unloading) {
+        // A non-root fiber already final or owned by another cascade/lifecycle
+        // operation: never take its effects twice.
+        return Ok(None);
+    }
+    // The root may be `Unloading` (restart/dispose already announced it) or even
+    // `Disposed` with deferred cleanups left by a cancelled unload (A-9 retry);
+    // `take_effects_begin` handles both.
+    let Some((effects, deferred, ctx)) = take_effects_begin(data)? else {
+        return Ok(None);
+    };
+    Ok(Some(CascadeFrame {
+        data: data.clone(),
+        effects,
+        deferred,
+        ctx,
+        target,
+        root,
+    }))
+}
+
+/// Phase 2 of the cascade: drain the dependents in reverse begin order
+/// (dependents-before-provider), containing their panics (FIX-2), and hand the
+/// root frame back to the caller.
+fn drain_cascade_dependents(
+    frames: Vec<CascadeFrame>,
+) -> (Option<CascadeFrame>, Option<crate::exec::PanicPayload>) {
+    let mut root = None;
+    let mut dependents = Vec::with_capacity(frames.len().saturating_sub(1));
+    for frame in frames {
+        if frame.root {
+            root = Some(frame);
+        } else {
+            dependents.push(frame);
+        }
+    }
+    let mut first_panic: Option<crate::exec::PanicPayload> = None;
+    for frame in dependents.into_iter().rev() {
+        match frame.drain_blocking() {
+            Ok(Some(payload)) => {
+                first_panic.get_or_insert(payload);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(
+                    target: "zeokeel_cordis::fiber",
+                    "cannot finish a dependent unload: {error}"
+                );
+            }
+        }
+    }
+    (root, first_panic)
+}
+
+/// RAII guard for the frames of an async cascade that were not drained yet.
+///
+/// If the host drops the unload future (timeout/select/cancel), every remaining
+/// frame is completed synchronously (A-9 model) instead of leaving fibers stuck
+/// in `Unloading`: sync cleanups run inline (contained), async cleanups are
+/// deferred to their fiber's next dispose, and every fiber reaches its target
+/// state.
+/// Park a not-yet-drained cascade frame when the host cancels the unload future.
+///
+/// Sync cleanups run inline (contained), async cleanups are deferred on the
+/// fiber (A-9 model), and the fiber is left `Unloading` **while staying
+/// registered**: a later dispose/retry (or `dispose_all`) finishes it and drains
+/// the deferred cleanups under a proper async context. Completing it here would
+/// drop the last `FiberData` reference, and its async cleanups may need a
+/// reactor that the cancelling thread cannot provide.
+fn park_cancelled_frame(frame: CascadeFrame) {
+    let CascadeFrame {
+        data,
+        effects,
+        deferred,
+        ctx: _,
+        target,
+        root: _,
+    } = frame;
+    let mut newly_deferred: Vec<AsyncDisposer> = Vec::new();
+    let mut first_panic = None;
+    for effect in effects.into_iter().rev() {
+        match effect.kind {
+            EffectKind::Sync(disposer) => {
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| disposer.dispose())) {
+                    first_panic.get_or_insert(payload);
+                }
+            }
+            EffectKind::Async(disposer) => newly_deferred.push(disposer),
+        }
+    }
+    let mut deferred = deferred;
+    newly_deferred.append(&mut deferred);
+    match data.lock() {
+        Ok(mut fiber) => {
+            if fiber.deferred_async.is_empty() {
+                fiber.deferred_async = newly_deferred;
+            } else {
+                fiber.deferred_async.extend(newly_deferred);
+            }
+        }
+        Err(_) => {
+            tracing::error!(
+                target: "zeokeel_cordis::fiber",
+                "cancelled cascade frame could not park its deferred cleanups: fiber lock poisoned"
+            );
+        }
+    }
+    // F1: remember the fiber so a later root operation / `when_idle` recovers
+    // it. Deferred cleanups stay deferred; the fiber remains `Unloading` and
+    // registered, so its `FiberData` cannot be dropped by the cancelling thread.
+    if let Ok(fiber) = data.lock() {
+        if let Some(registry) = fiber.registry.clone() {
+            drop(fiber);
+            registry.park_unload(&data, target);
+        }
+    }
+    if let Some(payload) = first_panic {
+        log_cleanup_panic("parking a cancelled cascade frame", payload.as_ref());
+    }
+}
+
+/// Cancellation-safe drain of one **non-root** cascade frame.
+///
+/// On normal completion the caller sweeps children and finishes the target
+/// state. If the future is dropped mid-drain, `Drop` parks the frame (see
+/// [`park_cancelled_frame`]) instead of completing it: a non-root fiber may own
+/// reactor-backed cleanups that the cancelling thread cannot drive, and
+/// completing it would drop its last reference while deferred cleanups remain.
+struct AsyncFrameUnload {
+    frame: Option<CascadeFrame>,
+    armed: bool,
+}
+
+impl AsyncFrameUnload {
+    async fn drain(&mut self) -> Option<crate::exec::PanicPayload> {
+        let Some(frame) = self.frame.as_mut() else {
+            // F2: defensive only (the guard disarms before dropping the frame);
+            // a missing frame means there is nothing left to drain.
+            tracing::error!(
+                target: "zeokeel_cordis::fiber",
+                "cancellation-safe frame drain lost its frame; skipping drain"
+            );
+            return None;
+        };
+        let mut first_panic: Option<crate::exec::PanicPayload> = None;
+        while let Some(effect) = frame.effects.last_mut() {
+            let outcome = match &mut effect.kind {
+                EffectKind::Sync(disposer) => {
+                    catch_unwind(AssertUnwindSafe(|| disposer.dispose())).map(|_| ())
+                }
+                EffectKind::Async(disposer) => {
+                    futures_util::FutureExt::catch_unwind(AssertUnwindSafe(disposer.dispose()))
+                        .await
+                        .map(|_| ())
+                }
+            };
+            frame.effects.pop();
+            if let Err(payload) = outcome {
+                first_panic.get_or_insert(payload);
+            }
+        }
+        while let Some(disposer) = frame.deferred.first_mut() {
+            let outcome =
+                futures_util::FutureExt::catch_unwind(AssertUnwindSafe(disposer.dispose()))
+                    .await
+                    .map(|_| ());
+            frame.deferred.remove(0);
+            if let Err(payload) = outcome {
+                first_panic.get_or_insert(payload);
+            }
+        }
+        first_panic
+    }
+}
+
+impl Drop for AsyncFrameUnload {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(frame) = self.frame.take() {
+            let _ = catch_unwind(AssertUnwindSafe(|| park_cancelled_frame(frame)));
+        }
+    }
+}
+
+/// RAII guard for the requested fiber's frame while the non-root frames are
+/// drained: if the unload future is dropped before the root is processed, the
+/// root still completes its teardown (A-9) instead of staying `Unloading`.
+struct RootFrameGuard {
+    frame: Option<CascadeFrame>,
+}
+
+impl Drop for RootFrameGuard {
+    fn drop(&mut self) {
+        if let Some(frame) = self.frame.take() {
+            let _ = catch_unwind(AssertUnwindSafe(|| frame.complete_teardown_sync()));
+        }
+    }
+}
+
+struct RemainingFrames {
+    frames: Vec<CascadeFrame>,
+}
+
+impl Drop for RemainingFrames {
+    fn drop(&mut self) {
+        // Park, do not complete: a completed non-root fiber is unregistered and
+        // its last `FiberData` reference can then be dropped, whose `Drop` would
+        // run reactor-backed async cleanups on the cancelling thread (deadlock).
+        // Parked fibers stay `Unloading` and registered, so the next dispose /
+        // retry (or `dispose_all`) finishes them with a proper async context.
+        while let Some(frame) = self.frames.pop() {
+            let _ = catch_unwind(AssertUnwindSafe(|| park_cancelled_frame(frame)));
+        }
+    }
+}
+
+/// F1: keeps [`Registry::active_unloads`] accurate for an unload body, including
+/// when the async unload future is dropped mid-flight (A-9 cancellation).
+struct UnloadActivity {
+    registry: Arc<crate::registry::Registry>,
+}
+
+impl Drop for UnloadActivity {
+    fn drop(&mut self) {
+        self.registry.end_unload_activity();
+    }
+}
+
+fn begin_unload_activity(data: &FiberRef) -> Option<UnloadActivity> {
+    let registry = data.lock().ok().and_then(|fiber| fiber.registry.clone())?;
+    registry.begin_unload_activity();
+    Some(UnloadActivity { registry })
+}
+
 pub(crate) fn unload_fiber(data: &FiberRef, target: FiberState) -> Result<()> {
-    let Some((effects, deferred, ctx)) = take_effects(data)? else {
+    let _activity = begin_unload_activity(data);
+    let Some(frames) = begin_cascade(data, target)? else {
         return Ok(());
     };
-    let drain_panic = drain_effects_blocking(effects, deferred);
-    // FIX-4: the sweep contains each child's panic and keeps going; the first
-    // payload (drain before sweep) is re-raised only after this fiber reached
-    // its target state, so the parent can never stay stuck in `Unloading`.
-    let sweep_panic = sweep_children_sync(data);
-    finish_unload(data, ctx, target)?;
-    if let Some(payload) = drain_panic.or(sweep_panic) {
+    let (root, dependent_panic) = drain_cascade_dependents(frames);
+    if let Some(payload) = dependent_panic {
+        log_cleanup_panic("unloading dependents", payload.as_ref());
+    }
+    let Some(root) = root else {
+        return Ok(());
+    };
+    if let Some(payload) = root.drain_blocking()? {
         std::panic::resume_unwind(payload);
     }
     Ok(())
 }
 
 pub(crate) async fn unload_fiber_async(data: &FiberRef, target: FiberState) -> Result<()> {
-    let Some((effects, deferred, ctx)) = take_effects(data)? else {
+    let _activity = begin_unload_activity(data);
+    // C1: dependents and ownership children are begun iteratively, then drained
+    // in reverse begin order. They are drained with the same cancellation-safe
+    // async logic as the root (a reactor-backed child cleanup must be awaited,
+    // not blocked on), and a `RemainingFrames` guard completes whatever is left
+    // if the host drops this future mid-cascade (A-9).
+    let Some(frames) = begin_cascade(data, target)? else {
         return Ok(());
     };
+    let mut root: Option<CascadeFrame> = None;
+    let mut rest: Vec<CascadeFrame> = Vec::with_capacity(frames.len().saturating_sub(1));
+    for frame in frames {
+        if frame.root {
+            root = Some(frame);
+        } else {
+            rest.push(frame);
+        }
+    }
+    let mut root_guard = RootFrameGuard { frame: root };
+    let mut remaining = RemainingFrames { frames: rest };
+    let mut first_dependent_panic: Option<crate::exec::PanicPayload> = None;
+    while let Some(frame) = remaining.frames.pop() {
+        let mut unload = AsyncFrameUnload {
+            frame: Some(frame),
+            armed: true,
+        };
+        if let Some(payload) = unload.drain().await {
+            first_dependent_panic.get_or_insert(payload);
+        }
+        // Still armed during the sweep: a cancel here parks the (already
+        // drained) frame as `Unloading` for a retry instead of dropping it.
+        let sweep_panic = match unload.frame.as_ref() {
+            Some(frame) => sweep_children_async(&frame.data).await,
+            None => {
+                tracing::error!(
+                    target: "zeokeel_cordis::fiber",
+                    "cancellation-safe frame lost before its child sweep; skipping sweep"
+                );
+                None
+            }
+        };
+        let Some(drained) = unload.frame.take() else {
+            continue;
+        };
+        unload.armed = false;
+        drop(unload);
+        if let Some(payload) = sweep_panic {
+            first_dependent_panic.get_or_insert(payload);
+        }
+        let CascadeFrame {
+            data: frame_data,
+            ctx,
+            target: frame_target,
+            ..
+        } = drained;
+        if let Err(error) = finish_unload(&frame_data, ctx, frame_target) {
+            tracing::error!(
+                target: "zeokeel_cordis::fiber",
+                "cannot finish a dependent unload: {error}"
+            );
+        }
+    }
+    drop(remaining);
+    if let Some(payload) = first_dependent_panic {
+        log_cleanup_panic("unloading dependents", payload.as_ref());
+    }
+    let Some(root) = root_guard.frame.take() else {
+        return Ok(());
+    };
+    let CascadeFrame {
+        data: root_data,
+        effects,
+        deferred,
+        ctx,
+        target: frame_target,
+        root: _,
+    } = root;
+    debug_assert_eq!(frame_target, target);
+    let data = &root_data;
     // Cancel-safe drain: if the host drops this future mid-await, the guard
     // completes the teardown synchronously (A-9) instead of leaving the fiber
     // half-unloaded in `Unloading` (or in a fake `Active` state).
@@ -2490,5 +3455,68 @@ mod regression_tests {
             1,
             "FIX-10: a dropped fiber must remove the event listeners it owns"
         );
+    }
+    /// C1: if `begin_cascade` fails halfway (a fiber's effect batch cannot be
+    /// taken), the already-begun frames are rolled back instead of leaving
+    /// fibers stuck in `Unloading`. The rollback routine is the same one the
+    /// error path calls; exercise it directly on a real two-level cascade.
+    #[test]
+    fn c1_rollback_of_a_partial_cascade_leaves_no_unloading_fiber() {
+        use crate::registry::Plugin;
+        use serde_json::Value;
+
+        struct C1Base;
+
+        impl Plugin for C1Base {
+            fn name(&self) -> &'static str {
+                "c1-unit-base"
+            }
+
+            fn apply(&self, ctx: crate::Context, _config: Value) -> crate::Result<()> {
+                ctx.provide_checked(
+                    crate::ServiceKey::new("c1-unit.svc"),
+                    Arc::new(1u32),
+                    || true,
+                )?;
+                Ok(())
+            }
+        }
+
+        struct C1Dependent;
+
+        impl Plugin for C1Dependent {
+            fn name(&self) -> &'static str {
+                "c1-unit-dependent"
+            }
+
+            fn inject(&self) -> &'static [&'static str] {
+                &["c1-unit.svc"]
+            }
+
+            fn apply(&self, _ctx: crate::Context, _config: Value) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        let root = crate::Context::root();
+        let base = root.plugin(Arc::new(C1Base), Value::Null).expect("base");
+        let dependent = root
+            .plugin(Arc::new(C1Dependent), Value::Null)
+            .expect("dependent");
+        assert_eq!(base.state(), FiberState::Active);
+        assert_eq!(dependent.state(), FiberState::Active);
+
+        let frames = begin_cascade(&base.data, FiberState::Disposed)
+            .expect("begin cascade")
+            .expect("frames");
+        assert!(frames.len() >= 2, "the dependent must be cascaded too");
+        assert_eq!(base.state(), FiberState::Unloading);
+
+        rollback_cascade(frames);
+        assert_eq!(base.state(), FiberState::Disposed);
+        assert_eq!(dependent.state(), FiberState::Pending);
+        assert!(root.registry().is_idle());
+        let _ = root.dispose_all();
+        assert!(root.registry().keys().is_empty());
     }
 }

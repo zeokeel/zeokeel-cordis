@@ -68,6 +68,48 @@ impl Drop for EffectStackScope<'_> {
     }
 }
 
+/// Supervision listener-quota token: releases the reserved listener slot
+/// exactly once, no matter which path releases it first (user disposer, `once`
+/// auto-removal in the event bus, or fiber unload).
+#[cfg(feature = "supervision")]
+struct ListenerSlot {
+    fiber: FiberRef,
+    released: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "supervision")]
+impl ListenerSlot {
+    fn release(&self) {
+        if self
+            .released
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        if let Ok(mut fiber) = self.fiber.lock() {
+            fiber.listener_count = fiber.listener_count.saturating_sub(1);
+        }
+    }
+}
+
+/// Releases the listener slot when a `once` listener invocation ends (including
+/// on a contained panic): the event bus removes the listener after that
+/// invocation, so the user-facing disposer may never be disposed.
+#[cfg(feature = "supervision")]
+struct OnceListenerRelease(Arc<ListenerSlot>);
+
+#[cfg(feature = "supervision")]
+impl Drop for OnceListenerRelease {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+/// Zero-sized placeholder so listener registration reads the same with and
+/// without the `supervision` feature (no quota bookkeeping in the core kernel).
+#[cfg(not(feature = "supervision"))]
+struct ListenerSlot;
+
 /// A scoped dependency container and plugin context.
 ///
 /// Rust cannot proxy property reads, so services are read with
@@ -517,7 +559,10 @@ impl Context {
                     if allowed {
                         Ok(())
                     } else {
-                        Err(CordisError::ServiceWriteForbidden(name.to_string()))
+                        // C5: the accessor's setter declined the write — this
+                        // is a computed-property decision, not an ownership
+                        // violation, so it gets its own error variant.
+                        Err(CordisError::AccessorWriteRejected(name.to_string()))
                     }
                 }
                 None => Err(CordisError::AccessorReadOnly(name.to_string())),
@@ -614,8 +659,23 @@ impl Context {
 
     /// Resolve once the whole context tree is quiescent (no in-flight lifecycle
     /// work). Useful for tests, shutdown and supervisor loops.
+    ///
+    /// The wait is **recovery-aware** (0.4.3 A-9/F1/F5): fibers parked in
+    /// `Unloading` by a cancelled async cascade are recovered while waiting, and
+    /// parked frames that appear *during* the wait (another thread cancels) are
+    /// picked up as well, so a cancellation can never block quiescence forever.
+    /// The recovery section is bounded and RAII-latched, so cancelling this
+    /// future leaves the next `when_idle()` able to recover.
+    ///
+    /// A caller that is itself inside a registration window (e.g. an
+    /// `internal/plugin` create hook) does not wait for its **own**
+    /// registration: the registry excludes the calling thread's in-flight
+    /// registrations from the quiescence check, so `block_on(ctx.when_idle())`
+    /// inside a create hook returns instead of deadlocking. External waiters
+    /// still wait for that window, and [`crate::Registry::is_idle`] stays strict
+    /// (`false` while a registration is pending).
     pub async fn when_idle(&self) {
-        self.inner.registry.when_idle().await;
+        crate::fiber::when_idle_with_recovery(&self.inner.registry).await;
     }
 
     /// Re-evaluate every dependent fiber.
@@ -654,8 +714,13 @@ impl Context {
     }
 
     /// Reserve one listener slot on this fiber (quota enforcement).
+    ///
+    /// The returned token releases the slot exactly once (audit R3B P2-1b): the
+    /// old bookkeeping only decremented while the *fiber* unloaded, so an
+    /// embedder that disposed the listener disposer kept the slot reserved
+    /// forever.
     #[cfg(feature = "supervision")]
-    fn reserve_listener(&self) -> Result<()> {
+    fn reserve_listener_slot(&self) -> Result<Arc<ListenerSlot>> {
         let max = self.inner.registry.quota_limits().max_listeners;
         let mut fiber = self
             .inner
@@ -669,47 +734,83 @@ impl Context {
             }
         }
         fiber.listener_count += 1;
-        Ok(())
+        drop(fiber);
+        Ok(Arc::new(ListenerSlot {
+            fiber: self.inner.fiber.data.clone(),
+            released: std::sync::atomic::AtomicBool::new(false),
+        }))
     }
 
-    /// Own a newly registered listener: enforce the listener quota, wrap the
-    /// disposer so the count is released on cleanup, and attach it to the fiber.
+    /// Wrap a sync listener so the event bus' own `once` auto-removal also frees
+    /// its quota slot (in that path the user-facing disposer is never disposed).
     #[cfg(feature = "supervision")]
-    fn register_listener_effect(
+    fn wrap_once_listener(
+        &self,
+        callback: ListenerFn,
+        once: bool,
+        slot: &Arc<ListenerSlot>,
+    ) -> ListenerFn {
+        if !once {
+            return callback;
+        }
+        let slot = Arc::clone(slot);
+        Arc::new(move |args: &[Value]| {
+            // Dropped when the invocation ends, including on a contained panic.
+            let _release = OnceListenerRelease(Arc::clone(&slot));
+            callback(args)
+        })
+    }
+
+    /// Own a newly registered listener: enforce the listener quota (already
+    /// reserved by [`Context::reserve_listener_slot`]), hand the embedder a
+    /// disposer that immediately frees the slot **and** unregisters the
+    /// listener, and attach that same single-shot disposer to the fiber so the
+    /// unload path cannot double-decrement the count.
+    #[cfg(feature = "supervision")]
+    fn adopt_listener(
         &self,
         disposer: Disposer,
+        slot: Arc<ListenerSlot>,
         label: &'static str,
     ) -> Result<Disposer> {
-        if let Err(error) = self.reserve_listener() {
-            disposer.dispose();
-            return Err(error);
-        }
-        let fiber_ref = self.inner.fiber.clone();
-        let inner = disposer.clone();
+        let unregister = disposer;
         let counted = Disposer::new(vec![cleanup(move || {
-            if let Ok(mut fiber) = fiber_ref.data.lock() {
-                fiber.listener_count = fiber.listener_count.saturating_sub(1);
-            }
-            inner.dispose();
+            slot.release();
+            unregister.dispose();
         })]);
-        match self.register_effect_labeled(counted, label) {
-            Ok(()) => Ok(disposer),
+        match self.register_effect_labeled(counted.clone(), label) {
+            Ok(()) => Ok(counted),
             Err(error) => {
-                if let Ok(mut fiber) = self.inner.fiber.data.lock() {
-                    fiber.listener_count = fiber.listener_count.saturating_sub(1);
-                }
-                disposer.dispose();
+                // Undo the registration and the reservation in one shot.
+                counted.dispose();
                 Err(error)
             }
         }
     }
 
-    /// Without the `supervision` feature listeners are attached directly (no
-    /// quota bookkeeping in the core kernel).
+    /// Without the `supervision` feature no quota bookkeeping is performed: the
+    /// token is a zero-sized placeholder and the event-bus disposer is returned
+    /// as-is.
     #[cfg(not(feature = "supervision"))]
-    fn register_listener_effect(
+    fn reserve_listener_slot(&self) -> Result<Arc<ListenerSlot>> {
+        Ok(Arc::new(ListenerSlot))
+    }
+
+    #[cfg(not(feature = "supervision"))]
+    fn wrap_once_listener(
+        &self,
+        callback: ListenerFn,
+        _once: bool,
+        _slot: &Arc<ListenerSlot>,
+    ) -> ListenerFn {
+        callback
+    }
+
+    #[cfg(not(feature = "supervision"))]
+    fn adopt_listener(
         &self,
         disposer: Disposer,
+        _slot: Arc<ListenerSlot>,
         label: &'static str,
     ) -> Result<Disposer> {
         self.register_effect_labeled(disposer.clone(), label)?;
@@ -789,6 +890,13 @@ impl Context {
         if fiber.state == FiberState::Disposed || fiber.state == FiberState::Unloading {
             return Err(CordisError::InactiveEffect);
         }
+        // Audit R3B P2-1a: a `Disposer`/`AsyncDisposer` the embedder already
+        // disposed no longer owns resources, but its `FiberEffect` entry used to
+        // stay in the list until the fiber unloaded, so repeated
+        // register/release cycles eventually tripped `QuotaExceeded("effects")`.
+        // Drop dead entries here: the quota then counts *live* effects only (and
+        // the list cannot grow without bound on a long-lived fiber).
+        fiber.effects.retain(Self::effect_is_live);
         #[cfg(feature = "supervision")]
         if let Some(max) = max_effects {
             if fiber.effects.len() >= max {
@@ -809,6 +917,17 @@ impl Context {
         });
         fiber.effects.push(effect);
         Ok(())
+    }
+
+    /// Whether an effect still owns resources.
+    ///
+    /// A disposed cleanup handle is inert (dispose is idempotent), so its entry
+    /// no longer represents a live effect for quota accounting.
+    fn effect_is_live(effect: &FiberEffect) -> bool {
+        match &effect.kind {
+            EffectKind::Sync(disposer) => !disposer.is_disposed(),
+            EffectKind::Async(disposer) => !disposer.is_disposed(),
+        }
     }
 
     /// Run `setup` while its effect node is the current parent for nested
@@ -933,7 +1052,9 @@ impl Context {
     /// Load a plugin. The fiber starts Pending until every `inject` service is
     /// available; it is returned immediately like Cordis `ctx.plugin()`.
     pub fn plugin(&self, plugin: Arc<dyn Plugin>, config: Value) -> Result<Fiber> {
-        let key = plugin.key();
+        // C2: `Plugin::key()` is embedder code; a panicking key degrades to the
+        // shared panicked-plugin runtime instead of poisoning kernel locks.
+        let key = crate::registry::plugin_key_contained(plugin.as_ref());
         self.plugin_with_key(plugin, config, key)
     }
 
@@ -994,13 +1115,31 @@ impl Context {
         }
         #[cfg(feature = "supervision")]
         if let Some(max) = self.inner.registry.quota_limits().max_child_fibers {
+            // Audit R3B P2-1c: `children` stores *weak* handles and a child that
+            // disposed itself is never removed by it, so stale entries used to
+            // consume `max_child_fibers` forever ("unload the old child plugin,
+            // then load a new one" failed). Count only live children
+            // (`Weak::upgrade()` and state != `Disposed`) and prune dead ones
+            // while we hold the list.
             let live_children = self
                 .inner
                 .fiber
                 .data
                 .lock()
                 .ok()
-                .and_then(|parent| parent.children.lock().ok().map(|children| children.len()))
+                .and_then(|parent| {
+                    parent.children.lock().ok().map(|mut children| {
+                        children.retain(|child| {
+                            child.upgrade().is_some_and(|data| {
+                                !matches!(
+                                    data.lock().map(|fiber| fiber.state),
+                                    Ok(FiberState::Disposed)
+                                )
+                            })
+                        });
+                        children.len()
+                    })
+                })
                 .unwrap_or(0);
             if live_children >= max {
                 return Err(CordisError::QuotaExceeded("child_fibers".to_string()));
@@ -1065,27 +1204,11 @@ impl Context {
         // Ownership effect: gives the cascade a deterministic place in the
         // parent's effect list, so a cancelled disposal restores it and the
         // retry disposes the children (the child registry below is the
-        // recovery path for busy children).
-        let weak_child = Arc::downgrade(&data);
-        let ownership = self.effect_async_labeled("ctx.plugin", move || {
-            let weak_child = weak_child.clone();
-            vec![crate::async_effects::cleanup_async(move || {
-                let weak_child = weak_child.clone();
-                async move {
-                    if let Some(data) = weak_child.upgrade() {
-                        let child = Fiber { data };
-                        if child.dispose_async().await.is_err() {
-                            if let Ok(fiber) = child.data.lock() {
-                                fiber
-                                    .dispose_requested
-                                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                            }
-                        }
-                    }
-                }
-            })]
-        });
-        if let Err(error) = ownership {
+        // recovery path for busy children). R3-A4: registered through the
+        // fibre module so the effect carries the child id; a parent can then
+        // drop it when the child is disposed on its own (bounded bookkeeping
+        // for dynamic-loading hosts).
+        if let Err(error) = crate::fiber::register_child_ownership(self, &fiber) {
             let _ = fiber.dispose();
             return Err(error);
         }
@@ -1140,7 +1263,8 @@ impl Context {
     /// until the host awaits [`Context::refresh_async`] (or calls
     /// [`Fiber::restart_async`]).
     pub async fn plugin_async(&self, plugin: Arc<dyn AsyncPlugin>, config: Value) -> Result<Fiber> {
-        let key = plugin.key();
+        // C2: contained `AsyncPlugin::key()` (see `Context::plugin`).
+        let key = crate::registry::async_plugin_key_contained(plugin.as_ref());
         // FIX-11b: cover the `internal/plugin` create hook too (see
         // `plugin_with_key`). `RegistrationGuard` is `Send`, so it may be held
         // across the activation await.
@@ -1257,6 +1381,12 @@ impl Context {
     {
         let owner = self.fiber_id();
         let (callback, options) = self.resolve_listener(name, options, owner, Arc::new(listener));
+        // Quota slot first: the `resolve_listener` hook may have forced `once`,
+        // which decides whether the callback also has to release the slot by
+        // itself (the event bus removes `once` listeners without touching our
+        // disposer).
+        let slot = self.reserve_listener_slot()?;
+        let callback = self.wrap_once_listener(callback, options.once, &slot);
         let disposer = Events::add_listener(
             &self.inner.events,
             name,
@@ -1265,7 +1395,7 @@ impl Context {
             self.inner.isolate.clone(),
             callback,
         );
-        self.register_listener_effect(disposer, "ctx.on")
+        self.adopt_listener(disposer, slot, "ctx.on")
     }
 
     /// Register a self-removing sync listener (Cordis `ctx.once`).
@@ -1339,6 +1469,7 @@ impl Context {
             Arc::new(move |args: &[Value]| -> BoxFuture<'static, EventResult> {
                 boxed(listener(args))
             });
+        let slot = self.reserve_listener_slot()?;
         let disposer = Events::add_async_listener(
             &self.inner.events,
             name,
@@ -1351,7 +1482,7 @@ impl Context {
             self.inner.isolate.clone(),
             callback,
         );
-        self.register_listener_effect(disposer, "ctx.on_async")
+        self.adopt_listener(disposer, slot, "ctx.on_async")
     }
 
     // -----------------------------------------------------------------------
@@ -1479,6 +1610,7 @@ impl Context {
     {
         let owner = self.fiber_id();
         let callback: WaterfallListenerFn = Arc::new(listener);
+        let slot = self.reserve_listener_slot()?;
         let disposer = Events::add_waterfall_listener(
             &self.inner.events,
             name,
@@ -1487,7 +1619,7 @@ impl Context {
             self.inner.isolate.clone(),
             callback,
         );
-        self.register_listener_effect(disposer, "ctx.on_waterfall")
+        self.adopt_listener(disposer, slot, "ctx.on_waterfall")
     }
 
     /// Register an async waterfall middleware owned by the current fiber.
@@ -1500,6 +1632,7 @@ impl Context {
     {
         let owner = self.fiber_id();
         let callback: AsyncWaterfallListenerFn = Arc::new(listener);
+        let slot = self.reserve_listener_slot()?;
         let disposer = Events::add_async_waterfall_listener(
             &self.inner.events,
             name,
@@ -1508,7 +1641,7 @@ impl Context {
             self.inner.isolate.clone(),
             callback,
         );
-        self.register_listener_effect(disposer, "ctx.on_waterfall_async")
+        self.adopt_listener(disposer, slot, "ctx.on_waterfall_async")
     }
 
     pub fn emit(&self, name: &str, args: &[Value]) {
@@ -1669,7 +1802,15 @@ impl Context {
 fn config_level(config: &Value) -> Option<LogLevel> {
     let level = config.get("level")?;
     if let Some(number) = level.as_u64() {
-        return Some(LogLevel::from_u8(number.min(u8::MAX as u64) as u8));
+        // Audit R3B P3-3: `LogLevel::from_u8` maps every code above `Debug` to
+        // `Debug`, so a typo like `{"level": 99}` used to *widen* logging to the
+        // most verbose level (fail-open for sensitive records). Clamp unknown
+        // numeric levels to the safe end (`Error`) instead.
+        return Some(if number <= 3 {
+            LogLevel::from_u8(number as u8)
+        } else {
+            LogLevel::Error
+        });
     }
     level.as_str().and_then(LogLevel::parse)
 }
@@ -1719,7 +1860,10 @@ impl Context {
                     if allowed {
                         Ok(())
                     } else {
-                        Err(CordisError::ServiceWriteForbidden(name.to_string()))
+                        // C5: the accessor's setter declined the write — this
+                        // is a computed-property decision, not an ownership
+                        // violation, so it gets its own error variant.
+                        Err(CordisError::AccessorWriteRejected(name.to_string()))
                     }
                 }
                 None => Err(CordisError::AccessorReadOnly(name.to_string())),

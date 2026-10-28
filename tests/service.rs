@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use zeokeel_cordis::{
     AvailabilityCheck, ConfigSchema, Context, CordisError, FiberState, JsonConfigSchema, Plugin,
-    Result, Service, ServiceKey,
+    Result, Service, ServiceKey, ServiceValue,
 };
 
 static GREETER: ServiceKey<Greeter> = ServiceKey::new("greeter");
@@ -335,4 +335,50 @@ fn availability_check_may_read_other_services() {
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("availability check must not deadlock on the service store");
     assert_eq!(resolved.as_deref(), Some("outer"));
+}
+
+/// Audit R3B P3-4 / C5: an accessor setter that declines a write is not an
+/// ownership violation; it has its own error variant so diagnostics stay
+/// accurate (previously it reused `ServiceWriteForbidden`, whose message says
+/// "service provided by another fiber").
+#[test]
+fn accessor_setter_rejection_uses_a_dedicated_error() {
+    let root = Context::root();
+    root.accessor_with_setter(
+        "svc.rejected",
+        |_ctx| Arc::new("value".to_string()) as ServiceValue,
+        |_ctx, _value| false,
+    )
+    .expect("rejecting accessor");
+
+    let error = root
+        .set("svc.rejected", Arc::new("next".to_string()) as ServiceValue)
+        .expect_err("the setter rejects the write");
+    match &error {
+        CordisError::AccessorWriteRejected(name) => assert_eq!(name, "svc.rejected"),
+        other => panic!("expected AccessorWriteRejected, got {other:?}"),
+    }
+    assert!(
+        error.to_string().contains("accessor"),
+        "the message must name the accessor decision: {error}"
+    );
+
+    // The `set_any` lane reports the same dedicated error.
+    let error = root
+        .set_any(
+            ServiceKey::<String>::new("svc.rejected"),
+            Arc::new("next".to_string()),
+        )
+        .expect_err("the setter rejects the write");
+    assert!(matches!(error, CordisError::AccessorWriteRejected(_)));
+
+    // A read-only accessor keeps its own distinct error.
+    root.accessor("svc.readonly", |_ctx| {
+        Arc::new("ro".to_string()) as ServiceValue
+    })
+    .expect("read-only accessor");
+    let error = root
+        .set("svc.readonly", Arc::new("nope".to_string()) as ServiceValue)
+        .expect_err("read-only accessor");
+    assert!(matches!(error, CordisError::AccessorReadOnly(_)));
 }
