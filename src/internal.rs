@@ -21,8 +21,8 @@
 //! | `internal/listener` | [`InternalBus::on_listener`] | bail: [`ListenerRequest`] → replacement |
 //! | `internal/dispatch` | [`InternalBus::on_dispatch`] | [`DispatchInfo`] |
 //!
-//! Hooks are registered with [`crate::Context::on_internal_*`] and are removed
-//! with the owning fiber, exactly like event listeners.
+//! Hooks are registered with the `Context::on_internal_*` methods and are
+//! removed with the owning fiber, exactly like event listeners.
 //!
 //! Dispatch mode names match Cordis `DispatchMode`.
 

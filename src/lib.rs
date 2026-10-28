@@ -43,6 +43,15 @@
 //! (`Disposer`, `AsyncDisposer`, boxed futures) instead of a dynamic proxy.
 #![forbid(unsafe_code)]
 
+// Compile-time contract: panic isolation is implemented with `catch_unwind`, so
+// the crate cannot run under `panic = "abort"` (a plugin panic would abort the
+// process before any containment code runs). Fail the build instead of silently
+// shipping a kernel whose core promise is false.
+#[cfg(panic = "abort")]
+compile_error!(
+    "cordis requires `panic = \"unwind\"`: panic isolation is impossible with      `panic = \"abort\"` (see docs/KERNEL-ISOLATION.md). Build with the default      unwind strategy, or run untrusted plugins behind process/WASM isolation."
+);
+
 pub mod async_effects;
 pub mod config;
 pub mod context;

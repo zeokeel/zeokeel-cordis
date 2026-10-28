@@ -372,12 +372,30 @@ Context 树（不可变、可派生）
 
 **无法遏制（Rust 进程内物理限制）**
 
-- `panic="abort"` 构建、栈溢出、OOM / 分配器 abort、`process::abort/exit`；
+- `panic="abort"` 构建：**编译期即拒绝**（`compile_error!`，见下节），不会静默产出"隔离失效"的内核；
+- 栈溢出、OOM / 分配器 abort、`process::abort/exit`（依赖中的 `unsafe` UB 同理）；
 - `unsafe` 造成的 UB（本 crate 无 unsafe，但宿主/依赖可能有）；
 - 死锁、无限循环、线程被外部 kill；
 - 插件越过宿主边界直接操作系统资源。
 
 对**不可信插件**，请使用宿主层的进程隔离（L3）或 WASM（L4）；内核不提供沙箱、动态 ABI 或抢占式超时。
+
+### 编译期强制与最严格构建（v0.3.0+）
+
+| 机制 | 实现 | 保证 |
+| --- | --- | --- |
+| `panic = "unwind"` | `src/lib.rs` 里 `#[cfg(panic = "abort")] compile_error!` | 用 `panic=abort` 编译**直接失败**，不会出现"panic 隔离静默失效"的构建 |
+| 禁止 `unsafe` | crate 级 `#![forbid(unsafe_code)]` | 内核自身零 `unsafe`（第三方依赖仍需审计） |
+| 整数溢出 | release profile `overflow-checks = true` | 溢出变成可被遏制观测的 panic，而不是静默回绕 |
+| 异步锁纪律 | clippy `await_holding_lock` / `mutex_integer` = deny | 编译期拦住"跨 await 持锁"等常见死锁模式 |
+| 文档 | CI `RUSTDOCFLAGS=-D warnings` | 失效的文档链接/未解析引用直接失败 |
+| 构建一致性 | release `codegen-units = 1` + `lto = "thin"` + `panic="unwind"` | 整 crate 优化、可复现的严格构建 |
+| CI 反证 | CI 里执行 `RUSTFLAGS="-C panic=abort" cargo check` 并断言失败 | 每次 CI 都验证编译期契约仍然生效 |
+
+**编译期能做什么、不能做什么**：编译器可以强制"可判定的前置条件"（panic 策略、unsafe 禁用、
+溢出检查、部分 lint 模式），但**无法证明**不存在栈溢出、OOM、死锁、无限循环或依赖中的 UB——
+这些是停机问题/运行时资源问题，只能靠进程隔离（L3）或 WASM（L4）。本项目的做法是把
+"能编译期拒绝的"全部变成硬错误，把"不能的"明确写进 [`docs/KERNEL-ISOLATION.md`](docs/KERNEL-ISOLATION.md)。
 
 ---
 

@@ -10,6 +10,35 @@ keywords = ["cordis", "plugin", "dependency-injection", "kernel"]
 categories = ["development-tools"]
 readme = "README.md"
 
+# Strictest supported build configuration.
+# - panic=unwind is mandatory: panic containment is implemented with
+#   `catch_unwind` (see the compile-time guard in src/lib.rs).
+# - overflow-checks in release turns integer overflow into a panic that the
+#   kernel's containment can observe, instead of silent wrap-around.
+# - one codegen unit + thin LTO give reproducible, whole-crate optimization;
+#   raise/remove if your build time matters more than strictness.
+[profile.dev]
+panic = "unwind"
+
+[profile.test]
+panic = "unwind"
+
+[profile.bench]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+overflow-checks = true
+codegen-units = 1
+lto = "thin"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+await_holding_lock = "deny"
+mutex_integer = "deny"
+
 [dependencies]
 serde_json = "1"
 tracing = { version = "0.1", features = ["log"] }

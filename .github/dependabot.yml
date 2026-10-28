@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # Keep GitHub Actions on their latest major versions automatically.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # Keep Cargo dependencies patched as well.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

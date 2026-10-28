@@ -4,7 +4,8 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 /// A cleanup callback. Sync by design: async cleanups use
-/// [`AsyncCleanup`] / [`Context::effect_async`].
+/// [`AsyncCleanup`](crate::async_effects::AsyncCleanup) /
+/// [`Context::effect_async`](crate::Context::effect_async).
 pub type Cleanup = Box<dyn FnOnce() + Send>;
 
 /// The result of an effect body: zero or more cleanup callbacks.

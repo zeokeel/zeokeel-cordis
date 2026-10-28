@@ -87,9 +87,53 @@ Cordis 在进程内提供的是 **unwinding panic 的故障遏制（fault contai
 > 判断标准：如果插件来自**可信仓库、同源代码** → L1+L2 足够；如果插件是**第三方/可被
 > 攻破** → 必须 L3 或 L4。内核本身不应假装是沙箱。
 
+## 5.5 编译期强制与"最严格构建"（v0.3.0+）
+
+编译器能强制的是**可判定的前置条件**，不是运行时资源/停机问题。本项目已把能强制的部分全部
+变成**编译错误或 CI 硬门禁**：
+
+| 威胁 | 能否编译期解决 | 本项目的处理 | 残余 |
+| --- | --- | --- | --- |
+| `panic="abort"` 构建 | ✅ 可判定 | `#[cfg(panic = "abort")] compile_error!`；CI 每次反证 `RUSTFLAGS="-C panic=abort" cargo check` 必须失败 | 无（构建层禁止）|
+| 内核自身 `unsafe` UB | ✅ 可判定（本 crate）| crate 级 `#![forbid(unsafe_code)]` | 依赖/宿主代码的 unsafe 不在覆盖范围（用 cargo-audit/geiger 做供应链审计）|
+| 整数溢出（静默回绕）| ✅ 可判定 | release `overflow-checks = true` → 溢出 panic，可被 containment 观测 | 不是"消除崩溃"，而是"把静默错误变成可观测错误" |
+| 异步死锁（持锁跨 await）| ⚠️ 常见模式可 lint | clippy `await_holding_lock = deny`、`mutex_integer = deny`，CI `-D warnings` | 通用死锁不可判定，仍需 L2 watchdog/超时 |
+| 栈溢出 | ❌ 不可判定 | 最大插件加载深度 `MAX_PLUGIN_DEPTH=256` 限制一类必然递归；运行时仍可能因插件自身递归爆栈 | 需 L3/L4 |
+| OOM / 分配器 abort | ❌ 不可判定 | 无编译期方案（Rust 分配错误默认 abort，不能 unwind）| 需 L3 cgroup/rlimit 或 L4 内存上限 |
+| 死锁 / 无限循环 | ❌ 停机问题 | 协作 checkpoint + `when_idle` + 宿主 watchdog（L2）| 内核不能强杀线程 |
+| 外部 kill / SEGV / UB | ❌ | 进程边界外处理 | L3/L4 |
+
+最严格构建配置（`Cargo.toml` 已内置）：
+
+```toml
+[profile.dev]   panic = "unwind"
+[profile.test]  panic = "unwind"
+[profile.release]
+panic = "unwind"
+overflow-checks = true
+codegen-units = 1
+lto = "thin"
+```
+
+CI 额外执行：
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+cargo build --release
+RUSTFLAGS="-C panic=abort" cargo check --lib   # 必须失败
+```
+
+> 结论：纯 Rust 内核可以把"panic 策略 / unsafe / 溢出 / 常见锁误用"变成**编译期或 CI 期的硬错误**，
+> 但无法把栈溢出、OOM、死锁、无限循环、依赖 UB 变成编译错误。要做"插件崩溃绝不拖垮内核"，
+> 这些仍然必须在 L3 进程隔离或 L4 WASM 里解决。
+
 ## 6. 支持 L2/L3 所需的 kernel API（路线图）
 
-1. `IsolationCapabilities`：启动时断言 `panic=unwind`；`kernel.can_contain_panics()`。
+1. ~~启动时断言 `panic=unwind`~~ → **已升级为编译期强制**（v0.3.0+，见 §5.5）；后续可加
+   `IsolationCapabilities::detect()` 做运行时自省（记录实际构建参数）。
 2. 观测：`Registry::when_idle(Duration)`（整树静默）、per-fiber `last_activity()`/`heartbeat()`。
 3. 协作取消：`Context::checkpoint() -> Result<(), Cancelled>`、`Fiber::cancel()`、
    `dispose_cancelling(Duration)`。

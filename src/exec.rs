@@ -9,9 +9,9 @@
 //! - [`block_on`] drives one future to completion on the current thread; it
 //!   backs `Fiber::dispose()` (the sync disposal path) and an
 //!   `AsyncDisposer` dropped without `dispose_async()`;
-//! - [`join_all`] polls several futures concurrently; it backs
+//! - `join_all` polls several futures concurrently; it backs
 //!   `Events::parallel_async`;
-//! - [`catch_panic`] isolates a panicking cleanup so one failed resource
+//! - `catch_panic` isolates a panicking cleanup so one failed resource
 //!   release cannot skip the rest of the effect list.
 
 use std::any::Any;

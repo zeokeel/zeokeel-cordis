@@ -3,8 +3,8 @@
 //!
 //! Modes:
 //!   cycle                  A loads B, B loads A (recursion-cycle containment)
-//!   depth <N>              parent→child chain N levels deep, then dispose root
-//!   wide <N>               parent loads N children, then dispose parent
+//!   depth `<N>`            parent→child chain N levels deep, then dispose root
+//!   wide `<N>`             parent loads N children, then dispose parent
 
 use std::sync::Arc;
 
