@@ -1,0 +1,20 @@
+[package]
+name = "cordis"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+repository = "https://github.com/zeokeel/Cordis"
+description = "Cordis-paradigm pluggable kernel core for Rust: context/service/fiber/effect/events/registry"
+keywords = ["cordis", "plugin", "dependency-injection", "kernel"]
+categories = ["development-tools"]
+readme = "README.md"
+
+[dependencies]
+serde_json = "1"
+tracing = { version = "0.1", features = ["log"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync"] }
+tracing-subscriber = "0.3"
