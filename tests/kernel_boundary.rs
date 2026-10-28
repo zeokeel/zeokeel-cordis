@@ -253,6 +253,15 @@ fn strip_comments(source: &str) -> String {
 /// text must not smuggle business vocabulary either.
 fn kernel_code(source: &str) -> String {
     let without_comments = strip_comments(source);
+    // The scanner strips the *trailing* unit-test module. To keep that sound,
+    // each source file may contain at most one `#[cfg(test)]` module and it must
+    // be the final item; otherwise test code would be scanned as production code
+    // (false positives) or production code could hide after a test module.
+    let cfg_tests = without_comments.matches("#[cfg(test)]").count();
+    assert!(
+        cfg_tests <= 1,
+        "kernel source may contain at most one trailing `#[cfg(test)]` module"
+    );
     match without_comments.rfind("\n#[cfg(test)]") {
         Some(index) => without_comments[..index].to_string(),
         None => without_comments,
@@ -398,11 +407,9 @@ fn identifier_words(text: &str) -> Vec<String> {
     for ch in text.chars() {
         if ch.is_ascii_alphanumeric() {
             run.push(ch);
-        } else {
-            if !run.is_empty() {
-                split_compound(&run, &mut words);
-                run.clear();
-            }
+        } else if !run.is_empty() {
+            split_compound(&run, &mut words);
+            run.clear();
         }
     }
     if !run.is_empty() {
@@ -767,6 +774,20 @@ fn guard_collects_doc_comments_and_doc_attributes() {
     assert!(docs.contains("payment"), "{docs:?}");
     assert!(docs.contains("database"), "{docs:?}");
     assert!(docs.contains("tenant"), "{docs:?}");
+}
+
+#[test]
+fn guard_limits_sources_to_one_trailing_test_module() {
+    let one = "pub fn f() {}\n#[cfg(test)]\nmod tests { #[test] fn t() {} }\n";
+    assert!(kernel_code(one).contains("pub fn f()"));
+    assert!(!kernel_code(one).contains("#[cfg(test)]"));
+
+    let two = "pub fn f() {}\n#[cfg(test)]\nmod a {}\n#[cfg(test)]\nmod b {}\n";
+    let result = std::panic::catch_unwind(|| kernel_code(two));
+    assert!(
+        result.is_err(),
+        "multiple cfg(test) modules must be rejected"
+    );
 }
 
 #[test]
