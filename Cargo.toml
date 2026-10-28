@@ -27,12 +27,6 @@ supervision = []
 [profile.dev]
 panic = "unwind"
 
-[profile.test]
-panic = "unwind"
-
-[profile.bench]
-panic = "unwind"
-
 [profile.release]
 panic = "unwind"
 overflow-checks = true

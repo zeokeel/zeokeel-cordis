@@ -106,8 +106,9 @@ Cordis 在进程内提供的是 **unwinding panic 的故障遏制（fault contai
 最严格构建配置（`Cargo.toml` 已内置）：
 
 ```toml
-[profile.dev]   panic = "unwind"
-[profile.test]  panic = "unwind"
+[profile.dev]
+panic = "unwind"
+
 [profile.release]
 panic = "unwind"
 overflow-checks = true
