@@ -155,6 +155,13 @@ pub(crate) fn contained_merge(
 /// injects defaults for missing keys, reports missing required keys, checks
 /// declared property types and — when [`JsonConfigSchema::deny_unknown`] was
 /// called — rejects undeclared keys.
+///
+/// **Optional typed fields** are expressed with a `Value::Null` default plus an
+/// explicit [`JsonConfigSchema::property`]: the `null` default then means
+/// "absent by default" and is *not* injected (injecting it would contradict the
+/// declared kind), so `validate({})` succeeds without the key while a provided
+/// value is still type-checked. A `null` default without a declared kind is
+/// injected as before.
 #[derive(Debug, Clone)]
 pub struct JsonConfigSchema {
     required: Vec<String>,
@@ -181,22 +188,42 @@ impl JsonConfigSchema {
     }
 
     /// Require `name` to be present (after defaults are injected).
+    ///
+    /// A typed field whose default is `null` is optional and absent by default,
+    /// so marking it `required` makes the caller provide an explicit value.
     pub fn required(mut self, name: impl Into<String>) -> Self {
         self.required.push(name.into());
         self
     }
 
     /// Inject `value` when `name` is missing.
+    ///
+    /// A non-null default also declares the property's JSON kind (unless
+    /// [`JsonConfigSchema::property`] overrides it).
+    ///
+    /// A `Value::Null` default never declares a type: `null` is a legal value
+    /// for every kind in Cordis configs and `JsonType` has no nullable wrapper.
+    /// Its *injection* depends on the declared type (either an earlier
+    /// non-null default or [`JsonConfigSchema::property`]):
+    ///
+    /// - **untyped** → the key is injected as `null` (the field is declared, so
+    ///   [`JsonConfigSchema::deny_unknown`] accepts it);
+    /// - **typed** → the key stays absent ("optional field"; injecting `null`
+    ///   would fail the declared type check). [`JsonConfigSchema::required`]
+    ///   then demands an explicit value.
     pub fn default_value(mut self, name: impl Into<String>, value: Value) -> Self {
         let name = name.into();
-        self.properties.entry(name.clone()).or_insert(match value {
-            Value::String(_) => JsonType::String,
-            Value::Number(_) => JsonType::Number,
-            Value::Bool(_) => JsonType::Bool,
-            Value::Object(_) => JsonType::Object,
-            Value::Array(_) => JsonType::Array,
-            Value::Null => JsonType::Object,
-        });
+        let kind = match &value {
+            Value::String(_) => Some(JsonType::String),
+            Value::Number(_) => Some(JsonType::Number),
+            Value::Bool(_) => Some(JsonType::Bool),
+            Value::Object(_) => Some(JsonType::Object),
+            Value::Array(_) => Some(JsonType::Array),
+            Value::Null => None,
+        };
+        if let Some(kind) = kind {
+            self.properties.entry(name.clone()).or_insert(kind);
+        }
         self.defaults.insert(name, value);
         self
     }
@@ -230,10 +257,45 @@ impl JsonConfigSchema {
         let mut issues = Vec::new();
         let mut normalized = object;
 
+        // B-4': a default that does not match its declared kind is a schema
+        // authoring error. Report it directly instead of injecting the value
+        // and letting the generic "field has the wrong type" check blame the
+        // (injected) field.
         for (name, default) in &self.defaults {
-            if !normalized.contains_key(name) {
-                normalized.insert(name.clone(), default.clone());
+            if default.is_null() {
+                continue;
             }
+            if let Some(expected) = self.properties.get(name) {
+                if !expected.matches(default) {
+                    issues.push(format!(
+                        "default value for `{name}` must be {}, got {}",
+                        expected.name(),
+                        json_kind(default)
+                    ));
+                }
+            }
+        }
+        for (name, default) in &self.defaults {
+            if normalized.contains_key(name) {
+                continue;
+            }
+            if let Some(expected) = self.properties.get(name) {
+                // An explicit declared type plus a `null` default models an
+                // *optional* field: `null` means "absent", and injecting it
+                // would contradict the declared kind. Leave the key absent; the
+                // type check still applies when the caller provides a value. An
+                // untyped `null` default is injected for backwards
+                // compatibility.
+                if default.is_null() {
+                    continue;
+                }
+                // A conflicting default was reported above and must not be
+                // injected either (it would add a second, confusing issue).
+                if !expected.matches(default) {
+                    continue;
+                }
+            }
+            normalized.insert(name.clone(), default.clone());
         }
         for name in &self.required {
             if !normalized.contains_key(name) {
@@ -247,7 +309,9 @@ impl JsonConfigSchema {
                     expected.name(),
                     json_kind(value)
                 )),
-                None if !self.additional_properties => {
+                // A key with a default is declared even when the default is
+                // `null` and therefore carries no type constraint.
+                None if !self.additional_properties && !self.defaults.contains_key(name) => {
                     issues.push(format!("unknown field `{name}`"));
                 }
                 _ => {}
@@ -297,8 +361,13 @@ impl ConfigSchema for JsonConfigSchema {
                 }
             }
         }
-        // Defaults never override an explicitly provided value.
+        // Defaults never override an explicitly provided value. A typed `null`
+        // default means "optional, absent by default" and is not materialized,
+        // keeping `merge` consistent with `validate` (FIX-17).
         for (name, default) in &self.defaults {
+            if default.is_null() && self.properties.contains_key(name) {
+                continue;
+            }
             merged
                 .entry(name.clone())
                 .or_insert_with(|| default.clone());

@@ -1921,9 +1921,19 @@ fn at29_concurrent_dispose_joins_inflight() {
             let first_handle = disposer.clone();
             let first = tokio::spawn(async move { first_handle.dispose().await });
             started_rx.await.expect("cleanup started");
+            // The joiner runs on a dedicated thread: a joiner polled on the same
+            // thread as the drainer is the documented R2-1 self-join shortcut
+            // (it must return instead of waiting for itself), and tokio may
+            // schedule a second task on the same worker thread. A *concurrent*
+            // joiner from another thread is what must wait here.
             let second_handle = disposer.clone();
-            let joiner = tokio::spawn(async move { second_handle.dispose().await });
-            tokio::time::sleep(Duration::from_millis(30)).await;
+            let (joiner_tx, joiner_rx) = std::sync::mpsc::channel::<()>();
+            let joiner = std::thread::spawn(move || {
+                let _ = joiner_tx.send(());
+                block_on(second_handle.dispose());
+            });
+            joiner_rx.recv().expect("joiner started");
+            std::thread::sleep(Duration::from_millis(30));
             assert!(!joiner.is_finished(), "the second dispose must wait");
             assert_eq!(runs.load(Ordering::SeqCst), 0);
             let _ = gate_tx.send(());
@@ -1931,10 +1941,7 @@ fn at29_concurrent_dispose_joins_inflight() {
                 .await
                 .expect("first dispose")
                 .expect("first task");
-            tokio::time::timeout(Duration::from_secs(10), joiner)
-                .await
-                .expect("joiner must not hang")
-                .expect("joiner task");
+            joiner.join().expect("joiner must not hang");
             assert_eq!(runs.load(Ordering::SeqCst), 1);
             let started = Instant::now();
             tokio::time::timeout(Duration::from_secs(2), disposer.dispose())

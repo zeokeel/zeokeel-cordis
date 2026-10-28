@@ -52,16 +52,16 @@ impl Accessor {
         }
     }
 
-    pub(crate) fn read(&self, ctx: &Context) -> ServiceValue {
-        // CORE-041: a panicking accessor getter must not unwind out of
-        // `Context::get` / `get_named`; the placeholder fails every typed
-        // downcast, so the read degrades to "value not available".
-        crate::internal::contained(
-            "zeokeel_cordis::reflect",
-            "accessor get()",
-            Arc::new(()) as ServiceValue,
-            || (self.get)(ctx),
-        )
+    /// Read the computed property, containing a panicking getter.
+    ///
+    /// CORE-041: a panicking accessor getter must not unwind out of
+    /// `Context::get` / `get_named`; the read degrades to `None` ("value not
+    /// available"), matching the absent-property contract instead of returning
+    /// a placeholder that only fails typed downcasts.
+    pub(crate) fn read(&self, ctx: &Context) -> Option<ServiceValue> {
+        crate::internal::contained("zeokeel_cordis::reflect", "accessor get()", None, || {
+            Some((self.get)(ctx))
+        })
     }
 }
 

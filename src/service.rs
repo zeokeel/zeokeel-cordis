@@ -1,6 +1,6 @@
 //! Service keys, availability gates and the entries stored by a context.
 
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::config::ConfigSchema;
 use crate::context::{Context, ContextInner};
 use crate::error::Result;
+use crate::fiber::{FiberData, FiberState};
 
 pub type ServiceValue = Arc<dyn Any + Send + Sync>;
 
@@ -47,6 +48,17 @@ pub(crate) fn unwrap_service<T: ?Sized + Send + Sync + 'static>(
         .map(|wrapped| Arc::clone(&wrapped.0))
 }
 
+/// The concrete `TypeId` stored inside a [`ServiceValue`].
+///
+/// This is `TypeId::of::<T>()` for a typed provide and
+/// `TypeId::of::<ArcWrap<T>>()` for a `*_any` provide: exactly the identity
+/// `ctx.set` compares against (FIX-13). The explicit `&dyn Any` coercion makes
+/// the dynamic `Any::type_id` dispatch unambiguous (calling `.type_id()` on the
+/// `Arc` itself would report the `Arc`'s own type instead of the stored one).
+pub(crate) fn service_type_id(value: &ServiceValue) -> TypeId {
+    (&**value as &dyn Any).type_id()
+}
+
 /// Availability predicate for a provided service (Cordis `Service.check`).
 ///
 /// Dependents (fibers whose `inject` names this service) only see the service
@@ -67,6 +79,19 @@ pub(crate) struct ServiceEntry {
     pub(crate) schema: Option<Arc<dyn ConfigSchema>>,
     /// Fiber id that provided the service (Cordis `ctx.set` ownership rule).
     pub(crate) owner: u64,
+    /// Concrete `TypeId` of [`ServiceEntry::value`]: `T` for typed provides and
+    /// `ArcWrap<T>` for the `*_any` provides. `ctx.set` rejects values of a
+    /// different type (DESIGN I5), so a service can never be silently replaced
+    /// by an unrelated value.
+    pub(crate) type_id: TypeId,
+    /// Fingerprint of the providing fiber, used by the injection gate.
+    ///
+    /// The gate requires the provider to be [`FiberState::Active`] so dependents
+    /// never activate against a provider that is still loading or already
+    /// failed/unloading (FIX-12). `Weak` keeps the registry lock-free and never
+    /// resurrects a fiber; `None` and already-dropped weaks count as available
+    /// so hand-built entries (root-only stores, migration paths) keep working.
+    pub(crate) provider: Option<Weak<Mutex<FiberData>>>,
     /// Entry version; dependents reactivate when this changes.
     pub(crate) version: u64,
     /// Set while the providing fiber is unloading: dependents deactivate
@@ -82,6 +107,38 @@ impl ServiceEntry {
         match &self.check {
             None => true,
             Some(check) => catch_unwind(AssertUnwindSafe(|| check())).unwrap_or(false),
+        }
+    }
+
+    /// Strict availability predicate for dependency/injection gates (FIX-12).
+    ///
+    /// On top of [`ServiceEntry::is_available`] the providing fiber must be
+    /// `Active`; the TS reference keeps a dependent `Pending` while its
+    /// provider loads, so a provider that later fails never lets the dependent
+    /// `apply` run at all. Reads through [`Context::get`] stay non-strict (see
+    /// [`ServiceEntry::is_available`]).
+    pub(crate) fn is_available_for_injection(&self) -> bool {
+        self.is_available() && self.provider_is_active()
+    }
+
+    fn provider_is_active(&self) -> bool {
+        let Some(provider) = &self.provider else {
+            return true;
+        };
+        match provider.upgrade() {
+            // The providing fiber was dropped without withdrawing the entry
+            // (leaked/detached store): stay backward compatible and usable.
+            None => true,
+            Some(data) => match data.lock() {
+                Ok(fiber) => fiber.state == FiberState::Active,
+                // A poisoned lock is *not* evidence that the provider went
+                // inactive: a contained panic while some kernel path held the
+                // lock (e.g. a panicking `Plugin::inject()` during
+                // `replace_plugin`) would otherwise turn one contained panic
+                // into a permanent, silent service outage (S-3 / audit B-3).
+                // Fail open here, like a dropped provider (`None` => true).
+                Err(_) => true,
+            },
         }
     }
 }

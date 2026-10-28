@@ -466,6 +466,13 @@ impl Events {
     }
 
     /// Compose and await the async waterfall chain for `name`.
+    ///
+    /// Panic policy matches the synchronous [`Events::waterfall`]: a panicking
+    /// middleware aborts the chain and the panic is re-raised to the caller
+    /// ([`std::panic::resume_unwind`]) after being logged. Degrading to a
+    /// default value would turn a failed policy middleware into an allow
+    /// (fail-open); the kernel's waterfall contract is fail-closed, so a
+    /// panicking middleware aborts the dispatch instead.
     pub async fn waterfall_async(
         &self,
         name: &str,
@@ -477,9 +484,6 @@ impl Events {
             .emit_dispatch(DispatchMode::Waterfall, name, args);
         let listeners = self.async_waterfall_snapshot(name, scope);
         let terminal = terminal.unwrap_or_else(null_async_waterfall_terminal);
-        // One panicking middleware must not unwind out of the dispatch; the
-        // chain cannot be resumed, so the dispatch degrades to the async
-        // waterfall's default value.
         let chain = AsyncWaterfallNext::new(listeners, args, terminal).next();
         match crate::exec::catch_panic(chain).await {
             Ok(value) => value,
@@ -488,9 +492,12 @@ impl Events {
                     target: "zeokeel_cordis::events",
                     event = name,
                     panic = %crate::internal::panic_message(payload.as_ref()),
-                    "async waterfall listener panicked; using the default value"
+                    "async waterfall listener panicked; aborting the chain and re-raising"
                 );
-                Value::Null
+                // Fail-closed: the remaining middleware/terminal must not run
+                // and the caller must observe the failure (same contract as the
+                // synchronous waterfall).
+                std::panic::resume_unwind(payload)
             }
         }
     }

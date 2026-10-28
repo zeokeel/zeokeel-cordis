@@ -1075,15 +1075,15 @@ fn r5_01_cancel_at_second_await_preserves_order() {
         let mut future = Box::pin(fiber.dispose_async());
         assert!(poll_once(future.as_mut()).is_pending());
         drop(future);
-        assert_eq!(fiber.state(), FiberState::Unloading);
+        // A-9: the cancelled unload completes the teardown: the not-yet-started
+        // sync cleanup `s1` runs inline (reverse order preserved) and the fiber
+        // is Disposed; the in-flight async `a2` tail is the documented loss.
+        assert_eq!(fiber.state(), FiberState::Disposed);
+        assert_eq!(*trace.lock().unwrap(), vec!["s3", "a2-start", "s1"]);
         let _ = gate_tx.send(());
         let retry = block_on(fiber.dispose_async());
         assert!(retry.is_ok(), "retry: {retry:?}");
-        assert_eq!(
-            *trace.lock().unwrap(),
-            vec!["s3", "a2-start", "s1"],
-            "reverse order must be preserved across cancellation; only the in-flight cleanup's tail may be lost"
-        );
+        assert_eq!(*trace.lock().unwrap(), vec!["s3", "a2-start", "s1"]);
         assert_eq!(fiber.state(), FiberState::Disposed);
         assert_eq!(root.registry().size(), 0);
     });
@@ -1132,8 +1132,12 @@ fn r5_02_repeated_direct_disposer_cancels_are_safe() {
     });
 }
 
-/// Cancelling the owning teardown while another handle waits as a joiner wakes
-/// the joiner, and a retried dispose runs the restored cleanups once.
+/// A separate future joining on the same thread is **not** a self-join (R2-1 /
+/// drain-frame): it must wait for the in-flight teardown. Cancelling the owner
+/// then releases the joiner, and a retry runs the restored cleanups once.
+///
+/// The real self-join case (a cleanup that `await`s its own disposer) is covered
+/// by `regression_semantics::fix15_self_join_from_cleanup_via_async_dispose_returns`.
 #[test]
 fn r5_03_cancel_wakes_joiner_and_retry_runs_remaining() {
     watchdog("r5_03", Duration::from_secs(20), || {
@@ -1153,17 +1157,18 @@ fn r5_03_cancel_wakes_joiner_and_retry_runs_remaining() {
         ]);
         let mut first = Box::pin(disposer.dispose());
         assert!(poll_once(first.as_mut()).is_pending());
+        // A separate joiner future on the same thread is not a self-join: it
+        // must wait instead of short-circuiting.
         let joiner_disposer = disposer.clone();
         let mut joiner = Box::pin(joiner_disposer.dispose());
         assert!(
             poll_once(joiner.as_mut()).is_pending(),
-            "the joiner must wait for the in-flight teardown"
+            "a separate future joining on the same thread is not a self-join: it must wait"
         );
+        drop(joiner);
+        // Cancelling the owner releases any joiner and leaves the unstarted
+        // cleanups restored; a retry runs them exactly once.
         drop(first);
-        assert!(
-            matches!(poll_once(joiner.as_mut()), Poll::Ready(())),
-            "cancelling the owner must release the joiner"
-        );
         let _ = gate_tx.send(());
         block_on(disposer.dispose());
         assert_eq!(*trace.lock().unwrap(), vec!["c1"]);
@@ -1253,11 +1258,13 @@ fn r5_05_cancel_during_deferred_drain_runs_remaining() {
             let mut future = Box::pin(fiber.dispose_async());
             assert!(poll_once(future.as_mut()).is_pending());
             drop(future);
-            assert_eq!(fiber.state(), FiberState::Unloading);
+            // A-9: a cancelled `dispose_async` lands the fiber on `Disposed`
+            // directly; the still-unstarted deferred cleanup waits for the retry.
+            assert_eq!(fiber.state(), FiberState::Disposed);
             assert_eq!(
                 remaining_runs.load(Ordering::SeqCst),
                 0,
-                "cancellation is a pure restore: deferred cleanups wait for the retry"
+                "deferred cleanups still wait for the retry dispose"
             );
             let retry = fiber.dispose_async().await;
             assert!(retry.is_ok(), "retry: {retry:?}");
@@ -1452,7 +1459,10 @@ fn r5_08_cancel_outside_runtime_restores_remaining_cleanup() {
             std::thread::scope(|scope| {
                 scope.spawn(move || drop(future));
             });
-            assert_eq!(fiber.state(), FiberState::Unloading);
+            // A-9: the cancelled unload finishes the teardown synchronously, so
+            // the fiber is already Disposed; the not-yet-started reactor cleanup
+            // waits for the retry (it cannot progress on the plain thread).
+            assert_eq!(fiber.state(), FiberState::Disposed);
             let retry = fiber.dispose_async().await;
             assert!(retry.is_ok(), "retry: {retry:?}");
             assert_eq!(fiber.state(), FiberState::Disposed);

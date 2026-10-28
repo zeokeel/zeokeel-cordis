@@ -31,6 +31,14 @@ pub enum CordisError {
     /// (`dispose`/`restart`/`update` are mutually exclusive; kernel-grade
     /// stability prefers a safe error over a data race).
     LifecycleBusy,
+    /// `ctx.set()`/`ctx.set_any()` tried to replace an existing service with a
+    /// value of a different type. The message contains the service name (and,
+    /// for diagnostics, the two type names when they are known).
+    ServiceTypeMismatch(String),
+    /// A `Registry::replace` rollback could not restore the previous state
+    /// completely. The message contains the original reload error *and* the
+    /// error raised by the rollback itself.
+    Rollback(String),
 }
 
 impl fmt::Display for CordisError {
@@ -53,6 +61,12 @@ impl fmt::Display for CordisError {
             Self::QuotaExceeded(kind) => write!(f, "resource quota exceeded: {kind}"),
             Self::LifecycleBusy => {
                 write!(f, "another lifecycle operation is already in progress")
+            }
+            Self::ServiceTypeMismatch(name) => {
+                write!(f, "service type mismatch: {name}")
+            }
+            Self::Rollback(message) => {
+                write!(f, "replace rollback failed: {message}")
             }
             Self::AsyncPluginNeedsAsync(name) => {
                 write!(

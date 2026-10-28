@@ -174,9 +174,14 @@ fn cancelling_dispose_async_restores_unstarted_effects() {
     let mut future = Box::pin(fiber.dispose_async());
     assert!(poll_once(future.as_mut()).is_pending());
     drop(future);
-    assert_eq!(fiber.state(), FiberState::Unloading);
+    // A-9: a cancelled `dispose_async` completes the teardown synchronously
+    // instead of leaving the fiber `Unloading`: the not-yet-started sync cleanup
+    // runs inline and the fiber reaches `Disposed`; the cleanup future that was
+    // already in flight cannot be recovered (documented bound).
+    assert_eq!(fiber.state(), FiberState::Disposed);
+    assert_eq!(snapshot(&trace), vec!["first"]);
 
-    // A retried dispose must run the restored sync effect and finalize.
+    // A retried dispose is idempotent and drains any deferred cleanup.
     block_on(fiber.dispose_async()).expect("retry dispose");
     assert_eq!(fiber.state(), FiberState::Disposed);
     assert_eq!(snapshot(&trace), vec!["first"]);

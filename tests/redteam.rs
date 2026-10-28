@@ -1125,10 +1125,11 @@ fn rt18_parallel_async_listener_panic_is_contained() {
     assert_kernel_usable(&root);
 }
 
-/// Register item 10f: a panicking async waterfall middleware must not escape
-/// the dispatch and must stop the chain (no terminal = fail closed).
+/// Register item 10f: a panicking async waterfall middleware is fail-closed —
+/// the panic propagates to the caller (like the synchronous waterfall) after
+/// being logged, and the terminal never runs.
 #[test]
-fn rt19_async_waterfall_panic_is_contained_and_stops_the_chain() {
+fn rt19_async_waterfall_panic_propagates_fail_closed() {
     let root = Context::root();
     let terminal_ran = Arc::new(AtomicBool::new(false));
     root.on_waterfall_async("rt19.pipeline", |_args, _next| {
@@ -1145,8 +1146,8 @@ fn rt19_async_waterfall_panic_is_contained_and_stops_the_chain() {
         block_on(root.waterfall_async("rt19.pipeline", &[], Some(terminal)))
     }));
     assert!(
-        dispatched.is_ok(),
-        "CONTAINMENT: a panicking async waterfall middleware escaped the dispatch"
+        dispatched.is_err(),
+        "FAIL-CLOSED: a panicking async waterfall middleware must propagate to the caller"
     );
     assert!(
         !terminal_ran.load(Ordering::SeqCst),

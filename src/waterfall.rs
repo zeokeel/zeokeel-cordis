@@ -7,6 +7,12 @@
 //! continuation is a value: [`WaterfallNext`] for sync listeners and
 //! [`AsyncWaterfallNext`] for async listeners.
 //!
+//! Panic policy is fail-closed on both lanes: a panicking middleware aborts the
+//! chain (the terminal must not run, because that would turn a failed policy
+//! check into an allow) and the panic is re-raised to the dispatcher
+//! ([`crate::Events::waterfall`] / [`crate::Events::waterfall_async`]) after
+//! being logged.
+//!
 //! ```no_run
 //! # use serde_json::{json, Value};
 //! # use zeokeel_cordis::{Context, waterfall_terminal};
@@ -81,6 +87,10 @@ impl WaterfallNext {
     /// Run the rest of the chain, or the terminal behavior when nothing is
     /// left. Calling it more than once re-runs the remaining chain, which is
     /// how retry/rewrite middlewares are expressed in Cordis.
+    ///
+    /// A panicking middleware aborts the chain (`fail-closed`: the remaining
+    /// middleware and the terminal never run) and the panic is logged through
+    /// `tracing` and re-raised to the dispatcher.
     pub fn next(&self) -> Value {
         match self.remaining.split_first() {
             Some((listener, rest)) => {
@@ -94,7 +104,14 @@ impl WaterfallNext {
                 // into an allow — fail-open is not acceptable for a kernel.
                 match catch_unwind(AssertUnwindSafe(|| listener(&self.args, &next))) {
                     Ok(value) => value,
-                    Err(payload) => std::panic::resume_unwind(payload),
+                    Err(payload) => {
+                        tracing::error!(
+                            target: "zeokeel_cordis::waterfall",
+                            panic = %crate::internal::panic_message(payload.as_ref()),
+                            "waterfall middleware panicked; aborting the chain and re-raising"
+                        );
+                        std::panic::resume_unwind(payload)
+                    }
                 }
             }
             None => (self.terminal)(&self.args),

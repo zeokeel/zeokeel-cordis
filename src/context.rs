@@ -354,6 +354,16 @@ impl Context {
         schema: Option<Arc<dyn ConfigSchema>>,
     ) -> Result<Disposer> {
         let entry = ServiceEntry {
+            // The stored value's concrete type: `T` for typed provides and
+            // `ArcWrap<T>` for `*_any` provides. `ctx.set` compares against it
+            // so a service can never be silently replaced by another type
+            // (DESIGN I5 / FIX-13).
+            type_id: crate::service::service_type_id(&service),
+            // Weak link to the providing fiber: injection gates require it to
+            // be `Active` (FIX-12). Weak keeps the registry lock-free and can
+            // never resurrect a fiber; entries without a registered provider
+            // (root-only / detached stores) count as available.
+            provider: Some(Arc::downgrade(&self.inner.fiber.data)),
             value: service.clone(),
             check,
             schema,
@@ -406,28 +416,28 @@ impl Context {
         Ok(disposer)
     }
 
+    /// Read an accessor with panic containment: a broken accessor must not
+    /// take down service lookup (panic-containment policy; see
+    /// docs/CORDIS-RUST.md). [`Accessor::read`] logs the panic and reports
+    /// `None`, so a panicking getter is indistinguishable from an absent
+    /// property (never a placeholder value that only fails typed downcasts).
+    fn accessor_value(&self, accessor: &Accessor) -> Option<ServiceValue> {
+        accessor.read(self)
+    }
+
     /// Typed lookup with child→root inheritance (respecting `isolate` and the
     /// provider's [`AvailabilityCheck`]).
     ///
     /// Dispatches the typed `internal/get` waterfall before reporting the
     /// service, so extensions can observe/override service reads (Cordis
     /// `internal/get`). Hooks that call `ctx.get()` again do not recurse.
-    /// Read an accessor with panic containment: a broken accessor must not
-    /// take down service lookup (panic-containment policy; see docs/CORDIS-RUST.md).
-    fn accessor_value(&self, accessor: &Accessor) -> Option<ServiceValue> {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| accessor.read(self))) {
-            Ok(value) => Some(value),
-            Err(payload) => {
-                tracing::error!(
-                    target: "zeokeel_cordis::context",
-                    "accessor read panicked: {}",
-                    crate::fiber::panic_message(payload.as_ref())
-                );
-                None
-            }
-        }
-    }
-
+    ///
+    /// This is the *non-strict* read path (Cordis property-read semantics): a
+    /// service provided by a fiber that is still loading is visible here, while
+    /// [`Context::service_available`] and `inject` gates use the strict
+    /// `Context::lookup_for_injection` query. Computed accessors
+    /// ([`Context::accessor`]) are resolved before services and are only
+    /// reachable through this read path, never through injection.
     pub fn get<T: Any + Send + Sync>(&self, key: ServiceKey<T>) -> Option<Arc<T>> {
         let name = key.name();
         if let Some(accessor) = self.find_accessor(name) {
@@ -485,8 +495,11 @@ impl Context {
 
     /// Overwrite a **trait-object** service registered by the current fiber.
     ///
-    /// Mirrors [`Context::set`]'s ownership rule: only the providing fiber may
-    /// write the service.
+    /// Mirrors [`Context::set`]'s ownership and type rules: only the providing
+    /// fiber may write the service, and the replacement must be the same
+    /// concrete `Arc<T>` type ([`CordisError::ServiceTypeMismatch`]
+    /// otherwise — the `*_any` lane stores `ArcWrap<T>` internally, so
+    /// `set_any` and `provide_any` with the same `T` always agree).
     pub fn set_any<T: ?Sized + Send + Sync + 'static>(
         &self,
         key: ServiceKey<T>,
@@ -514,26 +527,55 @@ impl Context {
         self.set_revertible(name, wrapped).map(|_| ())
     }
 
-    /// Whether `name` currently resolves to an available implementation from
-    /// this context (diagnostics for gated services).
+    /// Whether `name` currently resolves to an implementation **usable for
+    /// injection** from this context (diagnostics for gated services).
+    ///
+    /// Uses the strict injection query (`Context::lookup_for_injection`): the
+    /// provider fiber must be `Active`. Computed accessors and `internal/get`
+    /// virtual services are *not* services and never satisfy injection, so
+    /// `ctx.get_named(name).is_some()` can be `true` while this returns
+    /// `false` — that is the documented Cordis split (property read vs
+    /// dependency resolution).
     pub fn service_available(&self, name: &str) -> bool {
-        self.lookup(name).is_some()
+        self.lookup_for_injection(name).is_some()
     }
 
-    pub(crate) fn lookup(&self, name: &str) -> Option<ServiceEntry> {
+    /// The stored service entry for `name` in this context's scope, ignoring
+    /// availability (the raw registry cell; callers apply their own predicate).
+    fn lookup_entry(&self, name: &str) -> Option<ServiceEntry> {
         // Resolve within the scope this context maps `name` to; an unavailable
         // impl (Service.check false) shadows the scope instead of falling back
         // to the default scope (same rule as Cordis).
-        let scope = self.service_scope(name).unwrap_or(0);
+        let store = self.inner.service_store.lock().ok()?;
+        store
+            .get(&(self.service_scope(name).unwrap_or(0), name.to_string()))
+            .cloned()
+    }
+
+    /// Non-strict lookup: what [`Context::get`] / [`Context::get_named`] report.
+    ///
+    /// Honors `Service.check` and provider withdrawal but deliberately ignores
+    /// the provider fiber's lifecycle state (Cordis property-read semantics: a
+    /// dependent may observe a service while the providing plugin is still
+    /// loading; only *injection* is gated on [`FiberState::Active`]).
+    pub(crate) fn lookup(&self, name: &str) -> Option<ServiceEntry> {
         // Take the entry out of the store *before* running the availability
         // check: a check may itself read services or log (official Cordis
         // allows re-entrant checks), and holding the store mutex across user
         // code would self-deadlock.
-        let entry = {
-            let store = self.inner.service_store.lock().ok()?;
-            store.get(&(scope, name.to_string())).cloned()
-        };
-        entry.filter(|entry| entry.is_available())
+        self.lookup_entry(name).filter(|entry| entry.is_available())
+    }
+
+    /// Strict lookup used by dependency/injection gates (FIX-12).
+    ///
+    /// Adds the provider-fiber gate on top of [`Context::lookup`]: a service
+    /// whose providing fiber is not `Active` (still loading, failed, unloading,
+    /// disposed) must not satisfy an `inject` dependency, so dependents are not
+    /// activated against a provider that may never commit — matching the TS
+    /// reference, where a dependent stays `Pending` while its provider loads.
+    pub(crate) fn lookup_for_injection(&self, name: &str) -> Option<ServiceEntry> {
+        self.lookup_entry(name)
+            .filter(|entry| entry.is_available_for_injection())
     }
 
     /// Cooperative cancellation checkpoint.
@@ -580,12 +622,26 @@ impl Context {
     ///
     /// Call this after an `AvailabilityCheck`'s backing state changed, or after
     /// an out-of-band service mutation that bypassed the effect lifecycle.
+    ///
+    /// The fixpoint is **bounded**: at most 64 rounds, each round advancing
+    /// through a snapshot of the registry's fibers in registration order. A
+    /// forward dependency chain (`A → B → C`) therefore stabilizes in one round,
+    /// while a reverse chain (`C → B → A`) settles roughly one level per round —
+    /// very deep dependency chains need multiple `refresh` calls to fully
+    /// settle. Re-entrant calls made while a refresh is already running are
+    /// coalesced through a dirty flag and drained by the outermost loop.
     pub fn refresh(&self) {
         self.refresh_dependents();
     }
 
     /// Async counterpart of [`Context::refresh`]: also awaits async plugin
     /// activation/unload, which a synchronous refresh cannot do.
+    ///
+    /// It uses the same **bounded fixed point** (at most 64 rounds over a
+    /// registry snapshot in registration order: a forward dependency chain
+    /// stabilizes in one round, a reverse chain roughly one level per round, so
+    /// extremely deep chains need repeated refreshes). Re-entrant refreshes are
+    /// coalesced through the dirty flag instead of nesting.
     pub async fn refresh_async(&self) {
         self.inner.registry.refresh_all_async().await;
     }
@@ -740,9 +796,17 @@ impl Context {
             }
         }
         let mut effect = effect;
-        effect.activation = fiber
-            .activation_epoch
-            .load(std::sync::atomic::Ordering::SeqCst);
+        // Tag the effect with the **attempt** that registered it (FIX-5): under
+        // concurrent restarts the fiber's `activation_epoch` may already belong
+        // to a newer attempt, and tagging with it would make the stale
+        // attempt's effects undiscardable. Outside an activation frame (effects
+        // registered by the embedder after activation) fall back to the latest
+        // epoch, which preserves the previous behavior.
+        effect.activation = crate::fiber::current_activation_epoch(fiber.id).unwrap_or_else(|| {
+            fiber
+                .activation_epoch
+                .load(std::sync::atomic::Ordering::SeqCst)
+        });
         fiber.effects.push(effect);
         Ok(())
     }
@@ -897,11 +961,29 @@ impl Context {
         }
         // Loading-depth guard: recursive loading (A -> B -> A, or a plugin that
         // keeps loading itself) is contained instead of overflowing the stack.
+        //
+        // Count the **fiber** parent chain (Cordis `fiber.parent`), not the
+        // context chain (FIX-19): `isolate`/`intercept`/`extend_meta` derive
+        // child contexts without loading a plugin, so a deep scope chain must
+        // not consume the loading budget of one shallow plugin load. Only a
+        // fiber created by `ctx.plugin` adds a level.
+        //
+        // The root fiber's parent link is a *weak self-reference* (CORE-031),
+        // so a naive walk never terminates: stop when the parent repeats the
+        // current fiber id. The `MAX_PLUGIN_DEPTH` bound is a second, defensive
+        // guarantee against a corrupted link.
         let mut depth = 0usize;
-        let mut cursor = Some(self.clone());
-        while let Some(ancestor) = cursor {
+        let mut cursor = Some(self.inner.fiber.clone());
+        while let Some(fiber) = cursor {
             depth += 1;
-            cursor = ancestor.inner.parent.clone();
+            if depth > crate::fiber::MAX_PLUGIN_DEPTH {
+                break;
+            }
+            let fiber_id = fiber.id();
+            cursor = fiber
+                .parent()
+                .map(|parent| parent.fiber())
+                .filter(|parent| parent.id() != fiber_id);
         }
         if depth >= crate::fiber::MAX_PLUGIN_DEPTH {
             return Err(CordisError::InvalidPlugin(format!(
@@ -1034,9 +1116,21 @@ impl Context {
         config: Value,
         key: PluginKey,
     ) -> Result<Fiber> {
+        // FIX-11b: the registry registration counter must span the whole
+        // window — *before* `create_fiber_handle`, whose `internal/plugin` hook
+        // runs before the fiber is registered/activated. `Registry::is_idle` /
+        // `Context::when_idle` stay blocked until this guard drops.
+        let _registration = self.inner.registry.begin_registration();
         let fiber = self.create_fiber_handle(PluginKind::Sync(plugin), config, key)?;
+        // FIX-11: additionally mark the fiber's own registration → activation
+        // window as an in-flight lifecycle operation, so `Fiber::is_idle` /
+        // `await_settled` observe it. Dropped when this function returns.
+        // (The guard borrows a clone of the `FiberRef`, so `fiber` stays
+        // movable for the return value.)
+        let data = fiber.data.clone();
+        let _guard = crate::fiber::begin_operation(&data);
         if let Some((ctx, kind, config)) = Self::ready_activation(&fiber) {
-            let _ = activate_fiber(&fiber.data, &ctx, &kind, &config);
+            let _ = activate_fiber(&data, &ctx, &kind, &config);
         }
         Ok(fiber)
     }
@@ -1047,9 +1141,19 @@ impl Context {
     /// [`Fiber::restart_async`]).
     pub async fn plugin_async(&self, plugin: Arc<dyn AsyncPlugin>, config: Value) -> Result<Fiber> {
         let key = plugin.key();
+        // FIX-11b: cover the `internal/plugin` create hook too (see
+        // `plugin_with_key`). `RegistrationGuard` is `Send`, so it may be held
+        // across the activation await.
+        let _registration = self.inner.registry.begin_registration();
         let fiber = self.create_fiber_handle(PluginKind::Async(plugin), config, key)?;
+        // FIX-11: cover the whole registration → activation window (see
+        // `plugin_with_key`).
+        // (The guard borrows a clone of the `FiberRef`, so `fiber` stays
+        // movable for the return value.)
+        let data = fiber.data.clone();
+        let _guard = crate::fiber::begin_operation(&data);
         if let Some((ctx, kind, config)) = Self::ready_activation(&fiber) {
-            let _ = activate_fiber_async(&fiber.data, &ctx, &kind, &config).await;
+            let _ = activate_fiber_async(&data, &ctx, &kind, &config).await;
         }
         Ok(fiber)
     }
@@ -1062,14 +1166,30 @@ impl Context {
     ) -> Result<Fiber> {
         let key = PluginKey::Type(std::any::TypeId::of::<P>());
         let plugin: Arc<dyn AsyncPlugin> = plugin;
+        // FIX-11b: cover the `internal/plugin` create hook too (see
+        // `plugin_with_key`).
+        let _registration = self.inner.registry.begin_registration();
         let fiber = self.create_fiber_handle(PluginKind::Async(plugin), config, key)?;
+        // FIX-11: cover the whole registration → activation window (see
+        // `plugin_with_key`).
+        // (The guard borrows a clone of the `FiberRef`, so `fiber` stays
+        // movable for the return value.)
+        let data = fiber.data.clone();
+        let _guard = crate::fiber::begin_operation(&data);
         if let Some((ctx, kind, config)) = Self::ready_activation(&fiber) {
-            let _ = activate_fiber_async(&fiber.data, &ctx, &kind, &config).await;
+            let _ = activate_fiber_async(&data, &ctx, &kind, &config).await;
         }
         Ok(fiber)
     }
 
     /// Cordis `ctx.inject(deps, callback)` convenience: load a closure plugin.
+    ///
+    /// Each `inject` call gets its own registry identity keyed by the closure
+    /// type (`PluginKey::Type(TypeId::of::<Injected<F>>())`, FIX-20): three
+    /// `inject`s are three runtimes, and `Registry::replace(Named("injected"))`
+    /// no longer matches them (the diagnostic name stays `"injected"`).
+    /// Closures created at the same source location share one key, exactly like
+    /// two instances of the same plugin type.
     pub fn inject<F>(&self, deps: &'static [&'static str], callback: F) -> Result<Fiber>
     where
         F: Fn(Context) -> Result<()> + Send + Sync + 'static,
@@ -1091,7 +1211,8 @@ impl Context {
                 (self.0)(ctx)
             }
         }
-        self.plugin(Arc::new(Injected(callback, deps)), Value::Null)
+        let key = PluginKey::Type(std::any::TypeId::of::<Injected<F>>());
+        self.plugin_with_key(Arc::new(Injected(callback, deps)), Value::Null, key)
     }
 
     /// Register an event listener owned by the current fiber.
@@ -1568,6 +1689,9 @@ fn merge_into(target: &mut Value, source: Value) {
 impl Context {
     /// Untyped service lookup (Cordis `ctx.get(name)`); dispatches the
     /// `internal/get` waterfall.
+    ///
+    /// Non-strict, like [`Context::get`]: accessors and `internal/get` virtual
+    /// services are visible here but never satisfy an `inject` dependency.
     pub fn get_named(&self, name: &str) -> Option<ServiceValue> {
         if let Some(accessor) = self.find_accessor(name) {
             return self.accessor_value(&accessor);
@@ -1579,10 +1703,12 @@ impl Context {
     /// Overwrite a provided service value (Cordis `ctx.set(name, value)`).
     ///
     /// Only the fiber that provided the service may set it; setting an
-    /// unprovided or foreign-owned service is an error. Dispatches the typed
-    /// `internal/set` waterfall around the write; a hook that skips `next`
-    /// vetoes the write and the call returns `Ok(())` without changing state
-    /// (Cordis waterfall semantics).
+    /// unprovided or foreign-owned service is an error. The replacement must
+    /// have the same concrete type as the provided value
+    /// ([`CordisError::ServiceTypeMismatch`] otherwise — DESIGN I5). Dispatches
+    /// the typed `internal/set` waterfall around the write; a hook that skips
+    /// `next` vetoes the write and the call returns `Ok(())` without changing
+    /// state (Cordis waterfall semantics).
     pub fn set(&self, name: &'static str, value: ServiceValue) -> Result<()> {
         if let Some(accessor) = self.find_accessor(name) {
             return match accessor.set {
@@ -1607,8 +1733,13 @@ impl Context {
     /// The previous value is captured and restored by an effect owned by the
     /// providing fiber (reverse order on unload), and the entry version bump
     /// re-evaluates dependents (Cordis `ctx.set` + epoch semantics).
+    ///
+    /// The replacement is type-checked **before** dispatch
+    /// ([`CordisError::ServiceTypeMismatch`] on mismatch), so a hook never
+    /// observes an ill-typed write and the stored value can never change type.
     pub fn set_revertible(&self, name: &'static str, value: ServiceValue) -> Result<Disposer> {
         self.check_set_target(name)?;
+        self.check_set_type(name, &value)?;
         // A set during unload cannot publish its inverse: reject before the
         // write so the store is not mutated without an inverse.
         let state = self.inner.fiber.state();
@@ -1695,6 +1826,44 @@ impl Context {
         }
     }
 
+    /// Reject a `ctx.set`/`ctx.set_any` replacement whose concrete type differs
+    /// from the one registered at provide time (FIX-13 / DESIGN I5).
+    ///
+    /// The stored type is the provided `T` for typed provides and
+    /// `ArcWrap<T>` for the `*_any` family, which is exactly what
+    /// [`crate::service::service_type_id`] reports for either lane, so the two
+    /// APIs can share one check without extra metadata.
+    fn check_set_type(&self, name: &str, value: &ServiceValue) -> Result<()> {
+        let scope = self.service_scope(name).unwrap_or(0);
+        let store = self
+            .inner
+            .service_store
+            .lock()
+            .map_err(|_| CordisError::Disposed)?;
+        match store.get(&(scope, name.to_string())) {
+            None => Err(CordisError::UnknownService(name.to_string())),
+            Some(entry) => {
+                let incoming = crate::service::service_type_id(value);
+                if incoming == entry.type_id {
+                    Ok(())
+                } else {
+                    Err(Self::service_type_mismatch(name, entry.type_id, incoming))
+                }
+            }
+        }
+    }
+
+    /// The error returned when a `ctx.set` replacement has the wrong type.
+    fn service_type_mismatch(
+        name: &str,
+        expected: std::any::TypeId,
+        incoming: std::any::TypeId,
+    ) -> CordisError {
+        CordisError::ServiceTypeMismatch(format!(
+            "`{name}`: provided {expected:?}, replacement {incoming:?}"
+        ))
+    }
+
     fn write_service(&self, name: &str, value: &ServiceValue) -> Result<()> {
         let scope = self.service_scope(name).unwrap_or(0);
         let mut store = self
@@ -1705,6 +1874,13 @@ impl Context {
         match store.get_mut(&(scope, name.to_string())) {
             None => Err(CordisError::UnknownService(name.to_string())),
             Some(entry) => {
+                // Defense in depth: `set_revertible` already type-checked before
+                // dispatching `internal/set`, but the terminal must not be able
+                // to mutate the entry into a different concrete type.
+                let incoming = crate::service::service_type_id(value);
+                if incoming != entry.type_id {
+                    return Err(Self::service_type_mismatch(name, entry.type_id, incoming));
+                }
                 entry.value = value.clone();
                 entry.version = crate::service::next_version();
                 Ok(())

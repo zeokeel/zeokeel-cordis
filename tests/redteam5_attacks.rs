@@ -602,26 +602,27 @@ fn c10_cancelled_async_parent_rolls_back_children() {
                 .find(|fiber| fiber.name() == "r5-async-cancel-loader")
                 .expect("parent fiber");
             assert_eq!(parent.state(), FiberState::Failed);
+            // The retried dispose drains the deferred ownership effects and
+            // sweeps any remaining children (A-9/A-10); afterwards no child may
+            // be left alive under the cancelled parent.
+            parent
+                .dispose_async()
+                .await
+                .expect("dispose cancelled parent");
             let orphans: Vec<(String, FiberState)> = root
                 .registry()
                 .fibers()
                 .iter()
-                .filter(|fiber| fiber.id() != parent.id())
+                .filter(|fiber| fiber.state() != FiberState::Disposed)
                 .map(|fiber| (fiber.name(), fiber.state()))
                 .collect();
             assert!(
-                orphans
-                    .iter()
-                    .all(|(_, state)| *state == FiberState::Disposed),
+                orphans.is_empty(),
                 "CANCEL-ORPHAN: cancelled async parent left children {orphans:?} \
                  (cleanups ran {}, registry {})",
                 cleanups.load(Ordering::SeqCst),
                 root.registry().size()
             );
-            parent
-                .dispose_async()
-                .await
-                .expect("dispose cancelled parent");
             assert_eq!(root.registry().size(), 0);
         });
     });
@@ -1004,7 +1005,10 @@ fn c16_cancelled_parent_dispose_async_retry_disposes_all_children() {
         let mut future = Box::pin(parent.dispose_async());
         assert!(poll_once(future.as_mut()).is_pending());
         drop(future); // cancel mid-cascade
-        assert_eq!(parent.state(), FiberState::Unloading);
+                      // A-9: the cancelled cascade completes the parent's teardown (Disposed);
+                      // the children whose ownership effects were deferred are reclaimed by the
+                      // retry below (and by the sweep on that retry).
+        assert_eq!(parent.state(), FiberState::Disposed);
         for gate in gates {
             let _ = gate.send(());
         }

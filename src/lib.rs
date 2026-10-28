@@ -11,10 +11,12 @@
 //! - every plugin owns one ordered effect list; disposers run in reverse order
 //!   exactly once, and sync ([`Disposer`]) / async ([`AsyncDisposer`]) effects
 //!   share that list so unloading keeps one deterministic order;
-//! - events support emit / parallel / serial / bail and are owned by the
-//!   registering fiber; the sync lane (`emit`/`bail`/`parallel`/`serial`) and the
-//!   async lane (`parallel_async`/`serial_async`/`on_async`) are dispatched by
-//!   the matching API, never silently downgraded;
+//! - events ([`Events`], reachable through [`Context::events`]) support
+//!   `emit`/`bail`/`parallel`/`serial` and are owned by the registering fiber;
+//!   `Context` itself exposes the dispatch helpers `emit`/`bail`/`waterfall`.
+//!   The sync lane (`emit`/`bail`/`parallel`/`serial`) and the async lane
+//!   (`parallel_async`/`serial_async`/`on_async`) are dispatched by the matching
+//!   API, never silently downgraded;
 //! - `waterfall` composes middleware around an explicit `next` continuation
 //!   ([`WaterfallNext`], [`AsyncWaterfallNext`]): a listener that never calls
 //!   `next` vetoes the rest of the chain, including the terminal behavior;
@@ -49,7 +51,7 @@
 // shipping a kernel whose core promise is false.
 #[cfg(panic = "abort")]
 compile_error!(
-    "cordis requires `panic = \"unwind\"`: panic isolation is impossible with      `panic = \"abort\"` (see docs/KERNEL-ISOLATION.md). Build with the default      unwind strategy, or run untrusted plugins behind process/WASM isolation."
+    "zeokeel-cordis requires `panic = \"unwind\"`: panic isolation is impossible with `panic = \"abort\"` (see docs/KERNEL-ISOLATION.md). Build with the default unwind strategy, or run untrusted plugins behind process/WASM isolation."
 );
 
 pub mod async_effects;

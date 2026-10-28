@@ -12,6 +12,7 @@
 
 use std::any::TypeId;
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "supervision")]
@@ -22,8 +23,8 @@ use serde_json::Value;
 use crate::context::Context;
 use crate::error::Result;
 use crate::fiber::{
-    activate_fiber, activate_fiber_async, dependencies_ready, dependencies_satisfied, unload_fiber,
-    unload_fiber_async, Fiber, FiberState,
+    activate_fiber, activate_fiber_async, dependencies_ready, dependencies_satisfied,
+    unload_contained, unload_contained_async, Fiber, FiberState,
 };
 #[cfg(feature = "supervision")]
 use crate::l2::{FiberQuota, StalledFiber};
@@ -259,6 +260,11 @@ pub struct Registry {
     /// recursing (prevents exponential re-entrant scans).
     refresh_depth: AtomicUsize,
     refresh_dirty: AtomicBool,
+    /// Plugin registrations in flight before their fiber-level lifecycle
+    /// operation exists (`ctx.plugin` → `internal/plugin` hook →
+    /// `activate`). While this is non-zero the registry is not quiescent
+    /// (FIX-11b), so `when_idle` cannot return before activation starts.
+    pending_registrations: AtomicUsize,
 }
 
 /// Future returned by [`Registry::when_idle`]; unregisters its waker on drop.
@@ -312,8 +318,115 @@ struct RebindUndo {
     old_key: PluginKey,
     old_runtime: Arc<PluginRuntime>,
     target_key: PluginKey,
-    target_created: bool,
     fibers: Vec<(Fiber, PluginKind, Option<PluginKey>)>,
+}
+
+/// RAII guard for the refresh fixed point (FIX-1).
+///
+/// The re-entrancy latch (`refresh_depth`) used to be reset by a plain store at
+/// the end of `refresh_all`/`refresh_all_async`; a cleanup panic unwinding out
+/// of the loop skipped it, latched the registry forever and left dependency
+/// refresh dead (`is_idle` still reporting idle). Resetting in `Drop` also
+/// covers the async path when the future is cancelled mid-refresh.
+struct RefreshGuard<'a> {
+    registry: &'a Registry,
+}
+
+impl Drop for RefreshGuard<'_> {
+    fn drop(&mut self) {
+        self.registry.refresh_depth.store(0, Ordering::SeqCst);
+    }
+}
+
+/// RAII guard for the "fiber registered → activation started" window (FIX-11b).
+///
+/// `create_fiber_handle` publishes the fiber and fires the `internal/plugin`
+/// create hook *before* any fiber-level operation guard exists, so a host
+/// waiting in `when_idle()` could otherwise observe the moment as quiescent.
+/// The context plugin entry points hold this guard for the whole
+/// registration+activation window; `is_idle` reports busy while it is alive.
+pub(crate) struct RegistrationGuard<'a> {
+    registry: &'a Registry,
+}
+
+impl Drop for RegistrationGuard<'_> {
+    fn drop(&mut self) {
+        // Decrement first, then wake waiters so a re-poll observes the new
+        // state (the last registration may be the only thing keeping it busy).
+        self.registry
+            .pending_registrations
+            .fetch_sub(1, Ordering::SeqCst);
+        self.registry.notify_idle();
+    }
+}
+
+/// Outcome of a failed [`Registry::replace`] whose rollback also failed.
+///
+/// Contract (kept compatible with 0.4.1 tests): the caller sees the **original**
+/// error unless a partial migration really happened (`reloaded > 0`) and the
+/// rollback failed for a reason other than a busy fiber. `LifecycleBusy` during
+/// the rollback only means another thread is finishing its own operation on one
+/// of the fibers; the runtime table/bindings were restored structurally, so the
+/// caller still gets the original error (the incomplete per-fiber restore is
+/// logged). Only a genuine partial migration plus a non-busy rollback failure is
+/// reported as [`crate::CordisError::Rollback`] with both errors.
+fn replace_rollback_result(
+    original: crate::CordisError,
+    rollback: Option<crate::CordisError>,
+    reloaded: usize,
+) -> crate::CordisError {
+    let Some(rollback) = rollback else {
+        return original;
+    };
+    if reloaded == 0 || matches!(rollback, crate::CordisError::LifecycleBusy) {
+        tracing::error!(
+            target: "zeokeel_cordis::registry",
+            "replace rollback incomplete (reloaded={reloaded}): {rollback}; returning the original error: {original}"
+        );
+        return original;
+    }
+    crate::CordisError::Rollback(format!(
+        "original error: {original}; rollback error: {rollback}"
+    ))
+}
+
+/// Turn a contained reload panic into the error reported by
+/// [`Registry::replace`] / [`Registry::replace_async`] (D-2).
+fn reload_panic(operation: &str, payload: &(dyn std::any::Any + Send)) -> crate::CordisError {
+    crate::CordisError::PluginFailed(format!(
+        "{operation}: reload panicked: {}",
+        crate::fiber::panic_message(payload)
+    ))
+}
+
+/// Indices the rollback must reload: every fiber that already ran the new
+/// implementation plus the failed fiber itself (whose reload may have unloaded
+/// it). The failed fiber is checked lazily by the caller, because an earlier
+/// rollback reload can re-activate it through the dependent refresh (D-2).
+fn rollback_targets(fibers: &[Fiber], reloaded: usize) -> Vec<usize> {
+    let mut targets: Vec<usize> = (0..reloaded).collect();
+    if reloaded < fibers.len() {
+        targets.push(reloaded);
+    }
+    targets
+}
+
+/// Reload one fiber for the rollback, containing a cleanup panic (D-2).
+fn restart_contained(fiber: &Fiber) -> Result<()> {
+    match catch_unwind(AssertUnwindSafe(|| fiber.restart())) {
+        Ok(result) => result,
+        Err(payload) => Err(reload_panic("replace rollback", payload.as_ref())),
+    }
+}
+
+/// Awaiting variant of [`restart_contained`].
+async fn restart_contained_async(fiber: &Fiber) -> Result<()> {
+    let outcome =
+        futures_util::FutureExt::catch_unwind(AssertUnwindSafe(fiber.restart_async())).await;
+    match outcome {
+        Ok(result) => result,
+        Err(payload) => Err(reload_panic("replace rollback", payload.as_ref())),
+    }
 }
 
 impl Registry {
@@ -392,9 +505,18 @@ impl Registry {
         stalled
     }
 
-    /// Whether the whole registry is quiescent: no lifecycle operation is in
+    /// Whether the whole registry is quiescent: no plugin registration is in
     /// flight and no fiber (including the root fiber) is loading/unloading.
+    ///
+    /// A registration counts from the moment the context entry point starts
+    /// creating the fiber until its activation has begun (FIX-11b: this covers
+    /// the `internal/plugin` create hook, which runs before the fiber-level
+    /// operation guard exists), so `when_idle()` never reports a settled kernel
+    /// for a plugin that has not started activating yet.
     pub fn is_idle(&self) -> bool {
+        if self.pending_registrations.load(Ordering::SeqCst) != 0 {
+            return false;
+        }
         let fibers = self
             .fibers
             .lock()
@@ -541,16 +663,41 @@ impl Registry {
     /// effect history, but is re-bound to `new` and reloaded.
     ///
     /// Returns the reloaded fibers. The old key is removed; the new
-    /// implementation's key becomes the runtime identity. A reload rejected by
-    /// a busy fiber (`LifecycleBusy`) rolls the rebind back atomically.
+    /// implementation's key becomes the runtime identity.
+    ///
+    /// FIX-7: when a reload is rejected (e.g. `LifecycleBusy`), the rollback is
+    /// complete — the binding is restored *and* every fiber that already ran the
+    /// new implementation is reloaded with the old one, so no fiber is left with
+    /// the new implementation's live effects. If the rollback itself fails, the
+    /// error is reported as [`crate::CordisError::Rollback`] carrying both the
+    /// original and the rollback error (the binding is still restored).
     pub fn replace(&self, old: PluginKey, new: Arc<dyn Plugin>) -> Result<Vec<Fiber>> {
         let (fibers, undo) = self.rebind_runtime(old, PluginKind::Sync(new))?;
-        for fiber in &fibers {
-            if let Err(error) = fiber.restart() {
-                self.undo_rebind(undo);
-                return Err(error);
+        for index in 0..fibers.len() {
+            // A-6: a fiber disposed by a concurrent operation is already final;
+            // reloading it would only produce a bogus `Disposed` error and (via
+            // the rollback) a misleading `Rollback` report.
+            if fibers[index].state() == FiberState::Disposed {
+                self.heal_disposed_registration(&fibers[index]);
+                continue;
+            }
+            // D-2: the reload drains the previous implementation's cleanups,
+            // i.e. embedder code. A panic must be handled exactly like an
+            // `Err`; otherwise it escapes this `Result` API *after* the runtime
+            // was re-keyed and leaves a half-migrated registry.
+            match catch_unwind(AssertUnwindSafe(|| fibers[index].restart())) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(self.rollback_replace(undo, &fibers, index, error));
+                }
+                Err(payload) => {
+                    let error = reload_panic("replace", payload.as_ref());
+                    return Err(self.rollback_replace(undo, &fibers, index, error));
+                }
             }
         }
+        self.heal_disposed_registrations(&fibers);
+        self.prune_empty_runtimes();
         Ok(fibers)
     }
 
@@ -561,13 +708,96 @@ impl Registry {
         new: Arc<dyn AsyncPlugin>,
     ) -> Result<Vec<Fiber>> {
         let (fibers, undo) = self.rebind_runtime(old, PluginKind::Async(new))?;
-        for fiber in &fibers {
-            if let Err(error) = fiber.restart_async().await {
-                self.undo_rebind(undo);
-                return Err(error);
+        for index in 0..fibers.len() {
+            if fibers[index].state() == FiberState::Disposed {
+                self.heal_disposed_registration(&fibers[index]);
+                continue;
+            }
+            let outcome = futures_util::FutureExt::catch_unwind(AssertUnwindSafe(
+                fibers[index].restart_async(),
+            ))
+            .await;
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(self
+                        .rollback_replace_async(undo, &fibers, index, error)
+                        .await);
+                }
+                Err(payload) => {
+                    let error = reload_panic("replace_async", payload.as_ref());
+                    return Err(self
+                        .rollback_replace_async(undo, &fibers, index, error)
+                        .await);
+                }
             }
         }
+        self.heal_disposed_registrations(&fibers);
+        self.prune_empty_runtimes();
         Ok(fibers)
+    }
+
+    /// Undo a rejected [`Registry::replace`] with the old implementation.
+    ///
+    /// The binding is restored first (so the reloads below run against the old
+    /// runtime), then the fibers that already applied the new implementation are
+    /// restarted, which drains its effects and re-runs the old `apply`.
+    fn rollback_replace(
+        &self,
+        undo: RebindUndo,
+        fibers: &[Fiber],
+        reloaded: usize,
+        original: crate::CordisError,
+    ) -> crate::CordisError {
+        self.undo_rebind(undo);
+        let mut rollback_error = None;
+        for index in rollback_targets(fibers, reloaded) {
+            let fiber = &fibers[index];
+            if fiber.state() == FiberState::Disposed {
+                continue;
+            }
+            if index == reloaded && fiber.state() == FiberState::Active {
+                // A previous rollback reload ran `apply` again, which refreshes
+                // dependents and may already have re-activated the failed fiber
+                // (it is `Active` again with the old implementation). Reloading
+                // it a second time would drain those freshly registered effects
+                // — and could re-raise their cleanup panic (D-2).
+                continue;
+            }
+            if let Err(error) = restart_contained(fiber) {
+                rollback_error.get_or_insert(error);
+            }
+        }
+        self.heal_disposed_registrations(fibers);
+        self.prune_empty_runtimes();
+        replace_rollback_result(original, rollback_error, reloaded)
+    }
+
+    /// Awaiting variant of [`Registry::rollback_replace`].
+    async fn rollback_replace_async(
+        &self,
+        undo: RebindUndo,
+        fibers: &[Fiber],
+        reloaded: usize,
+        original: crate::CordisError,
+    ) -> crate::CordisError {
+        self.undo_rebind(undo);
+        let mut rollback_error = None;
+        for index in rollback_targets(fibers, reloaded) {
+            let fiber = &fibers[index];
+            if fiber.state() == FiberState::Disposed {
+                continue;
+            }
+            if index == reloaded && fiber.state() == FiberState::Active {
+                continue;
+            }
+            if let Err(error) = restart_contained_async(fiber).await {
+                rollback_error.get_or_insert(error);
+            }
+        }
+        self.heal_disposed_registrations(fibers);
+        self.prune_empty_runtimes();
+        replace_rollback_result(original, rollback_error, reloaded)
     }
 
     /// Re-key a single fiber's runtime (used by `Fiber::replace_plugin`).
@@ -609,47 +839,66 @@ impl Registry {
         if let Ok(mut list) = target.fibers.lock() {
             list.push(fiber.clone());
         }
-        let mut data = fiber
-            .data
-            .lock()
-            .map_err(|_| crate::CordisError::Disposed)?;
-        data.runtime_key = Some(new_key);
+        match fiber.data.lock() {
+            Ok(mut data) => data.runtime_key = Some(new_key),
+            Err(_) => {
+                // The push already happened; a poisoned fiber lock would leave
+                // the membership dangling, so detach it before returning.
+                self.unregister_runtime_fiber(id);
+                return Err(crate::CordisError::Disposed);
+            }
+        }
+        // D-1 self-heal: the fiber may have been disposed between the runtime
+        // table update and this push (a concurrent `dispose_all` only saw the
+        // old membership). Undo the new membership now so the registry cannot
+        // keep a `Disposed` strong handle.
+        self.heal_disposed_registration(fiber);
         Ok(())
     }
 
     fn undo_rebind(&self, undo: RebindUndo) {
         if let Ok(mut runtimes) = self.runtimes.lock() {
-            if undo.target_created {
-                if let Some(target) = runtimes.get(&undo.target_key) {
-                    if let Ok(mut fibers) = target.fibers.lock() {
-                        let ids: Vec<u64> =
-                            undo.fibers.iter().map(|(fiber, _, _)| fiber.id()).collect();
-                        fibers.retain(|candidate| !ids.contains(&candidate.id()));
-                    }
-                    let empty = target
-                        .fibers
-                        .lock()
-                        .map(|fibers| fibers.is_empty())
-                        .unwrap_or(false);
-                    if empty {
-                        runtimes.remove(&undo.target_key);
-                    }
-                }
-            } else if let Some(target) = runtimes.get(&undo.target_key) {
+            let ids: Vec<u64> = undo.fibers.iter().map(|(fiber, _, _)| fiber.id()).collect();
+            // D-1 residual (s28): remove the migrated fibers from the target —
+            // whether it was created by this replace or shared with another
+            // one — and prune it when it becomes empty in *both* cases. Leaving
+            // an empty runtime behind is invisible to `dispose_all` (no fibers
+            // to dispose) and keeps `keys()/size()` non-empty forever.
+            let mut prune_target = false;
+            if let Some(target) = runtimes.get(&undo.target_key) {
                 if let Ok(mut fibers) = target.fibers.lock() {
-                    let ids: Vec<u64> =
-                        undo.fibers.iter().map(|(fiber, _, _)| fiber.id()).collect();
                     fibers.retain(|candidate| !ids.contains(&candidate.id()));
+                    prune_target = fibers.is_empty();
                 }
             }
-            runtimes.insert(undo.old_key, undo.old_runtime);
-        }
-        for (fiber, kind, runtime_key) in undo.fibers {
-            let _ = fiber.swap_plugin(kind);
-            if let Ok(mut data) = fiber.data.lock() {
-                data.runtime_key = runtime_key;
+            if prune_target {
+                runtimes.remove(&undo.target_key);
+            }
+            // Restore the old runtime unless every fiber of it is gone by now
+            // (a concurrent disposal may have emptied it; the post-loop heal
+            // would then prune it, but not inserting it at all is cheaper).
+            let old_has_fibers = undo
+                .old_runtime
+                .fibers
+                .lock()
+                .map(|fibers| !fibers.is_empty())
+                .unwrap_or(true);
+            if old_has_fibers {
+                runtimes.insert(undo.old_key, undo.old_runtime);
             }
         }
+        for (fiber, kind, runtime_key) in &undo.fibers {
+            let _ = fiber.swap_plugin(kind.clone());
+            if let Ok(mut data) = fiber.data.lock() {
+                data.runtime_key = *runtime_key;
+            }
+        }
+        // D-1: a fiber that finished disposing while the rollback ran must not
+        // stay attached to the restored runtime.
+        for (fiber, _, _) in &undo.fibers {
+            self.heal_disposed_registration(fiber);
+        }
+        self.prune_empty_runtimes();
     }
 
     fn rebind_runtime(&self, old: PluginKey, kind: PluginKind) -> Result<(Vec<Fiber>, RebindUndo)> {
@@ -667,7 +916,6 @@ impl Registry {
         let fibers = runtime.fibers();
         // Merge into an existing runtime for the new key if present (the new
         // implementation was already loaded elsewhere).
-        let target_was_created = !runtimes.contains_key(&new_key);
         let target: Arc<PluginRuntime> = match runtimes.get(&new_key) {
             Some(existing) => Arc::clone(existing),
             None => {
@@ -677,39 +925,51 @@ impl Registry {
             }
         };
         drop(runtimes);
+        // Snapshot every old binding *before* mutating any fiber, so a failure
+        // from here on can undo the whole rebind (FIX-7: the previous `?` path
+        // left the runtime table and some fibers half-rewritten).
+        let mut saved = Vec::with_capacity(fibers.len());
+        for fiber in &fibers {
+            let data = match fiber.data.lock() {
+                Ok(data) => data,
+                Err(_) => {
+                    self.undo_rebind(RebindUndo {
+                        old_key: old,
+                        old_runtime: runtime,
+                        target_key: new_key,
+                        fibers: saved,
+                    });
+                    return Err(crate::CordisError::Disposed);
+                }
+            };
+            saved.push((fiber.clone(), data.plugin.clone(), data.runtime_key));
+        }
+        let undo = RebindUndo {
+            old_key: old,
+            old_runtime: runtime,
+            target_key: new_key,
+            fibers: saved,
+        };
         if let Ok(mut list) = target.fibers.lock() {
             for fiber in &fibers {
                 list.push(fiber.clone());
             }
         }
-        let mut saved = Vec::with_capacity(fibers.len());
         for fiber in &fibers {
-            let saved_kind = fiber
-                .data
-                .lock()
-                .map_err(|_| crate::CordisError::Disposed)?
-                .plugin
-                .clone();
-            let saved_key = fiber.data.lock().ok().and_then(|data| data.runtime_key);
-            fiber.swap_plugin(kind.clone())?;
-            let mut data = fiber
-                .data
-                .lock()
-                .map_err(|_| crate::CordisError::Disposed)?;
+            if let Err(error) = fiber.swap_plugin(kind.clone()) {
+                self.undo_rebind(undo);
+                return Err(error);
+            }
+            let Ok(mut data) = fiber.data.lock() else {
+                self.undo_rebind(undo);
+                return Err(crate::CordisError::Disposed);
+            };
             data.runtime_key = Some(new_key);
-            saved.push((fiber.clone(), saved_kind, saved_key));
         }
-        let target_created = target_was_created;
-        Ok((
-            fibers,
-            RebindUndo {
-                old_key: old,
-                old_runtime: runtime,
-                target_key: new_key,
-                target_created,
-                fibers: saved,
-            },
-        ))
+        // D-1 self-heal: fibers disposed while this rebind was migrating the
+        // runtime table must not stay attached to the new runtime.
+        self.heal_disposed_registrations(&fibers);
+        Ok((fibers, undo))
     }
 
     /// Dispose every registered fiber and the root fiber (shutdown path).
@@ -749,15 +1009,25 @@ impl Registry {
         if let Some(data) = root {
             attempt(Fiber { data });
         }
+        // D-1 residual: a runtime entry left empty by a rolled-back rebind has
+        // no fiber to dispose; prune it so shutdown really empties the registry.
+        self.prune_empty_runtimes();
         // Surface the outcome only after every fiber was attempted: one broken
-        // cleanup must not abort shutdown.
-        if let Some(error) = first_error {
-            return Err(error);
+        // cleanup must not abort shutdown. A panic wins over an error (only the
+        // panic payload is observable to an unwinding caller), but the error is
+        // logged instead of being silently dropped (FIX-9).
+        match (first_error, first_panic) {
+            (Some(error), Some(payload)) => {
+                tracing::error!(
+                    target: "zeokeel_cordis::registry",
+                    "dispose_all: a fiber failed while another panicked: {error}"
+                );
+                std::panic::resume_unwind(payload);
+            }
+            (Some(error), None) => Err(error),
+            (None, Some(payload)) => std::panic::resume_unwind(payload),
+            (None, None) => Ok(()),
         }
-        if let Some(payload) = first_panic {
-            std::panic::resume_unwind(payload);
-        }
-        Ok(())
     }
 
     /// Registered runtime keys (Cordis `registry.keys`).
@@ -824,40 +1094,64 @@ impl Registry {
         name: &'static str,
         fiber: &Fiber,
     ) -> Result<Arc<PluginRuntime>> {
-        let mut runtimes = self
-            .runtimes
-            .lock()
-            .map_err(|_| crate::CordisError::Disposed)?;
-        let runtime = runtimes
-            .entry(key)
-            .or_insert_with(|| PluginRuntime::new(name.to_string(), key));
-        if let Ok(mut fibers) = runtime.fibers.lock() {
-            fibers.push(fiber.clone());
-        }
-        Ok(Arc::clone(runtime))
+        let runtime = {
+            let mut runtimes = self
+                .runtimes
+                .lock()
+                .map_err(|_| crate::CordisError::Disposed)?;
+            let runtime = runtimes
+                .entry(key)
+                .or_insert_with(|| PluginRuntime::new(name.to_string(), key));
+            if let Ok(mut fibers) = runtime.fibers.lock() {
+                fibers.push(fiber.clone());
+            }
+            Arc::clone(runtime)
+        };
+        // D-1 self-heal: `dispose_all` may have finalized this fiber between
+        // `register_fiber` and this push (it only needs the registry list).
+        self.heal_disposed_registration(fiber);
+        Ok(runtime)
     }
 
-    /// Detach a disposed fiber from its runtime; the runtime is removed when its
-    /// last fiber is gone (Cordis deletes the runtime in the fiber disposer).
-    pub(crate) fn unregister_runtime_fiber(&self, key: PluginKey, fiber_id: u64) {
-        let mut runtimes = match self.runtimes.lock() {
-            Ok(runtimes) => runtimes,
-            Err(_) => return,
-        };
-        let empty = match runtimes.get(&key) {
-            Some(runtime) => match runtime.fibers.lock() {
-                Ok(mut fibers) => {
-                    fibers.retain(|fiber| fiber.id() != fiber_id);
-                    fibers.is_empty()
+    /// Detach a finished fiber from **every** runtime and from the registry
+    /// list; runtimes that become empty are removed (Cordis deletes the runtime
+    /// in the fiber disposer).
+    ///
+    /// D-1: matching by fiber id instead of by the fiber's current
+    /// `runtime_key` is what makes disposal/rebind races leak-free. A concurrent
+    /// rebind may have moved the fiber to another runtime (or may push it there
+    /// *after* this scan started), so a per-key removal could miss it and leave
+    /// a `Disposed` strong handle inside a runtime forever. Scanning every
+    /// runtime makes the detach idempotent and key-independent; the rebind paths
+    /// additionally self-heal a late push (`heal_disposed_registration`).
+    ///
+    /// Lock order: `runtimes` → each `runtime.fibers` (never the reverse), and
+    /// `registry.fibers` is taken only after `runtimes` was released. Reading
+    /// `fiber.id()` inside a `runtime.fibers` guard follows the existing
+    /// `runtime.fibers` → `fiber.data` order.
+    pub(crate) fn unregister_runtime_fiber(&self, fiber_id: u64) {
+        let mut empty_keys = Vec::new();
+        if let Ok(mut runtimes) = self.runtimes.lock() {
+            for (key, runtime) in runtimes.iter() {
+                let (detached, empty) = match runtime.fibers.lock() {
+                    Ok(mut fibers) => {
+                        let before = fibers.len();
+                        fibers.retain(|fiber| fiber.id() != fiber_id);
+                        (fibers.len() != before, fibers.is_empty())
+                    }
+                    Err(_) => (false, false),
+                };
+                // Only drop a runtime that this cleanup actually emptied: an
+                // empty runtime created by a concurrent registration may still
+                // receive its fiber.
+                if detached && empty {
+                    empty_keys.push(*key);
                 }
-                Err(_) => false,
-            },
-            None => false,
-        };
-        if empty {
-            runtimes.remove(&key);
+            }
+            for key in empty_keys {
+                runtimes.remove(&key);
+            }
         }
-        drop(runtimes);
         // Drop the fiber from the registry list immediately. Keeping disposed
         // fibers here until the next registration pins their context graph
         // (measured ~16 KB leaked per boot in v0.2).
@@ -866,15 +1160,81 @@ impl Registry {
         }
     }
 
-    pub(crate) fn refresh_all(&self) {
+    /// D-1 self-heal for a fiber that was disposed while a topology change was
+    /// in flight: if the fiber is already final, undo the membership that was
+    /// published after its cleanup scan.
+    fn heal_disposed_registration(&self, fiber: &Fiber) {
+        if fiber.state() != FiberState::Disposed {
+            return;
+        }
+        self.unregister_runtime_fiber(fiber.id());
+        if let Ok(mut data) = fiber.data.lock() {
+            data.runtime_key = None;
+        }
+    }
+
+    /// [`Registry::heal_disposed_registration`] for a batch of fibers.
+    fn heal_disposed_registrations(&self, fibers: &[Fiber]) {
+        for fiber in fibers {
+            self.heal_disposed_registration(fiber);
+        }
+    }
+
+    /// Remove runtime entries whose fiber list is empty (D-1 residual).
+    ///
+    /// A rolled-back rebind can leave an empty runtime behind (s28); since
+    /// `dispose_all` only walks fibers, such an entry would survive shutdown and
+    /// keep `keys()/size()` non-empty forever. An empty runtime has no members,
+    /// so dropping it cannot orphan a fiber; a concurrent registration that is
+    /// about to push into it is not possible while it is empty-and-visible
+    /// (registration holds the `runtimes` lock for its push).
+    fn prune_empty_runtimes(&self) {
+        let Ok(mut runtimes) = self.runtimes.lock() else {
+            return;
+        };
+        let mut empty_keys = Vec::new();
+        for (key, runtime) in runtimes.iter() {
+            let is_empty = runtime
+                .fibers
+                .lock()
+                .map(|fibers| fibers.is_empty())
+                .unwrap_or(false);
+            if is_empty {
+                empty_keys.push(*key);
+            }
+        }
+        for key in empty_keys {
+            runtimes.remove(&key);
+        }
+    }
+
+    /// Mark a plugin registration as in flight until the returned guard drops
+    /// (FIX-11b: `is_idle`/`when_idle` must see the registration window).
+    pub(crate) fn begin_registration(&self) -> RegistrationGuard<'_> {
+        self.pending_registrations.fetch_add(1, Ordering::SeqCst);
+        RegistrationGuard { registry: self }
+    }
+
+    /// Enter the refresh fixed point, or mark the registry dirty when another
+    /// refresh is already running (the outer loop re-evaluates).
+    ///
+    /// The returned guard resets the latch on every exit path (FIX-1).
+    fn begin_refresh(&self) -> Option<RefreshGuard<'_>> {
         if self
             .refresh_depth
             .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
             self.refresh_dirty.store(true, Ordering::SeqCst);
-            return;
+            return None;
         }
+        Some(RefreshGuard { registry: self })
+    }
+
+    pub(crate) fn refresh_all(&self) {
+        let Some(_refresh) = self.begin_refresh() else {
+            return;
+        };
         for _ in 0..64 {
             let mut progressed = false;
             let fibers = self
@@ -912,7 +1272,7 @@ impl Registry {
                     (PluginKind::Sync(_), FiberState::Active)
                         if !dependencies_satisfied(&ctx, deps, &recorded) =>
                     {
-                        let _ = unload_fiber(&fiber.data, FiberState::Pending);
+                        let _ = unload_contained(&fiber.data, FiberState::Pending);
                         progressed = true;
                     }
                     // Async fibers are re-evaluated by `refresh_all_async`; a sync
@@ -924,7 +1284,7 @@ impl Registry {
                 break;
             }
         }
-        self.refresh_depth.store(0, Ordering::SeqCst);
+        // `RefreshGuard` resets `refresh_depth` on drop, including a panic path.
     }
 
     /// Async counterpart of [`Registry::refresh_all`]: also awaits async
@@ -934,7 +1294,7 @@ impl Registry {
     ///
     /// Used by provider withdrawal to retire dependents (leaf first) before the
     /// provider's own effects are drained.
-    pub(crate) fn retire_unready(&self) -> bool {
+    pub(crate) fn retire_unready_contained(&self) -> bool {
         let fibers = self
             .fibers
             .lock()
@@ -960,7 +1320,7 @@ impl Registry {
             if matches!(plugin, PluginKind::Sync(_))
                 && !dependencies_satisfied(&ctx, deps, &recorded)
             {
-                let _ = unload_fiber(&fiber.data, FiberState::Pending);
+                let _ = unload_contained(&fiber.data, FiberState::Pending);
                 progressed = true;
             }
         }
@@ -968,14 +1328,9 @@ impl Registry {
     }
 
     pub(crate) async fn refresh_all_async(&self) {
-        if self
-            .refresh_depth
-            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            self.refresh_dirty.store(true, Ordering::SeqCst);
+        let Some(_refresh) = self.begin_refresh() else {
             return;
-        }
+        };
         for _ in 0..64 {
             let mut progressed = false;
             let fibers = self
@@ -1013,7 +1368,7 @@ impl Registry {
                         progressed = true;
                     }
                     (_, FiberState::Active) if !dependencies_satisfied(&ctx, deps, &recorded) => {
-                        let _ = unload_fiber_async(&fiber.data, FiberState::Pending).await;
+                        let _ = unload_contained_async(&fiber.data, FiberState::Pending).await;
                         progressed = true;
                     }
                     _ => {}
@@ -1023,6 +1378,32 @@ impl Registry {
                 break;
             }
         }
-        self.refresh_depth.store(0, Ordering::SeqCst);
+        // `RefreshGuard` resets `refresh_depth` on drop (also if cancelled).
+    }
+}
+
+#[cfg(test)]
+mod registration_window_tests {
+    use super::*;
+
+    /// FIX-11b: a plugin registration keeps the registry busy until its guard
+    /// drops, and `when_idle` waiters are woken up afterwards.
+    #[test]
+    fn registration_guard_keeps_the_registry_busy() {
+        fn assert_send<T: Send>(_: &T) {}
+        let registry = Registry::new();
+        assert!(registry.is_idle(), "an empty registry is idle");
+        let guard = registry.begin_registration();
+        // Held across `.await` by the async plugin entry points.
+        assert_send(&guard);
+        assert!(
+            !registry.is_idle(),
+            "FIX-11b: a pending registration must not report idle"
+        );
+        drop(guard);
+        assert!(
+            registry.is_idle(),
+            "the registry is idle again once the registration finished"
+        );
     }
 }
