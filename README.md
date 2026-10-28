@@ -6,10 +6,10 @@
 > 这是**内核**，不是框架：只提供组合原语与生命周期语义。模块加载、热更新、权限、沙箱、
 > 进程/WASM 隔离都属于使用它的宿主（embedder）。
 
-[![CI](https://github.com/zeokeel/Cordis/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zeokeel/Cordis/actions/workflows/ci.yml)
+[![CI](https://github.com/zeokeel/zeokeel-cordis/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zeokeel/zeokeel-cordis/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](#快速开始)
-[![cargo audit](https://img.shields.io/badge/security-cargo--audit-brightgreen.svg)](https://github.com/zeokeel/Cordis/actions/workflows/ci.yml)
+[![cargo audit](https://img.shields.io/badge/security-cargo--audit-brightgreen.svg)](https://github.com/zeokeel/zeokeel-cordis/actions/workflows/ci.yml)
 
 - Rust **1.85+**（edition 2021）· MIT · 零 `unsafe`（`#![forbid(unsafe_code)]`）
 - 通用、无产品逻辑、静态链接、无 ABI/FFI/动态加载
@@ -57,9 +57,11 @@ Cordis 把「动态组合」拆成两个正交维度：
 
 ```toml
 [dependencies]
-cordis = { git = "https://github.com/zeokeel/Cordis", tag = "v0.3.0" }
+zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.3.0" }
 serde_json = "1"   # 插件配置是 serde_json::Value
 ```
+
+> crates.io 发布名为 `zeokeel-cordis`；库目标名仍是 `cordis`，代码里继续 `use cordis::...`。
 
 最小插件（完整可运行版本：[`examples/hello.rs`](examples/hello.rs)）：
 
@@ -123,7 +125,7 @@ fn main() -> Result<()> {
 观测），**默认关闭**——核心内核不含任何监督策略：
 
 ```toml
-cordis = { git = "https://github.com/zeokeel/Cordis", tag = "v0.3.0", features = ["supervision"] }
+zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.3.0", features = ["supervision"] }
 ```
 
 详见 [`docs/KERNEL-ISOLATION.md`](docs/KERNEL-ISOLATION.md)。
@@ -193,4 +195,4 @@ GitHub topics —
 - 当前版本 **v0.3.0**（CORE-001…CORE-051）；v0.3.x 为功能冻结线。
 - MIT，见 [LICENSE](LICENSE)；论文版权归原作者。
 
-维护仓库：<https://github.com/zeokeel/Cordis>（提交作者 `zeokeel-dev`）。
+维护仓库：<https://github.com/zeokeel/zeokeel-cordis>（提交作者 `zeokeel-dev`）。

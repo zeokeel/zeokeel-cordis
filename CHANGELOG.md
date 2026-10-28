@@ -58,7 +58,7 @@
   fiber 状态机、effect 逆序清理、事件（emit/bail/parallel/serial/waterfall）、
   插件 registry 与配置 schema、日志服务。
 
-[Unreleased]: https://github.com/zeokeel/Cordis/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/zeokeel/Cordis/releases/tag/v0.3.0
-[0.2.0]: https://github.com/zeokeel/Cordis/releases/tag/v0.2.0
-[0.1.0]: https://github.com/zeokeel/Cordis/releases/tag/v0.1.0
+[Unreleased]: https://github.com/zeokeel/zeokeel-cordis/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.3.0
+[0.2.0]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.2.0
+[0.1.0]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.1.0

@@ -16,7 +16,7 @@ v0.3.x 是当前功能冻结线；安全修复会以补丁版本形式发布。
 请使用 GitHub 的私有安全报告渠道：
 
 - 仓库页 → **Security** → **Advisories** → **Report a vulnerability**
-  （<https://github.com/zeokeel/Cordis/security/advisories/new>）
+  （<https://github.com/zeokeel/zeokeel-cordis/security/advisories/new>）
 
 报告请包含：受影响的版本/commit、复现步骤或 PoC、影响评估、建议修复（如有）。
 维护者会尽力在 **72 小时内**确认收到，并在修复可用后协调披露。

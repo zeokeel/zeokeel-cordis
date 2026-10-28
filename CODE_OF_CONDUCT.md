@@ -15,7 +15,7 @@
 ## 执行
 
 - 违反行为准则的行为可通过仓库的 **私有安全报告渠道**
-  （[Security → Report a vulnerability](https://github.com/zeokeel/Cordis/security/advisories/new)）
+  （[Security → Report a vulnerability](https://github.com/zeokeel/zeokeel-cordis/security/advisories/new)）
   报告给维护者；行为准则问题同样可以发送至该渠道并注明「CoC」。
 - 维护者会及时、公正地审查与调查，并对违规者采取适当措施（警告、临时或永久封禁等）。
 - 维护者有义务保护举报者隐私与安全。

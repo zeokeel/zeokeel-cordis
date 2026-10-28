@@ -36,7 +36,7 @@
 
 ```toml
 [dependencies]
-cordis = { git = "https://github.com/zeokeel/Cordis", tag = "v0.3.0" }
+cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.3.0" }
 serde_json = "1"   # 插件配置用 serde_json::Value
 ```
 
