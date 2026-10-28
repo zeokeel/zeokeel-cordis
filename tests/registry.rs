@@ -103,11 +103,15 @@ fn registry_map_api() {
     let alpha = Arc::new(Incrementer::new("alpha"));
     let beta = Arc::new(Incrementer::new("beta"));
     let fiber_alpha = root.plugin(alpha.clone(), Value::Null).expect("alpha");
-    let _fiber_beta = root.plugin(beta.clone(), Value::Null).expect("beta");
+    let fiber_beta = root.plugin(beta.clone(), Value::Null).expect("beta");
     let registry = root.registry();
 
     assert_eq!(registry.size(), 2);
-    assert!(registry.counter() >= 2, "fiber ids are allocated");
+    // 0.5: `Registry::counter` is crate-internal; fiber ids are public.
+    assert!(
+        fiber_alpha.id() != fiber_beta.id(),
+        "fiber ids are allocated"
+    );
     assert!(registry.fiber_count() >= 2);
 
     let mut keys = registry.keys();

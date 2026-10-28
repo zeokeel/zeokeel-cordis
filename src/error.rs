@@ -39,6 +39,28 @@ pub enum CordisError {
     /// completely. The message contains the original reload error *and* the
     /// error raised by the rollback itself.
     Rollback(String),
+    /// A plugin returned a **structured** error from its lifecycle callback
+    /// (`Plugin::apply` / `AsyncPlugin::apply_async`). The kernel propagates
+    /// this variant unchanged (it is never flattened into
+    /// [`CordisError::PluginFailed`]), so embedders can match on `kind` and
+    /// react programmatically.
+    ///
+    /// Construct it with [`CordisError::plugin`]:
+    ///
+    /// ```
+    /// # use zeokeel_cordis::CordisError;
+    /// let error = CordisError::plugin("my-plugin", "config", "missing api key");
+    /// assert_eq!(error.to_string(), "plugin error: my-plugin (config): missing api key");
+    /// ```
+    Plugin {
+        /// Plugin display name (`Plugin::name`).
+        plugin: String,
+        /// Machine-readable error kind chosen by the plugin (e.g. `"config"`,
+        /// `"network"`, `"auth"`).
+        kind: String,
+        /// Human-readable message.
+        message: String,
+    },
     /// A computed accessor (`Context::accessor`) **rejected** a write: its
     /// setter returned `false`. Distinct from [`CordisError::ServiceWriteForbidden`]
     /// (another fiber owns the service) and [`CordisError::AccessorReadOnly`]
@@ -77,12 +99,37 @@ impl fmt::Display for CordisError {
             Self::AccessorWriteRejected(name) => {
                 write!(f, "computed accessor rejected the write: {name}")
             }
+            Self::Plugin {
+                plugin,
+                kind,
+                message,
+            } => write!(f, "plugin error: {plugin} ({kind}): {message}"),
             Self::AsyncPluginNeedsAsync(name) => {
                 write!(
                     f,
                     "plugin `{name}` implements AsyncPlugin: use plugin_async/restart_async/update_async"
                 )
             }
+        }
+    }
+}
+
+impl CordisError {
+    /// Build a structured plugin error (see [`CordisError::Plugin`]).
+    ///
+    /// Plugins should return this from [`crate::Plugin::apply`] /
+    /// [`crate::AsyncPlugin::apply_async`] when they can classify their
+    /// failure; the kernel propagates it unchanged through activation,
+    /// `Fiber::await_settled`, restart/update and `Registry::replace`.
+    pub fn plugin(
+        plugin: impl Into<String>,
+        kind: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::Plugin {
+            plugin: plugin.into(),
+            kind: kind.into(),
+            message: message.into(),
         }
     }
 }

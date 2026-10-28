@@ -97,6 +97,11 @@ pub(crate) struct FiberEffect {
     pub(crate) meta: Arc<Mutex<EffectNode>>,
     /// Activation generation that registered this effect (stale-rollback tag).
     pub(crate) activation: u64,
+    /// Q11: kernel-internal effect (root logger provide, child ownership,
+    /// internal lifecycle registration). Internal effects are not counted
+    /// against the user-facing `max_effects` quota; user effects
+    /// (`ctx.effect*`/`ctx.on*`/`effect_future*`/`effect_stream`) are `false`.
+    pub(crate) internal: bool,
 }
 
 impl FiberEffect {
@@ -140,22 +145,26 @@ impl FiberLink {
     }
 }
 
-pub type FiberRef = Arc<Mutex<FiberData>>;
+pub(crate) type FiberRef = Arc<Mutex<FiberData>>;
 
 /// One plugin activation. A fiber is created for each `Context::plugin` call,
 /// even when the same plugin is registered more than once (like Cordis).
-pub struct FiberData {
-    pub id: u64,
-    pub state: FiberState,
+pub(crate) struct FiberData {
+    pub(crate) id: u64,
+    pub(crate) state: FiberState,
     /// Plugin implementation hosted by this fiber (sync or async).
     pub(crate) plugin: PluginKind,
-    pub inject: &'static [&'static str],
+    pub(crate) inject: &'static [&'static str],
     /// Resolved (validated/normalized) config currently in effect.
-    pub config: Value,
+    pub(crate) config: Value,
     /// Config exactly as supplied by the caller / update hook. Re-resolved on
     /// every activation so derived values are not compounded (Cordis `_config`).
     pub(crate) raw_config: Value,
-    pub error: Option<String>,
+    /// Typed error of the last failed activation (Cordis `fiber.error`). The
+    /// kernel keeps the structured `CordisError` (e.g. `Plugin { kind, .. }`)
+    /// instead of flattening it, so `await_settled`/`error_detail` can forward
+    /// it unchanged.
+    pub(crate) error: Option<CordisError>,
     /// Parent context link (`Weak` only for the root fiber; CORE-031).
     pub(crate) parent: Option<FiberLink>,
     /// The fiber's own context link (released on dispose).
@@ -186,8 +195,12 @@ pub struct FiberData {
     /// Live listeners registered on this fiber's behalf (quota accounting).
     #[cfg_attr(not(feature = "supervision"), allow(dead_code))]
     pub(crate) listener_count: usize,
-    /// Last observed activity (heartbeat / lifecycle operation), for watchdogs.
-    pub(crate) last_activity: Mutex<std::time::Instant>,
+    /// Injectable time source shared with the context tree (clock-l2): keep
+    /// activity timestamps and idle durations consistent with the host's clock.
+    pub(crate) clock: Arc<dyn crate::clock::Clock>,
+    /// Monotonic milliseconds of the last observed activity (heartbeat /
+    /// lifecycle operation), for watchdogs (`idle_for`, `Registry::stalled_fibers`).
+    pub(crate) last_activity_ms: AtomicU64,
     /// Generation counter of activation attempts; a stale attempt must not
     /// transition or roll back a newer one.
     pub(crate) activation_epoch: AtomicU64,
@@ -361,29 +374,48 @@ impl Fiber {
     ///
     /// Long-running plugins should call `ctx.heartbeat()` periodically so an
     /// embedder watchdog can distinguish "busy" from "stuck".
+    ///
+    /// Available with the `supervision` feature.
     #[cfg(feature = "supervision")]
     pub fn heartbeat(&self) {
         if let Ok(fiber) = self.data.lock() {
-            if let Ok(mut at) = fiber.last_activity.lock() {
-                *at = std::time::Instant::now();
-            }
+            let now = fiber.clock.now_monotonic_ms();
+            fiber.last_activity_ms.store(now, Ordering::SeqCst);
         }
     }
 
-    /// When this fiber last reported activity (lifecycle step or heartbeat).
+    /// Monotonic milliseconds (host clock) of the last reported activity
+    /// (lifecycle step or heartbeat).
+    ///
+    /// The time base is the context tree's injected [`crate::Clock`]
+    /// (default [`crate::SystemClock`]).
+    ///
+    /// Available with the `supervision` feature.
     #[cfg(feature = "supervision")]
-    pub fn last_activity(&self) -> std::time::Instant {
-        self.data
-            .lock()
-            .ok()
-            .and_then(|fiber| fiber.last_activity.lock().ok().map(|at| *at))
-            .unwrap_or_else(std::time::Instant::now)
+    pub fn last_activity_ms(&self) -> u64 {
+        match self.data.lock() {
+            Ok(fiber) => fiber.last_activity_ms.load(Ordering::SeqCst),
+            Err(_) => 0,
+        }
     }
 
-    /// How long this fiber has been quiet.
+    /// How long this fiber has been quiet, measured with the host clock.
+    ///
+    /// Computed as `clock.now_monotonic_ms() - last_activity_ms` with the
+    /// context tree's injected clock, so it stays consistent with a fake clock.
+    ///
+    /// Available with the `supervision` feature.
     #[cfg(feature = "supervision")]
     pub fn idle_for(&self) -> std::time::Duration {
-        self.last_activity().elapsed()
+        match self.data.lock() {
+            Ok(fiber) => std::time::Duration::from_millis(
+                fiber
+                    .clock
+                    .now_monotonic_ms()
+                    .saturating_sub(fiber.last_activity_ms.load(Ordering::SeqCst)),
+            ),
+            Err(_) => std::time::Duration::ZERO,
+        }
     }
 
     /// Request cooperative cancellation: plugins observe it through
@@ -440,9 +472,30 @@ impl Fiber {
         // Disposed, effects become unreachable and provided services can never
         // be withdrawn). It is a pure declaration accessor, so compute it first.
         let inject = plugin.inject();
-        let mut data = self.data.lock().map_err(|_| CordisError::Disposed)?;
-        data.inject = inject;
-        data.plugin = plugin;
+        // S1/C2 ordering: invalidate candidate filtering **before** the fiber's
+        // declaration changes. If the window were opened after the `inject`
+        // swap, a concurrent cascade/refresh could read a "trustworthy" index
+        // that still has the old reverse edges -> it would miss a fiber that has
+        // just become a dependent (retired too late / provider gone with an
+        // Active dependent). The window is held until the reindex completes.
+        let registry = self
+            .data
+            .lock()
+            .ok()
+            .and_then(|data| data.ctx_ref().map(|ctx| ctx.inner.registry.clone()));
+        let window = registry
+            .as_ref()
+            .map(|registry| registry.dep_index_begin_window());
+        let id = {
+            let mut data = self.data.lock().map_err(|_| CordisError::Disposed)?;
+            data.inject = inject;
+            data.plugin = plugin;
+            data.id
+        };
+        if let Some(registry) = registry.as_ref() {
+            registry.index_fiber_deps(id, inject);
+        }
+        drop(window);
         Ok(())
     }
 
@@ -456,6 +509,24 @@ impl Fiber {
     /// when the reload is rejected, so a failed replace does not leave a
     /// partially re-bound fiber (the root fiber's temporary runtime is removed
     /// as well).
+    ///
+    /// # Success contract: `Ok(())` is not "Active"
+    ///
+    /// `Ok(())` means the swap/rebind/reload machinery completed; it does **not**
+    /// mean the new implementation activated. When the reload's activation fails,
+    /// the previous implementation is restored and the fiber is left
+    /// [`FiberState::Failed`] carrying the structured reload error in
+    /// [`Fiber::error_detail`] (and its `Display` form in [`Fiber::error`]):
+    ///
+    /// ```text
+    /// fiber.replace_plugin(new_plugin)?;              // Ok ...
+    /// assert_eq!(fiber.state(), FiberState::Failed);  // ... but not Active
+    /// let why = fiber.error_detail();                 // e.g. CordisError::Plugin{..}
+    /// ```
+    ///
+    /// A panic during teardown/reload is reported as
+    /// [`CordisError::PluginFailed`] (`"replace_plugin: reload panicked: …"`).
+    /// Always check [`Fiber::state`] after a successful replace.
     pub fn replace_plugin(&self, plugin: Arc<dyn Plugin>) -> Result<()> {
         let _guard = begin_operation(&self.data);
         let _lifecycle = begin_lifecycle(&self.data)?;
@@ -491,6 +562,9 @@ impl Fiber {
     }
 
     /// Replace this fiber's plugin with a new async implementation and reload it.
+    ///
+    /// Success contract is the same as [`Fiber::replace_plugin`]: `Ok(())` does
+    /// not imply `Active`; inspect [`Fiber::state`] / [`Fiber::error_detail`].
     pub async fn replace_plugin_async(&self, plugin: Arc<dyn AsyncPlugin>) -> Result<()> {
         let _guard = begin_operation(&self.data);
         let _lifecycle = begin_lifecycle(&self.data)?;
@@ -554,6 +628,16 @@ impl Fiber {
         // B-3: compute the embedder-provided injection list *before* taking the
         // fiber lock (a panicking `inject()` must not poison it).
         let inject = kind.inject();
+        // S1/C2 ordering: open the index window before the declaration changes
+        // (see `swap_plugin`); the window is held until the reindex completes.
+        let registry = self
+            .data
+            .lock()
+            .ok()
+            .and_then(|data| data.ctx_ref().map(|ctx| ctx.inner.registry.clone()));
+        let window = registry
+            .as_ref()
+            .map(|registry| registry.dep_index_begin_window());
         let mut data = self.data.lock().map_err(|_| CordisError::Disposed)?;
         // A disposed fiber is final: replacing its plugin must not resurrect it.
         if data.state == FiberState::Disposed {
@@ -561,9 +645,16 @@ impl Fiber {
         }
         let old_kind = data.plugin.clone();
         let old_key = data.runtime_key;
-        let registry = data.ctx_ref().map(|ctx| ctx.inner.registry.clone());
+        let id = data.id;
         data.inject = inject;
         data.plugin = kind.clone();
+        drop(data);
+        // S1/C1: atomic reindex for the in-place replace (and the matching
+        // rollback path goes through `swap_plugin`, which reindexes again).
+        if let Some(registry) = registry.as_ref() {
+            registry.index_fiber_deps(id, inject);
+        }
+        drop(window);
         Ok((old_kind, old_key, registry))
     }
 
@@ -599,6 +690,13 @@ impl Fiber {
     }
 
     pub fn error(&self) -> Option<String> {
+        self.error_detail().map(|error| error.to_string())
+    }
+
+    /// Structured error of the last failed activation (`None` when the fiber is
+    /// not failed). The kernel propagates `CordisError::Plugin { .. }` unchanged
+    /// (see [`crate::CordisError::plugin`]).
+    pub fn error_detail(&self) -> Option<CordisError> {
         self.data.lock().ok().and_then(|data| data.error.clone())
     }
 
@@ -659,6 +757,13 @@ impl Fiber {
     /// `internal/status` (FIX-6) and every return path (including `?` and a
     /// cleanup panic) finalizes a dispose that was requested while this
     /// operation owned the fiber (FIX-3).
+    ///
+    /// # Success contract: `Ok(())` is not "Active"
+    ///
+    /// A reload whose activation fails is **fiber state**, not a return error:
+    /// `restart()` returns `Ok(())` and the fiber is left
+    /// [`FiberState::Failed`] with the structured error in
+    /// [`Fiber::error_detail`]. Check [`Fiber::state`] after restarting.
     pub fn restart(&self) -> Result<()> {
         let _guard = begin_operation(&self.data);
         let _lifecycle = begin_lifecycle(&self.data)?;
@@ -745,11 +850,26 @@ impl Fiber {
     /// this operation owned the fiber is never lost (no permanent Active
     /// orphan). FIX-14 moved the raw-config commit into the waterfall terminal,
     /// so a vetoed update cannot leak its rejected config.
+    ///
+    /// # Success contract
+    ///
+    /// - config validation failure → `Err(CordisError::Validation(..))`, fiber
+    ///   untouched;
+    /// - hook veto → `Ok(())` **without** restart (fiber keeps its old
+    ///   implementation/config);
+    /// - restart activation failure → `Ok(())` with the fiber left
+    ///   [`FiberState::Failed`] (structured error in [`Fiber::error_detail`],
+    ///   like [`Fiber::restart`]).
+    ///
+    /// Check [`Fiber::state`] when the caller needs "now active".
     pub fn update(&self, config: Value) -> Result<()> {
         self.update_with_no_save(config, false)
     }
 
     /// [`Fiber::update`] with the Cordis `update(config, noSave)` hint exposed.
+    ///
+    /// The success contract (veto vs. restart-failure semantics) is documented on
+    /// [`Fiber::update`].
     ///
     /// `no_save` is forwarded verbatim to the `internal/update` waterfall
     /// ([`crate::UpdateNext::next`] receives it), so persistence/telemetry hooks
@@ -963,7 +1083,7 @@ pub(crate) fn validate_config(
 }
 
 /// Write the `Failed` error on a fiber (diagnostics).
-fn set_error(data: &FiberRef, error: String) {
+fn set_error(data: &FiberRef, error: CordisError) {
     if let Ok(mut fiber) = data.lock() {
         fiber.error = Some(error);
     }
@@ -1082,7 +1202,7 @@ impl Drop for AsyncActivationGuard {
             }));
             set_error(
                 &self.data,
-                "activation cancelled while unwinding".to_string(),
+                CordisError::PluginFailed("activation cancelled while unwinding".to_string()),
             );
             transition(&self.data, FiberState::Failed);
             return;
@@ -1098,7 +1218,7 @@ impl Drop for AsyncActivationGuard {
         }));
         set_error(
             &self.data,
-            "activation cancelled before completion".to_string(),
+            CordisError::PluginFailed("activation cancelled before completion".to_string()),
         );
         transition(&self.data, FiberState::Failed);
         // A-9 nit: do not run a full `refresh_dependents()` from `Drop` (it
@@ -1255,7 +1375,15 @@ pub(crate) fn register_child_ownership(parent: &Context, child: &Fiber) -> Resul
     }
     #[cfg(feature = "supervision")]
     if let Some(max) = parent.inner.registry.quota_limits().max_effects {
-        if parent_fiber.effects.len() >= max {
+        // Q11: the quota counts **user** effects only; kernel-internal effects
+        // (this ownership effect, root logger provide, internal lifecycle
+        // registrations) never consume a user slot.
+        let user_effects = parent_fiber
+            .effects
+            .iter()
+            .filter(|effect| !effect.internal)
+            .count();
+        if user_effects >= max {
             return Err(CordisError::QuotaExceeded("effects".to_string()));
         }
     }
@@ -1266,6 +1394,7 @@ pub(crate) fn register_child_ownership(parent: &Context, child: &Fiber) -> Resul
         kind: EffectKind::Async(disposer),
         meta: node,
         activation,
+        internal: true,
     });
     Ok(())
 }
@@ -1658,7 +1787,7 @@ async fn discard_stale_activation_async(data: &FiberRef, epoch: u64) {
 /// semantics, CORE-046). Services and listeners are removed before the fiber
 /// transitions to `Failed`, so a failed plugin leaves no visible registrations
 /// behind.
-fn fail_fiber_sync(data: &FiberRef, ctx: &Context, error: String) {
+fn fail_fiber_sync(data: &FiberRef, ctx: &Context, error: CordisError) {
     fail_fiber_sync_inner(data, ctx, error, false);
 }
 
@@ -1668,7 +1797,7 @@ fn fail_fiber_sync(data: &FiberRef, ctx: &Context, error: String) {
 /// `Drop` and must not block): async cleanups are then deferred to the fiber's
 /// next `dispose`. Normal activation failures drain everything inline so the
 /// reverse registration order holds across the sync and async lanes (CORE-007).
-fn fail_fiber_sync_inner(data: &FiberRef, ctx: &Context, error: String, defer_async: bool) {
+fn fail_fiber_sync_inner(data: &FiberRef, ctx: &Context, error: CordisError, defer_async: bool) {
     set_error(data, error);
     let effects = match data.lock() {
         Ok(mut fiber) => std::mem::take(&mut fiber.effects),
@@ -1723,7 +1852,7 @@ fn fail_fiber_sync_inner(data: &FiberRef, ctx: &Context, error: String, defer_as
 }
 
 /// Async counterpart of [`fail_fiber_sync`]: awaits async cleanups too.
-async fn fail_fiber_async(data: &FiberRef, ctx: &Context, error: String) {
+async fn fail_fiber_async(data: &FiberRef, ctx: &Context, error: CordisError) {
     set_error(data, error);
     let effects = match data.lock() {
         Ok(mut fiber) => std::mem::take(&mut fiber.effects),
@@ -1813,7 +1942,7 @@ pub(crate) fn activate_fiber(
             if activation_stale(data, epoch) {
                 return Ok(());
             }
-            set_error(data, error.message());
+            set_error(data, CordisError::Validation(error));
             transition(data, FiberState::Failed);
             ctx.refresh_dependents();
             return Ok(());
@@ -1856,7 +1985,7 @@ pub(crate) fn activate_fiber(
                 discard_stale_activation(data, epoch);
                 return Ok(());
             }
-            fail_fiber_sync(data, ctx, error.to_string());
+            fail_fiber_sync(data, ctx, error);
             Ok(())
         }
         Err(payload) => {
@@ -1867,7 +1996,7 @@ pub(crate) fn activate_fiber(
             fail_fiber_sync(
                 data,
                 ctx,
-                format!("panic: {}", panic_message(payload.as_ref())),
+                CordisError::PluginFailed(format!("panic: {}", panic_message(payload.as_ref()))),
             );
             Ok(())
         }
@@ -1913,7 +2042,7 @@ pub(crate) async fn activate_fiber_async(
             if activation_stale(data, epoch) {
                 return Ok(());
             }
-            set_error(data, error.message());
+            set_error(data, CordisError::Validation(error));
             transition(data, FiberState::Failed);
             ctx.refresh_dependents();
             return Ok(());
@@ -1949,7 +2078,10 @@ pub(crate) async fn activate_fiber_async(
                     fail_fiber_async(
                         data,
                         ctx,
-                        format!("panic: {}", panic_message(payload.as_ref())),
+                        CordisError::PluginFailed(format!(
+                            "panic: {}",
+                            panic_message(payload.as_ref())
+                        )),
                     )
                     .await;
                     return Ok(());
@@ -1977,7 +2109,7 @@ pub(crate) async fn activate_fiber_async(
                 discard_stale_activation_async(data, epoch).await;
                 return Ok(());
             }
-            fail_fiber_async(data, ctx, error.to_string()).await;
+            fail_fiber_async(data, ctx, error).await;
             Ok(())
         }
         Err(payload) => {
@@ -1988,7 +2120,7 @@ pub(crate) async fn activate_fiber_async(
             fail_fiber_async(
                 data,
                 ctx,
-                format!("panic: {}", panic_message(payload.as_ref())),
+                CordisError::PluginFailed(format!("panic: {}", panic_message(payload.as_ref()))),
             )
             .await;
             Ok(())
@@ -2016,7 +2148,14 @@ pub(crate) async fn activate_by_kind_async(
 /// caller can simply return.
 /// Effects taken off a fiber for one unload (effects, deferred async cleanups,
 /// owning context).
-type DrainBatch = (Vec<FiberEffect>, Vec<AsyncDisposer>, Option<Context>);
+/// `(effects, deferred_async, ctx, withdrawn_services)`. The last element is the
+/// authoritative withdrawn-service list used by the S3 cascade candidate filter.
+type DrainBatch = (
+    Vec<FiberEffect>,
+    Vec<AsyncDisposer>,
+    Option<Context>,
+    Vec<String>,
+);
 
 fn take_effects_begin(data: &FiberRef) -> Result<Option<DrainBatch>> {
     let (effects, deferred, ctx) = {
@@ -2031,7 +2170,7 @@ fn take_effects_begin(data: &FiberRef) -> Result<Option<DrainBatch>> {
             }
             let effects = std::mem::take(&mut fiber.effects);
             let deferred = std::mem::take(&mut fiber.deferred_async);
-            return Ok(Some((effects, deferred, fiber.ctx_ref())));
+            return Ok(Some((effects, deferred, fiber.ctx_ref(), Vec::new())));
         }
         (
             std::mem::take(&mut fiber.effects),
@@ -2045,11 +2184,22 @@ fn take_effects_begin(data: &FiberRef) -> Result<Option<DrainBatch>> {
     // provider-withdrawal order). The transitively-unready dependents are
     // begun/drained by the caller's iterative cascade (`begin_cascade`), not by
     // a recursive retire loop here (C1: no unbounded recursion on deep chains).
-    if let Some(ctx) = ctx.as_ref() {
-        let owner = data.lock().map(|fiber| fiber.id).unwrap_or(0);
-        ctx.withdraw_owner_services(owner);
-    }
-    Ok(Some((effects, deferred, ctx)))
+    let withdrawn = match ctx.as_ref() {
+        Some(ctx) => {
+            let owner = data.lock().map(|fiber| fiber.id).unwrap_or(0);
+            // S3: the authoritative withdrawn-service list drives the cascade
+            // candidate filter (effect labels cannot supply service names).
+            let withdrawn = ctx.withdraw_owner_services(owner);
+            // S4: withdrawal is a service-availability change; mark it dirty so
+            // the next refresh pass re-evaluates exactly its dependents.
+            for name in &withdrawn {
+                ctx.inner.registry.note_service_changed(name);
+            }
+            withdrawn
+        }
+        None => Vec::new(),
+    };
+    Ok(Some((effects, deferred, ctx, withdrawn)))
 }
 
 /// Finish unloading: drop listeners/services and store the target state.
@@ -2160,6 +2310,9 @@ struct CascadeFrame {
     deferred: Vec<AsyncDisposer>,
     ctx: Option<Context>,
     target: FiberState,
+    /// S3: services this frame withdrew when it began (their indexed dependents
+    /// form the next cascade frontier).
+    withdrawn: Vec<String>,
     /// True for the fiber whose unload the caller requested: only its cleanup
     /// panic is re-raised (dependents' panics are contained like FIX-2).
     root: bool,
@@ -2177,6 +2330,7 @@ impl CascadeFrame {
             deferred,
             ctx,
             target,
+            withdrawn: _,
             root: _,
         } = self;
         let mut newly_deferred: Vec<AsyncDisposer> = Vec::new();
@@ -2485,34 +2639,146 @@ fn begin_cascade(data: &FiberRef, target: FiberState) -> Result<Option<Vec<Casca
     let Some(root_frame) = begin_frame(data, target, true)? else {
         return Ok(None);
     };
+    let root_withdrawn = root_frame.withdrawn.clone();
     let mut frames = vec![root_frame];
     let Some(registry) = data.lock().ok().and_then(|fiber| fiber.registry.clone()) else {
         return Ok(Some(frames));
     };
     let limit = cascade_round_limit(&registry);
     // Phase 1a: dependency dependents (provider-before-dependent begin order).
-    let mut rounds = 0usize;
-    while rounds < limit {
-        rounds += 1;
-        let Some(dependent) = registry.find_unready_active() else {
-            break;
-        };
-        match begin_frame(&dependent.data, FiberState::Pending, false) {
-            // Already disposed/unloading between the scan and the begin.
-            Ok(None) => continue,
-            Ok(Some(frame)) => frames.push(frame),
-            Err(error) => {
-                rollback_cascade(frames);
-                return Err(error);
+    //
+    // S3: when the derived index is trustworthy, the dependency frontier is
+    // driven by the *withdrawn service names* of the frames begun so far: only
+    // the indexed dependents of those services are candidates. The candidate set
+    // is only a filter — every candidate must still pass a fresh availability
+    // check (`dependencies_satisfied`), the fixed-point rounds are kept, and the
+    // begin order is sorted by fiber id for determinism. Any doubt about the
+    // index (broken / replace window / poisoned lock) falls back to the original
+    // full scan, which stays the correctness backstop (C2).
+    let use_index = registry.dep_index_ready();
+    let index_epoch = registry.dep_index_epoch();
+    let mut index_failed = !use_index;
+    let mut frontier: Vec<String> = root_withdrawn;
+    if use_index {
+        let mut rounds = 0usize;
+        while !frontier.is_empty() && rounds < limit {
+            // C2: a replace/reindex window may open *while* the cascade runs
+            // (another thread swaps a plugin's inject list). The frontier built
+            // so far then cannot be trusted; stop using the index and let the
+            // full-scan fallback below re-evaluate every Active fiber.
+            if !registry.dep_index_ready() {
+                index_failed = true;
+                break;
+            }
+            rounds += 1;
+            let Some(candidates) = registry.dependents_of_services(&frontier) else {
+                // C2: the index became unusable mid-cascade -> full scan next.
+                index_failed = true;
+                break;
+            };
+            frontier.clear();
+            let mut ids: Vec<u64> = candidates.into_iter().collect();
+            ids.sort_unstable();
+            for id in ids {
+                let Some(candidate) = registry.fiber_by_id(id) else {
+                    continue;
+                };
+                if !fiber_is_unready_active(&candidate) {
+                    continue;
+                }
+                match begin_frame(&candidate.data, FiberState::Pending, false) {
+                    Ok(None) => {}
+                    Ok(Some(frame)) => {
+                        frontier.extend(frame.withdrawn.iter().cloned());
+                        frames.push(frame);
+                    }
+                    Err(error) => {
+                        rollback_cascade(frames);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        if rounds >= limit && !frontier.is_empty() {
+            tracing::error!(
+                target: "zeokeel_cordis::fiber",
+                "unload cascade hit its bounded fixed point ({limit} rounds); \
+                 remaining unready dependents stay Active and can be retried"
+            );
+        }
+        // The window may have opened (and even closed again) after the last
+        // frontier round: compare generations so a reindex that started *and*
+        // finished during the cascade still forces the full-scan fallback.
+        if !index_failed
+            && (!registry.dep_index_ready() || registry.dep_index_epoch() != index_epoch)
+        {
+            index_failed = true;
+        }
+    }
+    // C2/C3 evidence (debug only, opt-in): the index-driven candidate frontier
+    // must cover every fiber the full scan would call unready. A miss would mean
+    // a missing/stale reverse edge, so fail loudly in tests instead of silently
+    // leaving a dependent Active.
+    #[cfg(debug_assertions)]
+    if use_index && !index_failed && registry.debug_cross_check() {
+        // The cross-check scans concurrently with other threads, so it may only
+        // assert while the dependency-index generation is provably stable: a
+        // replace/reindex window may legitimately open *after* the loop-end
+        // epoch check (or during the scan) and add the very edge the scan is
+        // about to look for. Capture the generation before and after the scan
+        // and skip the assertion when a window happened in between.
+        let epoch_before_scan = registry.dep_index_epoch();
+        if epoch_before_scan == index_epoch && registry.dep_index_ready() {
+            if let Some(missed) = registry.find_unready_active() {
+                let generation_stable =
+                    registry.dep_index_epoch() == epoch_before_scan && registry.dep_index_ready();
+                let missed_id = missed.id();
+                let already_begun = frames.iter().any(|frame| {
+                    frame
+                        .data
+                        .lock()
+                        .map(|data| data.id == missed_id)
+                        .unwrap_or(false)
+                });
+                if generation_stable && !already_begun {
+                    tracing::error!(
+                        target: "zeokeel_cordis::fiber",
+                        "S3 cross-check: candidate frontier missed unready fiber {missed_id}"
+                    );
+                    debug_assert!(
+                        false,
+                        "S3 candidate frontier missed an unready fiber (missing reverse edge)"
+                    );
+                }
             }
         }
     }
-    if rounds >= limit {
-        tracing::error!(
-            target: "zeokeel_cordis::fiber",
-            "unload cascade hit its bounded fixed point ({limit} rounds); \
-             remaining unready dependents stay Active and can be retried"
-        );
+    // C2 fail-safe: the full scan stays the correctness backstop whenever the
+    // index could not be used (broken/poisoned) or became unusable mid-cascade.
+    if index_failed {
+        let mut rounds = 0usize;
+        while rounds < limit {
+            rounds += 1;
+            let Some(dependent) = registry.find_unready_active() else {
+                break;
+            };
+            match begin_frame(&dependent.data, FiberState::Pending, false) {
+                // Already disposed/unloading between the scan and the begin.
+                Ok(None) => continue,
+                Ok(Some(frame)) => frames.push(frame),
+                Err(error) => {
+                    rollback_cascade(frames);
+                    return Err(error);
+                }
+            }
+        }
+        if rounds >= limit {
+            tracing::error!(
+                target: "zeokeel_cordis::fiber",
+                "unload cascade hit its bounded fixed point ({limit} rounds); \
+                 remaining unready dependents stay Active and can be retried"
+            );
+        }
     }
     // Phase 1b: ownership descendants, collected iteratively (DFS pre-order) so
     // a deep parent -> child plugin hierarchy unloads without recursion. They
@@ -2569,6 +2835,31 @@ fn child_fibers(data: &FiberRef) -> Vec<Fiber> {
         .collect()
 }
 
+/// S3: whether `fiber` is an `Active` sync fiber whose injected dependencies are
+/// no longer satisfied (the same condition `find_unready_active` checks).
+fn fiber_is_unready_active(fiber: &Fiber) -> bool {
+    if fiber.state() != FiberState::Active {
+        return false;
+    }
+    let Ok(data) = fiber.data.lock() else {
+        return false;
+    };
+    if !matches!(data.plugin, PluginKind::Sync(_)) {
+        return false;
+    }
+    let recorded = data
+        .dep_versions
+        .lock()
+        .map(|versions| versions.clone())
+        .unwrap_or_default();
+    let deps = data.inject;
+    let Some(ctx) = data.ctx_ref() else {
+        return false;
+    };
+    drop(data);
+    !dependencies_satisfied(&ctx, deps, &recorded)
+}
+
 /// Begin one cascade frame for `data` if the fiber still needs unloading.
 ///
 /// `None` means "nothing to begin": the fiber is already final, or another
@@ -2586,7 +2877,7 @@ fn begin_frame(data: &FiberRef, target: FiberState, root: bool) -> Result<Option
     // The root may be `Unloading` (restart/dispose already announced it) or even
     // `Disposed` with deferred cleanups left by a cancelled unload (A-9 retry);
     // `take_effects_begin` handles both.
-    let Some((effects, deferred, ctx)) = take_effects_begin(data)? else {
+    let Some((effects, deferred, ctx, withdrawn)) = take_effects_begin(data)? else {
         return Ok(None);
     };
     Ok(Some(CascadeFrame {
@@ -2595,6 +2886,7 @@ fn begin_frame(data: &FiberRef, target: FiberState, root: bool) -> Result<Option
         deferred,
         ctx,
         target,
+        withdrawn,
         root,
     }))
 }
@@ -2654,6 +2946,7 @@ fn park_cancelled_frame(frame: CascadeFrame) {
         deferred,
         ctx: _,
         target,
+        withdrawn: _,
         root: _,
     } = frame;
     let mut newly_deferred: Vec<AsyncDisposer> = Vec::new();
@@ -2908,6 +3201,7 @@ pub(crate) async fn unload_fiber_async(data: &FiberRef, target: FiberState) -> R
         deferred,
         ctx,
         target: frame_target,
+        withdrawn: _,
         root: _,
     } = root;
     debug_assert_eq!(frame_target, target);
@@ -3203,9 +3497,8 @@ impl Drop for OperationGuard<'_> {
 pub(crate) fn begin_operation(data: &FiberRef) -> OperationGuard<'_> {
     if let Ok(fiber) = data.lock() {
         fiber.pending_ops.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut at) = fiber.last_activity.lock() {
-            *at = std::time::Instant::now();
-        }
+        let now = fiber.clock.now_monotonic_ms();
+        fiber.last_activity_ms.store(now, Ordering::SeqCst);
     }
     OperationGuard { data }
 }
@@ -3213,9 +3506,8 @@ pub(crate) fn begin_operation(data: &FiberRef) -> OperationGuard<'_> {
 fn end_operation(data: &FiberRef) {
     let waiters = match data.lock() {
         Ok(fiber) => {
-            if let Ok(mut at) = fiber.last_activity.lock() {
-                *at = std::time::Instant::now();
-            }
+            let now = fiber.clock.now_monotonic_ms();
+            fiber.last_activity_ms.store(now, Ordering::SeqCst);
             if fiber.pending_ops.fetch_sub(1, Ordering::SeqCst) == 1 {
                 fiber
                     .settle_waiters
@@ -3289,7 +3581,7 @@ impl Future for Settled<'_> {
         }
         let error = data.lock().ok().and_then(|fiber| fiber.error.clone());
         match error {
-            Some(error) => Poll::Ready(Err(CordisError::PluginFailed(error))),
+            Some(error) => Poll::Ready(Err(error)),
             None => Poll::Ready(Ok(())),
         }
     }
@@ -3343,7 +3635,8 @@ mod regression_tests {
             dispose_requested: AtomicBool::new(false),
             cancel_requested: AtomicBool::new(false),
             listener_count: 0,
-            last_activity: Mutex::new(std::time::Instant::now()),
+            clock: Arc::new(crate::clock::SystemClock),
+            last_activity_ms: AtomicU64::new(0),
             activation_epoch: AtomicU64::new(0),
             lifecycle_owner: AtomicU64::new(0),
             lifecycle_depth: AtomicUsize::new(0),
@@ -3358,6 +3651,7 @@ mod regression_tests {
                 kind: EffectKind::Sync(Disposer::new(vec![body])),
                 meta: EffectNode::new(label),
                 activation: 0,
+                internal: false,
             });
         }
     }

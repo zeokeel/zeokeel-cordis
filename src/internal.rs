@@ -24,6 +24,25 @@
 //! Hooks are registered with the `Context::on_internal_*` methods and are
 //! removed with the owning fiber, exactly like event listeners.
 //!
+//! ## Ownership: context methods vs the raw bus
+//!
+//! There are two ways to register a hook, and they differ in ownership:
+//!
+//! | entry point | owned by | removed on fiber unload | intended for |
+//! |---|---|---|---|
+//! | `Context::on_internal_*` (e.g. [`crate::Context::on_internal_status`]) | the calling fiber | yes (automatic) | normal plugins |
+//! | [`crate::Events::internal`] / [`InternalBus`] | the caller | **no** (dispose manually) | embedder tooling that must outlive fibers |
+//!
+//! Both write into the same ordered hook list of the shared bus, so registration
+//! order interleaves as expected and `internal/*` names are never dispatched
+//! back into the bus. [`InternalBus`]'s registration methods are an
+//! **advanced/unstable** surface: prefer the `Context::on_internal_*` wrappers
+//! unless the hook must survive the fiber that installed it.
+//!
+//! [`crate::Context::on_lifecycle`] is a general convenience built on that raw
+//! bus: a non-fiber-bound [`LifecycleListener`] subscriber for fiber state
+//! transitions.
+//!
 //! ## Semantics worth knowing before writing a hook
 //!
 //! - **`internal/get`: `None` means "service absent".** A get hook that returns
@@ -171,6 +190,34 @@ pub type GetHook =
 /// `internal/set` waterfall hook.
 pub type SetHook =
     Arc<dyn for<'a> Fn(&Context, &str, &ServiceValue, &SetNext<'a>) -> bool + Send + Sync>;
+/// One fiber lifecycle transition delivered to a [`LifecycleListener`]
+/// (see [`crate::Context::on_lifecycle`]).
+///
+/// Transitions are reported for the whole context tree the observer was
+/// installed on (the internal hook bus is shared by the root context), including
+/// the terminal `* -> Disposed` transition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleEvent {
+    /// Id of the fiber whose state changed (`0` is the root fiber).
+    pub fiber_id: u64,
+    /// Display name of the fiber's plugin (`root` for the root fiber).
+    pub name: String,
+    /// State before the transition.
+    pub from: FiberState,
+    /// State after the transition (as observed when the hook runs).
+    pub to: FiberState,
+}
+
+/// A lifecycle subscriber (see [`crate::Context::on_lifecycle`]).
+///
+/// The listener is **not** owned by a fiber: it keeps receiving events after the
+/// fiber (or context) that installed it unloads, until its [`Disposer`] is
+/// disposed. The disposer is a single-owner handle: dropping the last handle is
+/// equivalent to disposing it ([`Disposer`]'s `Drop` safety net), so keep it
+/// alive to keep the subscription. Panics are contained and logged, other
+/// subscribers still run.
+pub type LifecycleListener = Arc<dyn Fn(&LifecycleEvent) + Send + Sync>;
+
 /// `internal/listener` bail hook: returning `Some` replaces the registration.
 pub type ListenerHook =
     Arc<dyn for<'a> Fn(&ListenerRequest<'a>) -> Option<ListenerOverride> + Send + Sync>;

@@ -157,11 +157,15 @@ fn await_settled_rethrows_startup_errors() {
         .plugin(Arc::new(NeedsModel), json!({}))
         .expect("fiber handle");
     assert_eq!(fiber.state(), FiberState::Failed);
+    // 0.4.5 typed errors: a schema rejection is stored as the structured
+    // `CordisError::Validation` variant and forwarded unchanged (it is no longer
+    // flattened into `PluginFailed`).
     match block_on(fiber.await_settled()) {
-        Err(CordisError::PluginFailed(message)) => {
-            assert!(message.contains("model"), "message: {message}")
+        Err(CordisError::Validation(error)) => {
+            let message = error.to_string();
+            assert!(message.contains("model"), "message: {message}");
         }
-        other => panic!("expected PluginFailed, got {other:?}"),
+        other => panic!("expected Validation, got {other:?}"),
     }
 }
 

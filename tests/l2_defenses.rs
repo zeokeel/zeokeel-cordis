@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use std::sync::Mutex;
 use zeokeel_cordis::{
-    cleanup, Context, FiberQuota, FiberState, IsolationCapabilities, Plugin, Result,
+    cleanup, Clock, Context, CordisError, Disposer, EventResult, FiberQuota, FiberState,
+    IsolationCapabilities, Plugin, Result, ServiceKey, TracingExporter,
 };
 
 #[test]
@@ -554,4 +555,235 @@ fn disposed_child_fibers_free_the_child_quota_slot() {
 
     root.dispose_all().expect("cleanup");
     assert_eq!(root.registry().fiber_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Q11: `max_effects` counts *user* effects only
+// ---------------------------------------------------------------------------
+
+/// A plugin that registers one user effect per call through `ctx.effect`.
+struct UserEffects {
+    runs: Arc<AtomicUsize>,
+    outcomes: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+impl Plugin for UserEffects {
+    fn name(&self) -> &'static str {
+        "l2-user-effects"
+    }
+
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        let runs = self.runs.clone();
+        // First user effect: allowed under max_effects(1).
+        let first = ctx.effect(move || {
+            let runs = runs.clone();
+            vec![cleanup(move || {
+                runs.fetch_add(1, Ordering::SeqCst);
+            })]
+        });
+        self.outcomes
+            .lock()
+            .unwrap()
+            .push(first.as_ref().err().map(ToString::to_string));
+        // Second live user effect: must be rejected (QuotaExceeded("effects")).
+        let counter = self.runs.clone();
+        let second = ctx.effect(move || {
+            let counter = counter.clone();
+            vec![cleanup(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })]
+        });
+        self.outcomes
+            .lock()
+            .unwrap()
+            .push(second.as_ref().err().map(ToString::to_string));
+        Ok(())
+    }
+}
+
+struct NoopPlugin;
+
+impl Plugin for NoopPlugin {
+    fn name(&self) -> &'static str {
+        "l2-noop"
+    }
+
+    fn apply(&self, _ctx: Context, _config: Value) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A plugin whose bookkeeping uses only kernel-internal effects: providing a
+/// service, a log exporter, an event listener and an internal hook.
+struct InternalOnly {
+    disposers: Arc<Mutex<Vec<Disposer>>>,
+}
+
+impl Plugin for InternalOnly {
+    fn name(&self) -> &'static str {
+        "l2-internal-only"
+    }
+
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        let service = ctx.provide(ServiceKey::new("l2.internal"), Arc::new(7u32))?;
+        let exporter = ctx.log_exporter(Arc::new(TracingExporter))?;
+        let listener = ctx.on("l2.internal-event", |_args: &[Value]| EventResult::Continue)?;
+        ctx.on_internal_status(Arc::new(|_fiber, _old| {}))?;
+        self.disposers
+            .lock()
+            .unwrap()
+            .extend([service, exporter, listener]);
+        Ok(())
+    }
+}
+
+#[test]
+fn max_effects_one_still_loads_a_plugin() {
+    let root = Context::root();
+    root.set_quota(FiberQuota::unlimited().max_effects(1));
+    let fiber = root
+        .plugin(
+            Arc::new(InternalOnly {
+                disposers: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Value::Null,
+        )
+        .expect("max_effects(1) must not block a plugin whose bookkeeping is internal");
+    assert_eq!(fiber.state(), FiberState::Active);
+    assert!(
+        !fiber.get_effects().is_empty(),
+        "the internal effects are still registered on the fiber"
+    );
+    root.dispose_all().expect("cleanup");
+}
+
+#[test]
+fn user_effects_consume_the_max_effects_quota() {
+    let root = Context::root();
+    root.set_quota(FiberQuota::unlimited().max_effects(1));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let fiber = root
+        .plugin(
+            Arc::new(UserEffects {
+                runs: runs.clone(),
+                outcomes: outcomes.clone(),
+            }),
+            Value::Null,
+        )
+        .expect("plugin");
+    assert_eq!(fiber.state(), FiberState::Active);
+    let recorded = outcomes.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 2);
+    assert_eq!(recorded[0], None, "the first user effect is allowed");
+    assert!(
+        recorded[1]
+            .as_deref()
+            .is_some_and(|error| error.contains("effects")),
+        "the second live user effect is rejected: {recorded:?}"
+    );
+    root.dispose_all().expect("cleanup");
+}
+
+#[test]
+fn disposed_user_effect_frees_the_quota_slot_under_max_effects_one() {
+    let root = Context::root();
+    root.set_quota(FiberQuota::unlimited().max_effects(1));
+    let fiber = root
+        .plugin(Arc::new(NoopPlugin), Value::Null)
+        .expect("plugin");
+    let ctx = fiber.context().expect("ctx");
+    let first = ctx
+        .effect(|| vec![cleanup(|| {})])
+        .expect("first user effect");
+    let error = match ctx.effect(|| vec![cleanup(|| {})]) {
+        Err(error) => error,
+        Ok(disposer) => {
+            disposer.dispose();
+            panic!("the second live user effect must exceed max_effects(1)");
+        }
+    };
+    assert!(
+        matches!(&error, CordisError::QuotaExceeded(kind) if kind == "effects"),
+        "unexpected error: {error:?}"
+    );
+    first.dispose();
+    // The freed slot is reusable (disposed entries are not live).
+    let second = ctx
+        .effect(|| vec![cleanup(|| {})])
+        .expect("the slot is freed after disposal");
+    drop(second);
+    root.dispose_all().expect("cleanup");
+}
+
+// ---------------------------------------------------------------------------
+// Injectable clock: L2 activity tracking uses the host clock
+// ---------------------------------------------------------------------------
+
+struct FakeClock {
+    unix_ms: AtomicUsize,
+    monotonic_ms: AtomicUsize,
+}
+
+impl FakeClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            unix_ms: AtomicUsize::new(1_700_000_000_000),
+            monotonic_ms: AtomicUsize::new(0),
+        })
+    }
+
+    fn advance(&self, millis: usize) {
+        self.monotonic_ms.fetch_add(millis, Ordering::SeqCst);
+    }
+}
+
+impl Clock for FakeClock {
+    fn now_unix_ms(&self) -> u64 {
+        self.unix_ms.load(Ordering::SeqCst) as u64
+    }
+
+    fn now_monotonic_ms(&self) -> u64 {
+        self.monotonic_ms.load(Ordering::SeqCst) as u64
+    }
+}
+
+#[test]
+fn l2_activity_uses_the_injected_clock() {
+    let root = Context::root();
+    let fake = FakeClock::new();
+    root.set_clock(fake.clone())
+        .expect("root installs the clock");
+
+    // Fibers created after the clock is installed start their activity stamp
+    // from the host clock.
+    let fiber = root
+        .plugin(Arc::new(NoopPlugin), Value::Null)
+        .expect("plugin");
+    assert_eq!(fiber.last_activity_ms(), 0, "created at fake monotonic 0");
+
+    fake.advance(2_500);
+    fiber.heartbeat();
+    assert_eq!(
+        fiber.last_activity_ms(),
+        2_500,
+        "heartbeat writes the host monotonic clock"
+    );
+
+    fake.advance(7_500);
+    assert!(
+        fiber.idle_for() >= Duration::from_secs(7),
+        "idle duration comes from the host clock: {:?}",
+        fiber.idle_for()
+    );
+
+    // The root fiber is updated together with the tree clock (it predates it).
+    assert!(root.fiber().last_activity_ms() <= fake.now_monotonic_ms());
+    root.fiber().heartbeat();
+    fake.advance(3_000);
+    assert!(
+        root.fiber().idle_for() >= Duration::from_secs(3),
+        "the root fiber follows the injected clock too"
+    );
+    root.dispose_all().expect("cleanup");
 }

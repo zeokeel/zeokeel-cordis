@@ -51,6 +51,9 @@ pub(crate) struct ContextInner {
     pub(crate) accessors: Mutex<HashMap<&'static str, Accessor>>,
     /// Diagnostic/extension metadata attached with [`Context::extend_meta`].
     pub(crate) meta: ContextMeta,
+    /// Injectable time source for this context tree (shared by every derived
+    /// context; see [`crate::Clock`]).
+    pub(crate) clock: Arc<Mutex<Arc<dyn crate::clock::Clock>>>,
 }
 
 /// RAII guard for the fiber's nested-effect stack: the node is popped even
@@ -146,7 +149,10 @@ impl Context {
             dispose_requested: std::sync::atomic::AtomicBool::new(false),
             cancel_requested: std::sync::atomic::AtomicBool::new(false),
             listener_count: 0,
-            last_activity: Mutex::new(std::time::Instant::now()),
+            // The root tree clock is installed right below (`ContextInner.clock`);
+            // the root fiber is updated together with it by `set_clock`.
+            clock: Arc::new(crate::clock::SystemClock),
+            last_activity_ms: std::sync::atomic::AtomicU64::new(0),
             activation_epoch: std::sync::atomic::AtomicU64::new(0),
             lifecycle_owner: std::sync::atomic::AtomicU64::new(0),
             lifecycle_depth: std::sync::atomic::AtomicUsize::new(0),
@@ -165,6 +171,7 @@ impl Context {
             service_store: Arc::new(Mutex::new(HashMap::new())),
             accessors: Mutex::new(HashMap::new()),
             meta: ContextMeta::new(),
+            clock: Arc::new(Mutex::new(Arc::new(crate::clock::SystemClock))),
         });
         let ctx = Self { inner };
         if let Ok(mut data) = ctx.inner.fiber.data.lock() {
@@ -202,6 +209,7 @@ impl Context {
                 service_store: parent.inner.service_store.clone(),
                 accessors: Mutex::new(HashMap::new()),
                 meta: ContextMeta::new(),
+                clock: parent.inner.clock.clone(),
             }),
         }
     }
@@ -260,6 +268,7 @@ impl Context {
                 service_store: self.inner.service_store.clone(),
                 accessors: Mutex::new(HashMap::new()),
                 meta: ContextMeta::new(),
+                clock: self.inner.clock.clone(),
             }),
         }
     }
@@ -278,6 +287,7 @@ impl Context {
                 service_store: self.inner.service_store.clone(),
                 accessors: Mutex::new(HashMap::new()),
                 meta,
+                clock: self.inner.clock.clone(),
             }),
         }
     }
@@ -316,6 +326,7 @@ impl Context {
                 service_store: self.inner.service_store.clone(),
                 accessors: Mutex::new(HashMap::new()),
                 meta: ContextMeta::new(),
+                clock: self.inner.clock.clone(),
             }),
         }
     }
@@ -323,6 +334,70 @@ impl Context {
     /// Resolve the current fiber id; the root fiber is 0.
     pub fn fiber_id(&self) -> u64 {
         self.inner.fiber.id()
+    }
+
+    /// The time source of this context tree (defaults to
+    /// [`crate::SystemClock`]).
+    ///
+    /// Shared by every context derived from the same root; see
+    /// [`Context::set_clock`] and [`crate::Clock`].
+    pub fn clock(&self) -> Arc<dyn crate::clock::Clock> {
+        self.inner
+            .clock
+            .lock()
+            .map(|clock| Arc::clone(&clock))
+            .unwrap_or_else(|_| Arc::new(crate::clock::SystemClock))
+    }
+
+    /// Install the time source for this context tree.
+    ///
+    /// # Scope
+    ///
+    /// Only contexts that belong to the **root fiber** (`fiber_id() == 0`) may
+    /// install a clock: every context derived from the root (`.extend()`,
+    /// `.isolate()`, `.intercept()`, …) also has fiber id 0 and writes **the same
+    /// per-tree slot**, so installing from any of them changes the clock of the
+    /// whole tree. A context owned by a plugin fiber (`fiber_id() != 0`) is
+    /// rejected with [`CordisError::InvalidPlugin`] — installing from a plugin
+    /// would silently change global timing.
+    ///
+    /// Install it right after [`Context::root`], before loading plugins, and do
+    /// not switch clocks at runtime: the monotonic source must stay the same or
+    /// idle measurements jump. Existing log records keep their timestamps; only
+    /// new observations (new log records, new heartbeats) use the new clock.
+    ///
+    /// # Facade snapshot
+    ///
+    /// Logger facades ([`Context::logger`], [`Context::logger_named`]) snapshot
+    /// the clock **when they are created**. A facade obtained before
+    /// `set_clock` keeps using the old clock; facades obtained afterwards use the
+    /// new one. After installing a clock, re-acquire logger facades that must
+    /// report the injected time (plugin code normally obtains its logger during
+    /// activation, i.e. after the host installed the clock).
+    ///
+    /// The default is [`crate::SystemClock`].
+    pub fn set_clock(&self, clock: Arc<dyn crate::clock::Clock>) -> Result<()> {
+        if self.fiber_id() != 0 {
+            return Err(CordisError::InvalidPlugin(
+                "clock must be set on the root context".to_string(),
+            ));
+        }
+        {
+            let mut slot = self.inner.clock.lock().map_err(|_| CordisError::Disposed)?;
+            *slot = Arc::clone(&clock);
+        }
+        // Fibers snapshot the clock handle at creation. Updating the live ones
+        // keeps activity/idle measurements on one monotonic source even for
+        // fibers created before the clock was installed (the root fiber predates
+        // the tree clock slot).
+        let mut live: Vec<crate::fiber::Fiber> = self.inner.registry.fibers();
+        live.push(self.inner.fiber.clone());
+        for fiber in live {
+            if let Ok(mut data) = fiber.data.lock() {
+                data.clock = Arc::clone(&clock);
+            }
+        }
+        Ok(())
     }
 
     /// Register a typed service. The returned disposer removes it; service
@@ -430,6 +505,9 @@ impl Context {
             }
             store.insert(key.clone(), entry);
         }
+        // S4: derived dependency index is dirty for this name (candidate
+        // superset; availability is still decided by `lookup_for_injection`).
+        self.inner.registry.note_service_changed(name);
         self.inner
             .events
             .internal()
@@ -442,11 +520,14 @@ impl Context {
         // (upgrading the Weak alone would silently leave a stale service).
         let store = Arc::clone(&self.inner.service_store);
         let events = Arc::clone(&self.inner.events);
+        let registry = Arc::clone(&self.inner.registry);
         let weak = Arc::downgrade(&self.inner);
         let disposer = Disposer::new(vec![Box::new(move || {
             if let Ok(mut store) = store.lock() {
                 store.remove(&key);
             }
+            // S4: the removal changes the derived dependency index too.
+            registry.note_service_changed(name);
             if let Some(inner) = weak.upgrade() {
                 let ctx = Context { inner };
                 events.internal().emit_service(&ctx, name, None);
@@ -691,7 +772,10 @@ impl Context {
     /// settle. Re-entrant calls made while a refresh is already running are
     /// coalesced through a dirty flag and drained by the outermost loop.
     pub fn refresh(&self) {
-        self.refresh_dependents();
+        // 0.5: the user-facing refresh is a full re-evaluation (0.4.4 semantics):
+        // an availability-gate flip must be observed even when nothing is marked
+        // dirty. The internal `refresh_dependents()` keeps the indexed fast path.
+        self.inner.registry.refresh_all_full();
     }
 
     /// Async counterpart of [`Context::refresh`]: also awaits async plugin
@@ -703,14 +787,17 @@ impl Context {
     /// extremely deep chains need repeated refreshes). Re-entrant refreshes are
     /// coalesced through the dirty flag instead of nesting.
     pub async fn refresh_async(&self) {
-        self.inner.registry.refresh_all_async().await;
+        // 0.5: full re-evaluation, same contract as `Context::refresh()`.
+        self.inner.registry.refresh_all_async_full().await;
     }
 
     /// Attach an already-created disposer to the current fiber as a labeled
     /// effect (used by add-on crates such as `cordis-timer`); unloading or
     /// restarting the fiber disposes it.
     pub fn attach_effect(&self, disposer: Disposer, label: &'static str) -> Result<()> {
-        self.register_effect_labeled(disposer, label)
+        // User-owned effect: it counts against the supervision `max_effects`
+        // quota (kernel bookkeeping uses `register_effect_labeled` instead).
+        self.register_user_effect_labeled(disposer, label)
     }
 
     /// Reserve one listener slot on this fiber (quota enforcement).
@@ -842,10 +929,30 @@ impl Context {
         self.inner.registry.stalled_fibers(timeout)
     }
 
+    /// Register a **kernel-internal** sync effect (bookkeeping): it is owned by
+    /// the fiber but does not count against the user `max_effects` quota.
     pub(crate) fn register_effect_labeled(
         &self,
         disposer: Disposer,
         label: &'static str,
+    ) -> Result<()> {
+        self.register_effect_with_origin(disposer, label, true)
+    }
+
+    /// Register a **user** sync effect (counts against `max_effects`).
+    pub(crate) fn register_user_effect_labeled(
+        &self,
+        disposer: Disposer,
+        label: &'static str,
+    ) -> Result<()> {
+        self.register_effect_with_origin(disposer, label, false)
+    }
+
+    fn register_effect_with_origin(
+        &self,
+        disposer: Disposer,
+        label: &'static str,
+        internal: bool,
     ) -> Result<()> {
         let node = EffectNode::new(label);
         self.attach_effect_node(&node)?;
@@ -853,6 +960,7 @@ impl Context {
             kind: EffectKind::Sync(disposer),
             meta: node,
             activation: 0,
+            internal,
         })
     }
 
@@ -876,7 +984,19 @@ impl Context {
         Ok(())
     }
 
+    /// Push one effect onto the fiber.
+    ///
+    /// `internal` marks kernel bookkeeping effects (service registrations,
+    /// listener accounting, internal hooks, ownership effects, …). The
+    /// supervision `max_effects` quota counts **user** effects only, so a host
+    /// can set `max_effects(1)` and still load a plugin (Q11).
     fn push_effect(&self, effect: FiberEffect) -> Result<()> {
+        // Read the origin marker unconditionally: the quota check below is
+        // `supervision`-gated, but the marker is part of the internal contract
+        // (and this keeps the field live in every feature combination).
+        let internal = effect.internal;
+        #[cfg(not(feature = "supervision"))]
+        let _ = internal;
         #[cfg(feature = "supervision")]
         let max_effects = self.inner.registry.quota_limits().max_effects;
         #[cfg(not(feature = "supervision"))]
@@ -899,8 +1019,18 @@ impl Context {
         fiber.effects.retain(Self::effect_is_live);
         #[cfg(feature = "supervision")]
         if let Some(max) = max_effects {
-            if fiber.effects.len() >= max {
-                return Err(CordisError::QuotaExceeded("effects".to_string()));
+            // Q11: only *user* effects count; kernel-internal bookkeeping
+            // effects (logger service provide, `ctx.plugin` ownership, listener
+            // accounting, internal hooks) never consume the host's budget.
+            if !internal {
+                let user_effects = fiber
+                    .effects
+                    .iter()
+                    .filter(|effect| !effect.internal)
+                    .count();
+                if user_effects >= max {
+                    return Err(CordisError::QuotaExceeded("effects".to_string()));
+                }
             }
         }
         let mut effect = effect;
@@ -959,6 +1089,7 @@ impl Context {
             kind: EffectKind::Sync(disposer.clone()),
             meta: node,
             activation: 0,
+            internal: false,
         })?;
         Ok(disposer)
     }
@@ -990,6 +1121,7 @@ impl Context {
             kind: EffectKind::Async(disposer.clone()),
             meta: node,
             activation: 0,
+            internal: false,
         })?;
         Ok(disposer)
     }
@@ -1147,6 +1279,8 @@ impl Context {
         }
         let id = self.inner.registry.next_id();
         let name = plugin.name();
+        let tree_clock = self.clock();
+        let started_ms = tree_clock.now_monotonic_ms();
         let data: FiberRef = Arc::new(Mutex::new(FiberData {
             id,
             state: FiberState::Pending,
@@ -1167,7 +1301,8 @@ impl Context {
             dispose_requested: std::sync::atomic::AtomicBool::new(false),
             cancel_requested: std::sync::atomic::AtomicBool::new(false),
             listener_count: 0,
-            last_activity: Mutex::new(std::time::Instant::now()),
+            clock: tree_clock,
+            last_activity_ms: std::sync::atomic::AtomicU64::new(started_ms),
             activation_epoch: std::sync::atomic::AtomicU64::new(0),
             lifecycle_owner: std::sync::atomic::AtomicU64::new(0),
             lifecycle_depth: std::sync::atomic::AtomicUsize::new(0),
@@ -1596,6 +1731,7 @@ impl Context {
             kind: EffectKind::Async(disposer.clone()),
             meta: node,
             activation: 0,
+            internal: false,
         })?;
         Ok(disposer)
     }
@@ -1774,7 +1910,9 @@ impl Context {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .unwrap_or_else(|| self.plugin_name());
-        self.inner.logger.logger_with(name, config_level(&config))
+        self.inner
+            .logger
+            .logger_with_clock(name, config_level(&config), self.clock())
     }
 
     /// Cordis `ctx.logger(name)`: a named logger facade.
@@ -1782,7 +1920,7 @@ impl Context {
         let config = self.resolve_config("logger", None, None);
         self.inner
             .logger
-            .logger_with(name.to_string(), config_level(&config))
+            .logger_with_clock(name.to_string(), config_level(&config), self.clock())
     }
 
     /// The shared logging service (`ctx.get(LOGGER)` also resolves it).
@@ -1935,6 +2073,7 @@ impl Context {
                     }
                 }
             }
+            ctx.inner.registry.note_service_changed(name);
             ctx.refresh_dependents();
         })]);
         self.register_effect_labeled(disposer.clone(), "ctx.set")?;
@@ -1944,14 +2083,23 @@ impl Context {
 
     /// Mark every service provided by `owner` as withdrawn so dependents
     /// deactivate before the binding disappears (provider-withdrawal order).
-    pub(crate) fn withdraw_owner_services(&self, owner: u64) {
+    ///
+    /// Returns the withdrawn service **names** for the caller (S3): the fiber
+    /// side uses them as the cascade candidate set and to invalidate its
+    /// dependency index. A service may be withdrawn more than once (idempotent);
+    /// every service owned by `owner` is reported so a re-entrant withdrawal
+    /// cannot lose a name.
+    pub(crate) fn withdraw_owner_services(&self, owner: u64) -> Vec<String> {
+        let mut withdrawn = Vec::new();
         if let Ok(mut store) = self.inner.service_store.lock() {
-            for entry in store.values_mut() {
+            for ((_, name), entry) in store.iter_mut() {
                 if entry.owner == owner {
                     entry.withdrawn = true;
+                    withdrawn.push(name.clone());
                 }
             }
         }
+        withdrawn
     }
 
     fn check_set_target(&self, name: &str) -> Result<()> {
@@ -2010,26 +2158,36 @@ impl Context {
 
     fn write_service(&self, name: &str, value: &ServiceValue) -> Result<()> {
         let scope = self.service_scope(name).unwrap_or(0);
-        let mut store = self
-            .inner
-            .service_store
-            .lock()
-            .map_err(|_| CordisError::Disposed)?;
-        match store.get_mut(&(scope, name.to_string())) {
-            None => Err(CordisError::UnknownService(name.to_string())),
-            Some(entry) => {
-                // Defense in depth: `set_revertible` already type-checked before
-                // dispatching `internal/set`, but the terminal must not be able
-                // to mutate the entry into a different concrete type.
-                let incoming = crate::service::service_type_id(value);
-                if incoming != entry.type_id {
-                    return Err(Self::service_type_mismatch(name, entry.type_id, incoming));
+        let outcome = {
+            let mut store = self
+                .inner
+                .service_store
+                .lock()
+                .map_err(|_| CordisError::Disposed)?;
+            match store.get_mut(&(scope, name.to_string())) {
+                None => Err(CordisError::UnknownService(name.to_string())),
+                Some(entry) => {
+                    // Defense in depth: `set_revertible` already type-checked
+                    // before dispatching `internal/set`, but the terminal must
+                    // not be able to mutate the entry into a different concrete
+                    // type.
+                    let incoming = crate::service::service_type_id(value);
+                    if incoming != entry.type_id {
+                        Err(Self::service_type_mismatch(name, entry.type_id, incoming))
+                    } else {
+                        entry.value = value.clone();
+                        entry.version = crate::service::next_version();
+                        Ok(())
+                    }
                 }
-                entry.value = value.clone();
-                entry.version = crate::service::next_version();
-                Ok(())
             }
+        };
+        // S4: a value/version change invalidates the derived dependency index
+        // for this name (notified outside the service-store lock).
+        if outcome.is_ok() {
+            self.inner.registry.note_service_changed(name);
         }
+        outcome
     }
 }
 
@@ -2043,6 +2201,52 @@ impl Context {
         let disposer = self.inner.events.internal().on_plugin(hook);
         self.register_effect_labeled(disposer.clone(), "ctx.on_internal_plugin")?;
         Ok(disposer)
+    }
+
+    /// Subscribe to fiber lifecycle transitions in this context tree.
+    ///
+    /// The listener receives one [`crate::internal::LifecycleEvent`] per state
+    /// transition
+    /// (`Pending -> Loading -> Active`, `Active -> Unloading -> Disposed`,
+    /// failure paths, …) for **every fiber** whose events flow through this
+    /// tree's internal hook bus (install it on the root context to observe the
+    /// whole kernel).
+    ///
+    /// Unlike [`Context::on_internal_status`], the subscription is **not owned
+    /// by the calling fiber**: it keeps firing after that fiber unloads, so
+    /// embedder-level observers (metrics, shutdown coordination) can outlive the
+    /// fiber that installed them.
+    ///
+    /// **Ownership of the returned [`Disposer`]:** it is a single-owner handle.
+    /// Disposing it unsubscribes. Dropping the **last** handle is equivalent to
+    /// disposing it — [`crate::Disposer`]'s `Drop` safety net runs the cleanup
+    /// when its strong count reaches one, so a dropped subscription does **not**
+    /// keep firing. To keep the subscription alive for the process lifetime,
+    /// store the `Disposer` (e.g. in the embedder's shutdown state) and dispose
+    /// it explicitly at shutdown; if you only need it scoped to a block/fiber,
+    /// dropping it is already the correct unsubscribe.
+    ///
+    /// Listener panics are contained and logged; other subscribers still run, and
+    /// multiple listeners are supported.
+    ///
+    /// This is a thin, general wrapper over the `internal/status` hook: it adds
+    /// none of the fiber-bound lifecycle semantics, see
+    /// [`Context::on_internal_status`] for the raw hook.
+    pub fn on_lifecycle(&self, listener: crate::internal::LifecycleListener) -> Result<Disposer> {
+        let hook: StatusHook = Arc::new(move |fiber: &Fiber, old: FiberState| {
+            let event = crate::internal::LifecycleEvent {
+                fiber_id: fiber.id(),
+                name: fiber.name(),
+                from: old,
+                to: fiber.state(),
+            };
+            crate::internal::contained("zeokeel_cordis::context", "lifecycle listener", (), || {
+                listener(&event)
+            });
+        });
+        // Deliberately NOT registered as a fiber effect: the subscription must
+        // survive the installing fiber (see the doc comment).
+        Ok(self.inner.events.internal().on_status(hook))
     }
 
     /// Register an `internal/status` hook owned by the current fiber.

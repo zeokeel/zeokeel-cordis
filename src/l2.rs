@@ -73,8 +73,14 @@ impl IsolationCapabilities {
 /// rolls back through the normal failure path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FiberQuota {
-    /// Maximum live effects owned by one fiber (includes listeners, child-fiber
-    /// ownership effects and user effects).
+    /// Maximum live **user** effects owned by one fiber.
+    ///
+    /// Q11: only user effects count (`ctx.effect*`, `ctx.on*`,
+    /// `effect_future*`, `effect_stream`). Kernel-internal effects (the root
+    /// logger service, child-fiber ownership effects, internal lifecycle
+    /// registrations) are marked `internal` and never consume a quota slot, so
+    /// `max_effects(1)` can still load a plugin. Listeners are counted through
+    /// [`FiberQuota::max_listeners`] instead.
     pub max_effects: Option<usize>,
     /// Maximum live event listeners registered on one fiber's behalf.
     pub max_listeners: Option<usize>,

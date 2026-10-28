@@ -176,6 +176,23 @@ impl Events {
     }
 
     /// The typed `internal/*` hook bus attached to this event bus.
+    ///
+    /// # Two entry points (ownership matters)
+    ///
+    /// - `Context::on_internal_*` — the **recommended** API: the hook is
+    ///   owned by the calling fiber, so it is removed automatically when that
+    ///   fiber unloads/restarts, and it follows the usual effect ordering.
+    /// - `Events::internal()` — the **raw bus**, for embedder-level tooling
+    ///   (tracing/metrics bridges, tests) that must outlive any single fiber or
+    ///   that already owns the [`Events`] handle. Hooks registered here are
+    ///   **not** fiber-owned: nothing removes them on unload, the caller must
+    ///   dispose the returned [`crate::Disposer`] explicitly.
+    ///
+    /// Both entry points register into the same ordered hook list (one shared
+    /// bus per context tree), so raw and fiber-owned hooks observe the same
+    /// events in registration order. `internal/*` names never recurse into the
+    /// bus itself. The raw-bus surface is **advanced/unstable**: prefer the
+    /// context methods unless you specifically need a non-fiber-bound hook.
     pub fn internal(&self) -> &Arc<InternalBus> {
         &self.internal
     }

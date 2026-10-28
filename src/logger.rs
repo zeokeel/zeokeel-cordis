@@ -21,7 +21,6 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 
@@ -154,11 +153,26 @@ impl LoggerService {
     }
 
     /// Create a named logger at the service threshold.
+    ///
+    /// The facade uses [`crate::SystemClock`] for record timestamps; context
+    /// loggers obtain an injectable clock through [`crate::Context::logger`].
     pub fn logger(self: &Arc<Self>, name: impl Into<String>) -> Logger {
+        self.logger_with_clock(name, None, Arc::new(crate::clock::SystemClock))
+    }
+
+    /// Create a named logger with an explicit level override and time source
+    /// (used by [`crate::Context::logger`] / [`crate::Context::logger_named`]).
+    pub(crate) fn logger_with_clock(
+        self: &Arc<Self>,
+        name: impl Into<String>,
+        level: Option<LogLevel>,
+        clock: Arc<dyn crate::clock::Clock>,
+    ) -> Logger {
         Logger {
             service: Arc::clone(self),
             name: name.into(),
-            level: None,
+            level,
+            clock,
         }
     }
 
@@ -168,11 +182,7 @@ impl LoggerService {
         name: impl Into<String>,
         level: Option<LogLevel>,
     ) -> Logger {
-        Logger {
-            service: Arc::clone(self),
-            name: name.into(),
-            level,
-        }
+        self.logger_with_clock(name, level, Arc::new(crate::clock::SystemClock))
     }
 
     /// Register an exporter; the returned disposer removes it (idempotent).
@@ -199,26 +209,36 @@ impl LoggerService {
 
     /// Emit one record. Level filtering happens here; exporters are called
     /// outside the exporter lock.
+    ///
+    /// Timestamps come from [`crate::SystemClock`]; context loggers use their
+    /// injected [`crate::Clock`] instead (see [`crate::Context::set_clock`]).
     pub fn log(&self, level: LogLevel, name: &str, message: &str, fields: Value) {
-        self.log_with_threshold(level, self.level(), name, message, fields);
+        self.log_with_clock(
+            level,
+            self.level(),
+            name,
+            message,
+            fields,
+            &crate::clock::SystemClock,
+        );
     }
 
-    /// Emit one record against an explicit threshold (used by facades that
-    /// override the service level through `ctx.intercept("logger", ...)`).
-    pub(crate) fn log_with_threshold(
+    /// Emit one record against an explicit threshold and time source.
+    pub(crate) fn log_with_clock(
         &self,
         level: LogLevel,
         threshold: LogLevel,
         name: &str,
         message: &str,
         fields: Value,
+        clock: &dyn crate::clock::Clock,
     ) {
         if level.as_u8() > threshold.as_u8() {
             return;
         }
         let record = LogRecord {
             seq: self.seq.fetch_add(1, Ordering::Relaxed) + 1,
-            ts_unix_ms: now_unix_ms(),
+            ts_unix_ms: clock.now_unix_ms(),
             name: name.to_string(),
             level,
             message: message.to_string(),
@@ -279,12 +299,28 @@ impl LoggerService {
     }
 }
 
-/// A named logging facade handed out by [`LoggerService::logger`].
+/// A named logging facade handed out by [`LoggerService::logger`] /
+/// [`crate::Context::logger`].
+///
+/// # Clock snapshot
+///
+/// A facade captures its time source **at creation**: [`Context::set_clock`]
+/// only affects facades created afterwards. Re-acquire the facade after
+/// installing a clock if it must stamp records with the injected time (plugin
+/// code usually gets its logger during activation, i.e. after the host installed
+/// the clock). The raw [`LoggerService::logger`] constructor uses
+/// [`crate::SystemClock`].
+///
+/// [`Context::set_clock`]: crate::Context::set_clock
 #[derive(Clone)]
 pub struct Logger {
     service: Arc<LoggerService>,
     name: String,
     level: Option<LogLevel>,
+    /// Time source of the context tree that created this facade (see
+    /// [`crate::Clock`]); the raw [`LoggerService::logger`] constructor uses
+    /// [`crate::SystemClock`].
+    clock: Arc<dyn crate::clock::Clock>,
 }
 
 impl Logger {
@@ -309,17 +345,23 @@ impl Logger {
             service: Arc::clone(&self.service),
             name: format!("{}.{}", self.name, name),
             level: self.level,
+            clock: Arc::clone(&self.clock),
         }
     }
 
     /// Emit a record at `level`, honoring this facade's threshold override.
     pub fn log(&self, level: LogLevel, message: &str, fields: Value) {
-        match self.level {
-            Some(threshold) => self
-                .service
-                .log_with_threshold(level, threshold, &self.name, message, fields),
-            None => self.service.log(level, &self.name, message, fields),
-        }
+        let threshold = self.level.unwrap_or_else(|| self.service.level());
+        self.service
+            .log_with_clock(level, threshold, &self.name, message, fields, &*self.clock);
+    }
+
+    /// The time source snapshot used for this facade's record timestamps.
+    ///
+    /// Facades snapshot the clock when they are created; see the type-level
+    /// documentation for the [`crate::Context::set_clock`] interaction.
+    pub fn clock(&self) -> Arc<dyn crate::clock::Clock> {
+        Arc::clone(&self.clock)
     }
 
     pub fn error(&self, message: &str, fields: Value) {
@@ -377,13 +419,6 @@ impl LogExporter for TracingExporter {
 
 /// The built-in logger service key (`ctx.get(LOGGER)`).
 pub const LOGGER: ServiceKey<LoggerService> = ServiceKey::new("logger");
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 fn fields_as_map(fields: Value) -> Map<String, Value> {
     match fields {

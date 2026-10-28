@@ -55,6 +55,7 @@ compile_error!(
 );
 
 pub mod async_effects;
+pub mod clock;
 pub mod config;
 pub mod context;
 pub mod effect;
@@ -72,6 +73,7 @@ pub mod service;
 pub mod waterfall;
 
 pub use async_effects::{cleanup_async, AsyncCleanup, AsyncDisposer, AsyncEffect};
+pub use clock::{Clock, SystemClock};
 pub use config::{ConfigSchema, JsonConfigSchema, JsonType, ValidationError};
 pub use context::Context;
 pub use effect::{cleanup, Cleanup, Disposer, Effect};
@@ -81,14 +83,14 @@ pub use exec::{block_on, boxed, set_blocking_executor, yield_now, BlockingExecut
 pub use fiber::{EffectMeta, Fiber, FiberState, Settled};
 pub use internal::{
     ConfigHook, ConfigNext, DispatchHook, DispatchInfo, DispatchMode, GetHook, GetNext,
-    InternalBus, ListenerHook, ListenerOverride, ListenerRequest, PluginHook, ServiceHook, SetHook,
-    SetNext, StatusHook, UpdateHook, UpdateNext,
+    InternalBus, LifecycleEvent, LifecycleListener, ListenerHook, ListenerOverride,
+    ListenerRequest, PluginHook, ServiceHook, SetHook, SetNext, StatusHook, UpdateHook, UpdateNext,
 };
 #[cfg(feature = "supervision")]
 pub use l2::{FiberQuota, IsolationCapabilities, StalledFiber};
 pub use logger::{LogExporter, LogLevel, LogRecord, Logger, LoggerService, TracingExporter};
 pub use reflect::{Accessor, AccessorGet, AccessorSet, ContextMeta};
-pub use registry::{AsyncPlugin, Plugin, PluginKey, PluginKind, PluginRuntime, Registry};
+pub use registry::{AsyncPlugin, IdleWait, Plugin, PluginKey, PluginRuntime, Registry};
 pub use service::{
     provide_service, AvailabilityCheck, Service, ServiceGate, ServiceKey, ServiceValue,
 };
