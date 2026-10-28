@@ -166,3 +166,36 @@ fn resolve_config_without_schema_shallow_merges() {
         "parent intercepts stay untouched by children"
     );
 }
+
+/// A hook that replaces the config with a schema-invalid value must reject the
+/// whole update (and restore the retained raw config) instead of storing it and
+/// failing later on activation.
+#[test]
+fn update_hook_replacement_is_validated() {
+    let root = Context::root();
+    let plugin = Arc::new(ConfigPlugin::new());
+    let fiber = root
+        .plugin(plugin.clone(), json!({"model": "a"}))
+        .expect("plugin fiber");
+    let _hook = root
+        .on_internal_update(Arc::new(
+            |_fiber: &cordis::Fiber, _config: Value, _no_save: bool, next: &cordis::UpdateNext| {
+                // Replace with a value that violates the plugin's schema.
+                next.next(json!({"model": 42}), false);
+            },
+        ))
+        .expect("update hook");
+
+    let error = fiber
+        .update(json!({"model": "b"}))
+        .expect_err("invalid hook replacement must reject the update");
+    assert!(matches!(error, CordisError::Validation(_)), "{error:?}");
+    assert_eq!(fiber.state(), FiberState::Active, "fiber was not reloaded");
+    assert_eq!(plugin.runs(), 1, "activation count unchanged");
+    assert_eq!(
+        fiber.raw_config(),
+        json!({"model": "a"}),
+        "raw config restored"
+    );
+    assert_eq!(fiber.config()["model"], json!("a"));
+}

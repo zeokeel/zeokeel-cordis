@@ -504,6 +504,8 @@ let fibers = root.registry().replace(
 - `restart` / `update` / `dispose` 是**阻塞边界**：在异步宿主里优先用 `*_async` 变体；
 - 生命周期操作互斥，跨线程并发会得到 `LifecycleBusy`；
 - `update` 的配置会被校验，然后作为下一轮激活的 raw config（重新解析一次，不叠加）；
+  `internal/update` hook 替换出的配置也会在 `update` 返回前用 schema 校验，非法则返回 `Validation`
+  并恢复旧 raw config、不重启（v0.3.0 起）；
 - `Registry::replace` 是原子的：任一 fiber 拒绝 reload 时整体回滚；
 - disposed fiber 不能重启（Disposed 是终态）。
 

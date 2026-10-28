@@ -543,6 +543,7 @@ impl Fiber {
         let Some(ctx) = ctx else {
             return Err(CordisError::Disposed);
         };
+        let previous_raw = self.raw_config();
         let raw = config.clone();
         let resolved = ctx.events().internal().waterfall_config(self, raw.clone());
         let config = validate_config(&plugin, resolved).map_err(CordisError::Validation)?;
@@ -551,7 +552,11 @@ impl Fiber {
         self.store_raw_config(raw);
         let this = self.clone();
         let passed = config.clone();
-        ctx.events().internal().waterfall_update(
+        let schema_plugin = plugin.clone();
+        let rejected: std::sync::Arc<std::sync::Mutex<Option<crate::config::ValidationError>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let rejected_for_hook = rejected.clone();
+        let proceeded = ctx.events().internal().waterfall_update(
             self,
             config,
             false,
@@ -561,12 +566,29 @@ impl Fiber {
                 // (and is resolved once on restart). A pass-through must not be
                 // stored, or derived values would compound (CORE-040).
                 if replaced != passed {
-                    this.store_raw_config(replaced);
+                    // A replacement must itself be schema-valid before it can
+                    // become the next raw config; otherwise reject the whole
+                    // update instead of failing later on activation.
+                    match validate_config(&schema_plugin, replaced.clone()) {
+                        Ok(_) => this.store_raw_config(replaced),
+                        Err(error) => {
+                            if let Ok(mut slot) = rejected_for_hook.lock() {
+                                *slot = Some(error);
+                            }
+                            return false;
+                        }
+                    }
                 }
-                let _ = this.restart();
                 true
             },
         );
+        if let Some(error) = rejected.lock().ok().and_then(|mut slot| slot.take()) {
+            self.store_raw_config(previous_raw);
+            return Err(CordisError::Validation(error));
+        }
+        if proceeded {
+            self.restart()?;
+        }
         finalize_requested_dispose(&self.data);
         Ok(())
     }
@@ -587,23 +609,40 @@ impl Fiber {
         let Some(ctx) = ctx else {
             return Err(CordisError::Disposed);
         };
+        let previous_raw = self.raw_config();
         let raw = config.clone();
         let resolved = ctx.events().internal().waterfall_config(self, raw.clone());
         let config = validate_config(&plugin, resolved).map_err(CordisError::Validation)?;
         self.store_raw_config(raw);
         let this = self.clone();
         let passed = config.clone();
+        let schema_plugin = plugin.clone();
+        let rejected: std::sync::Arc<std::sync::Mutex<Option<crate::config::ValidationError>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let rejected_for_hook = rejected.clone();
         let proceeded = ctx.events().internal().waterfall_update(
             self,
             config,
             false,
             &move |replaced, _no_save| {
                 if replaced != passed {
-                    this.store_raw_config(replaced);
+                    match validate_config(&schema_plugin, replaced.clone()) {
+                        Ok(_) => this.store_raw_config(replaced),
+                        Err(error) => {
+                            if let Ok(mut slot) = rejected_for_hook.lock() {
+                                *slot = Some(error);
+                            }
+                            return false;
+                        }
+                    }
                 }
                 true
             },
         );
+        if let Some(error) = rejected.lock().ok().and_then(|mut slot| slot.take()) {
+            self.store_raw_config(previous_raw);
+            return Err(CordisError::Validation(error));
+        }
         if proceeded {
             self.restart_async().await?;
         }

@@ -7,7 +7,7 @@
 
 [![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](#环境要求)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-311%20passed-brightgreen.svg)](#质量与测试)
+[![Tests](https://img.shields.io/badge/tests-312%20passed-brightgreen.svg)](#质量与测试)
 
 ---
 
@@ -350,7 +350,7 @@ Context 树（不可变、可派生）
 
 ## 质量与测试
 
-- **311 个测试、31 个测试套件**全部通过：`cargo test`
+- **312 个测试、31 个测试套件**全部通过：`cargo test`
 - 代码风格与静态检查：`cargo fmt --check && cargo clippy --all-targets -- -D warnings`
 - `spec/CORDIS-CORE.md` 中的每个 `CORE-0xx` 用例都在 `tests/` 中有对应测试；
 - 除常规单测外，还有 8 轮独立对抗性测试套件（panic / abort / hang / 并发 / 泄漏 / 语义 parity），
@@ -408,8 +408,9 @@ v0.2.0 引入异步插件与阻塞执行器钩子；v0.1.0 为初始内核。
   会 park 当前线程，在单线程 tokio runtime 上可能死锁。请安装
   `exec::set_blocking_executor`（首个安装生效）或改用 `*_async` API。
 - **生命周期调用是互斥而非排队**：跨线程并发调用返回 `LifecycleBusy`，宿主需自行重试或串行化。
-- **`update` 先校验后跑 `internal/update` waterfall**：hook 若替换出非法配置，会在下一次激活时失败
-  （此时 `update` 已返回 Ok）；hook 作者应返回 schema 合法配置。
+- **`update` 会校验 hook 替换出的配置**（v0.3.0 起）：`internal/update` hook 替换的配置会先用插件 schema
+  校验，非法时 `update` 返回 `Validation`、恢复旧 raw config 且不重启；通过后作为下一轮激活的 raw config
+  （只解析一次，不叠加）。
 - **`ctx.effect` 有所有权窗口**：effect 体在挂到 fiber 之前执行；体内注册的东西归 fiber 所有，
   不归正在创建的这条 effect 所有。
 - **取消卸载只丢失「正在 await 的那一个」清理 future**：未开始的清理会被恢复并在下次 dispose 时
