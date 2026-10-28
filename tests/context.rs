@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use cordis::{Context, CordisError, Disposer, Plugin, Result, ServiceKey, ServiceValue};
+use zeokeel_cordis::{Context, CordisError, Disposer, Plugin, Result, ServiceKey, ServiceValue};
 
 static GREETING: ServiceKey<String> = ServiceKey::new("greeting");
 static SCOPED: ServiceKey<String> = ServiceKey::new("scoped");
@@ -102,7 +102,7 @@ fn accessor_is_scoped_to_its_fiber() {
 #[test]
 fn extend_meta_attaches_metadata() {
     let root = Context::root();
-    let mut meta = cordis::ContextMeta::new();
+    let mut meta = zeokeel_cordis::ContextMeta::new();
     meta.insert("workspace", Arc::new("/tmp/project".to_string()));
     let child = root.extend_meta(meta);
     assert_eq!(

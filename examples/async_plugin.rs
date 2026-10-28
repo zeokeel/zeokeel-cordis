@@ -4,8 +4,8 @@
 
 use std::sync::Arc;
 
-use cordis::{block_on, cleanup_async, AsyncPlugin, BoxFuture, Context, Result};
 use serde_json::Value;
+use zeokeel_cordis::{block_on, cleanup_async, AsyncPlugin, BoxFuture, Context, Result};
 
 struct Ticker;
 

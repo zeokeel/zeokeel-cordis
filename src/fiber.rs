@@ -209,7 +209,7 @@ impl Drop for FiberData {
                     }
                 }
                 tracing::error!(
-                    target: "cordis::fiber",
+                    target: "zeokeel_cordis::fiber",
                     "fiber dropped during unwinding; async cleanups were not run"
                 );
             } else {
@@ -1081,7 +1081,7 @@ fn fail_fiber_sync_inner(data: &FiberRef, ctx: &Context, error: String, defer_as
         // keep the kernel alive (the activation itself already failed).
         let message = panic_message(payload.as_ref());
         tracing::error!(
-            target: "cordis::fiber",
+            target: "zeokeel_cordis::fiber",
             plugin = ctx.plugin_name().as_str(),
             "cleanup panicked during failed activation rollback: {message}"
         );
@@ -1123,7 +1123,7 @@ async fn fail_fiber_async(data: &FiberRef, ctx: &Context, error: String) {
     if let Some(payload) = first_panic {
         let message = panic_message(payload.as_ref());
         tracing::error!(
-            target: "cordis::fiber",
+            target: "zeokeel_cordis::fiber",
             plugin = ctx.plugin_name().as_str(),
             "cleanup panicked during failed async activation rollback: {message}"
         );
@@ -1581,7 +1581,7 @@ impl Drop for CancelSafeUnload<'_> {
             fiber.deferred_async.append(&mut self.deferred);
         }
         tracing::error!(
-            target: "cordis::fiber",
+            target: "zeokeel_cordis::fiber",
             "fiber unload cancelled mid-teardown; unstarted effects were restored"
         );
     }

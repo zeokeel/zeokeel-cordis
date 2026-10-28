@@ -419,7 +419,7 @@ impl Context {
             Ok(value) => Some(value),
             Err(payload) => {
                 tracing::error!(
-                    target: "cordis::context",
+                    target: "zeokeel_cordis::context",
                     "accessor read panicked: {}",
                     crate::fiber::panic_message(payload.as_ref())
                 );
@@ -838,8 +838,8 @@ impl Context {
     /// deterministic: when disposal returns, every resource is released.
     ///
     /// ```no_run
-    /// # use cordis::{cleanup_async, Context};
-    /// # async fn demo(ctx: &Context) -> cordis::Result<()> {
+    /// # use zeokeel_cordis::{cleanup_async, Context};
+    /// # async fn demo(ctx: &Context) -> zeokeel_cordis::Result<()> {
     /// let effect = ctx.effect_async(|| {
     ///     vec![cleanup_async(|| async {
     ///         // release the connection; the future resolves when it is gone
@@ -1246,8 +1246,8 @@ impl Context {
     /// during activation.
     ///
     /// ```no_run
-    /// # use cordis::{cleanup_async, Context};
-    /// # fn demo(ctx: &Context) -> cordis::Result<()> {
+    /// # use zeokeel_cordis::{cleanup_async, Context};
+    /// # fn demo(ctx: &Context) -> zeokeel_cordis::Result<()> {
     /// let effect = ctx.effect_future(
     ///     || async { Ok(vec![cleanup_async(|| async {})]) },
     ///     "ctx.effect_future(connect)",

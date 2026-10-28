@@ -1,6 +1,6 @@
 [package]
 name = "zeokeel-cordis"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"
@@ -11,10 +11,12 @@ keywords = ["cordis", "plugin", "plugin-system", "dependency-injection", "kernel
 categories = ["development-tools"]
 readme = "README.md"
 
-# Package name is zeokeel-cordis; the library target stays `cordis`, so
-# consumers write `use cordis::...` regardless of the published crate name.
-[lib]
-name = "cordis"
+# 库目标名由包名推导，即 `zeokeel_cordis`：与项目名保持一致，
+# 用户侧代码统一写 `use zeokeel_cordis::...`（无需显式 [lib] 覆盖）。
+
+[package.metadata.docs.rs]
+# docs.rs 以全部 feature 构建，`supervision` 的 L2 监督 API 也会出现在在线文档中。
+all-features = true
 
 [features]
 default = []

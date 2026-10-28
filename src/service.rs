@@ -127,7 +127,7 @@ impl<T: ?Sized + Send + Sync + 'static> Copy for ServiceKey<T> {}
 ///
 /// ```
 /// # use std::sync::Arc;
-/// # use cordis::{Context, ServiceGate, ServiceKey};
+/// # use zeokeel_cordis::{Context, ServiceGate, ServiceKey};
 /// static READY: ServiceKey<String> = ServiceKey::new("ready");
 /// let root = Context::root();
 /// let gate = ServiceGate::new(false);
@@ -204,7 +204,7 @@ impl ServiceGate {
 /// ```no_run
 /// use std::sync::Arc;
 ///
-/// use cordis::{Context, Disposer, Service};
+/// use zeokeel_cordis::{Context, Disposer, Service};
 ///
 /// struct Greeter;
 ///
@@ -214,8 +214,8 @@ impl ServiceGate {
 ///     }
 /// }
 ///
-/// fn start(ctx: &Context) -> cordis::Result<Disposer> {
-///     cordis::service::provide_service(ctx, Arc::new(Greeter))
+/// fn start(ctx: &Context) -> zeokeel_cordis::Result<Disposer> {
+///     zeokeel_cordis::service::provide_service(ctx, Arc::new(Greeter))
 /// }
 /// ```
 ///

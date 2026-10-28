@@ -237,15 +237,20 @@ impl LoggerService {
         for exporter in exporters {
             // A broken exporter must not skip the remaining exporters or the
             // buffer write below; each embedder call is contained separately.
-            let exporter_threshold =
-                crate::internal::contained("cordis::logger", "log exporter level()", None, || {
-                    exporter.level()
-                })
-                .unwrap_or(threshold);
+            let exporter_threshold = crate::internal::contained(
+                "zeokeel_cordis::logger",
+                "log exporter level()",
+                None,
+                || exporter.level(),
+            )
+            .unwrap_or(threshold);
             if level.as_u8() <= exporter_threshold.as_u8() {
-                crate::internal::contained("cordis::logger", "log exporter export()", (), || {
-                    exporter.export(&record)
-                });
+                crate::internal::contained(
+                    "zeokeel_cordis::logger",
+                    "log exporter export()",
+                    (),
+                    || exporter.export(&record),
+                );
             }
         }
         if self.buffer_size > 0 {

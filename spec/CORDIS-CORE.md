@@ -145,7 +145,7 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
 
 - `ctx.effect(body)` runs `body` immediately and owns its result. The body is
   `FnOnce() -> Effect` with `Effect = Vec<Cleanup>`: an empty vector means nothing
-  to clean up, and `cordis::cleanup(closure)` wraps one sync cleanup. The call
+  to clean up, and `zeokeel_cordis::cleanup(closure)` wraps one sync cleanup. The call
   returns `Result<Disposer>`; the disposer runs the cleanups in reverse order and
   is single-shot.
 - `ctx.effect_labeled(label, body)` is the same with an explicit diagnostics label.

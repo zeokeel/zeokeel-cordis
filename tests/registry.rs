@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use cordis::{cleanup, Context, FiberState, Plugin, PluginKey, Result};
+use zeokeel_cordis::{cleanup, Context, FiberState, Plugin, PluginKey, Result};
 
 struct Incrementer {
     name: &'static str,

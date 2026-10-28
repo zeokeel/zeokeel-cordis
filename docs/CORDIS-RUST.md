@@ -3,8 +3,8 @@
 Companion to `spec/CORDIS-CORE.md`. This file records how the Rust port relates to
 the JavaScript Cordis reference, what the Rust-only extensions add, which failures
 the kernel contains, and what the crate deliberately does not support. It is
-descriptive; the specification stays normative. Baseline: crate version `0.3.0`
-(tag `v0.3.0`).
+descriptive; the specification stays normative. Baseline: crate version `0.4.0`
+(tag `v0.4.0`).
 
 ## 1. Deliberate differences from the TypeScript reference
 

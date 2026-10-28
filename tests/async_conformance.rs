@@ -19,8 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use cordis::yield_now;
-use cordis::*;
+use zeokeel_cordis::yield_now;
+use zeokeel_cordis::*;
 
 type Trace = Arc<Mutex<Vec<&'static str>>>;
 

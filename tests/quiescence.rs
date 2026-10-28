@@ -4,8 +4,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cordis::{block_on, cleanup_async, yield_now, Context, CordisError, FiberState, Plugin};
 use serde_json::Value;
+use zeokeel_cordis::{
+    block_on, cleanup_async, yield_now, Context, CordisError, FiberState, Plugin,
+};
 
 struct Slow {
     delay: Duration,
@@ -16,7 +18,7 @@ impl Plugin for Slow {
         "quiescence-slow"
     }
 
-    fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         std::thread::sleep(self.delay);
         Ok(())
     }
@@ -65,7 +67,7 @@ impl Plugin for AsyncCleanupPlugin {
         "quiescence-async-cleanup"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let runs = self.runs.clone();
         ctx.effect_async(move || {
             vec![cleanup_async(move || {
@@ -108,7 +110,7 @@ impl Plugin for CheckpointPlugin {
         "quiescence-checkpoint"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         *self.captured.lock().unwrap() = Some(ctx);
         Ok(())
     }

@@ -5,8 +5,28 @@
 
 ## [Unreleased]
 
-**v0.3.x 功能冻结**：不再新增语义能力；仅接受 bugfix、安全修复、性能改进（不改变语义）
+**v0.4.x 语义冻结**：不再新增语义能力；仅接受 bugfix、安全修复、性能改进（不改变语义）
 与文档修正。
+
+## [0.4.0] - 2026-10-28
+
+### Changed（破坏性）
+
+- **crate 名与导入路径统一**：库目标名由 `cordis` 改为 `zeokeel_cordis`，与包名
+  `zeokeel-cordis` 及项目名一致。用户侧代码由 `use cordis::...` 改为
+  `use zeokeel_cordis::...`。这是 0.4.0 唯一的破坏性变更（0.3.0 发布后无下游依赖，
+  实际影响为零）。
+- 日志 `target` 前缀随 crate 名统一为 `zeokeel_cordis::*`（`fiber`、`internal`、
+  `config`、`events`、`context`、`logger`、`reflect`、`containment`），方便按 crate
+  名过滤日志。
+- docs.rs 改用全部 feature 构建（`[package.metadata.docs.rs] all-features = true`），
+  `supervision` feature 的 L2 监督 API 也会出现在在线文档
+  <https://docs.rs/zeokeel-cordis> 中。
+
+### Docs
+
+- README、`docs/GUIDE.md`、`docs/CORDIS-RUST.md` 的安装与导入示例同步为新名称；
+  README 增加 crates.io / docs.rs 徽章。
 
 ## [0.3.0] - 2026-10-28
 

@@ -90,7 +90,7 @@ fn call_sync(name: &str, callback: &ListenerFn, args: &[Value]) -> EventResult {
         Ok(result) => result,
         Err(_) => {
             tracing::error!(
-                target: "cordis::events",
+                target: "zeokeel_cordis::events",
                 event = name,
                 "event listener panicked; dispatch continues"
             );
@@ -102,7 +102,7 @@ fn call_sync(name: &str, callback: &ListenerFn, args: &[Value]) -> EventResult {
 /// Report a panic captured from an async listener (future construction or poll).
 fn report_async_panic(name: &str, stage: &'static str, payload: crate::exec::PanicPayload) {
     tracing::error!(
-        target: "cordis::events",
+        target: "zeokeel_cordis::events",
         event = name,
         stage = stage,
         panic = %crate::internal::panic_message(payload.as_ref()),
@@ -485,7 +485,7 @@ impl Events {
             Ok(value) => value,
             Err(payload) => {
                 tracing::error!(
-                    target: "cordis::events",
+                    target: "zeokeel_cordis::events",
                     event = name,
                     panic = %crate::internal::panic_message(payload.as_ref()),
                     "async waterfall listener panicked; using the default value"

@@ -6,8 +6,8 @@
 //! an async cleanup as a boxed future factory:
 //!
 //! ```no_run
-//! # use cordis::{Context, cleanup_async};
-//! # fn demo(ctx: &Context) -> cordis::Result<()> {
+//! # use zeokeel_cordis::{Context, cleanup_async};
+//! # fn demo(ctx: &Context) -> zeokeel_cordis::Result<()> {
 //! ctx.effect_async(|| {
 //!     vec![cleanup_async(|| async {
 //!         // release the resource; the future resolves when it is gone
@@ -127,7 +127,7 @@ impl Drop for CancelSafeDrain<'_> {
                 }
             }
             tracing::error!(
-                target: "cordis::fiber",
+                target: "zeokeel_cordis::fiber",
                 "async disposer cancelled mid-teardown; unstarted cleanups were restored"
             );
         }
@@ -240,7 +240,7 @@ impl Drop for AsyncDisposer {
             // them from Drop would block an async worker or run outside the
             // runtime. A later explicit dispose retries them.
             tracing::error!(
-                target: "cordis::fiber",
+                target: "zeokeel_cordis::fiber",
                 "cancelled async effect dropped; restored cleanups were discarded"
             );
             return;
@@ -253,7 +253,7 @@ impl Drop for AsyncDisposer {
         if std::thread::panicking() {
             let _ = self.inner.lock().map(|mut slot| slot.take());
             tracing::error!(
-                target: "cordis::fiber",
+                target: "zeokeel_cordis::fiber",
                 "async effect dropped during unwinding; its cleanups were not run"
             );
             return;

@@ -5,8 +5,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use cordis::{Context, FiberState, Plugin, Result, ServiceKey};
 use serde_json::Value;
+use zeokeel_cordis::{Context, FiberState, Plugin, Result, ServiceKey};
 
 struct Clock {
     started: Instant,

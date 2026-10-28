@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use cordis::*;
+use zeokeel_cordis::*;
 
 static GREETING: ServiceKey<String> = ServiceKey::new("greeting");
 

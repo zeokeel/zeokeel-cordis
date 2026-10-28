@@ -8,11 +8,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use cordis::{
+use serde_json::Value;
+use zeokeel_cordis::{
     ConfigSchema, Context, EventResult, FiberState, LogExporter, LogRecord, Plugin, ServiceKey,
     ServiceValue,
 };
-use serde_json::Value;
 
 static PROBE: ServiceKey<u32> = ServiceKey::new("containment.probe");
 static ACC: ServiceKey<u32> = ServiceKey::new("containment.acc");
@@ -24,7 +24,7 @@ impl Plugin for Noop {
         "containment-noop"
     }
 
-    fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         Ok(())
     }
 }
@@ -45,12 +45,12 @@ fn assert_kernel_usable(root: &Context) {
 fn internal_plugin_hook_panic_is_contained() {
     let root = Context::root();
     let ran = Arc::new(AtomicUsize::new(0));
-    root.on_internal_plugin(Arc::new(|_fiber: &cordis::Fiber| {
+    root.on_internal_plugin(Arc::new(|_fiber: &zeokeel_cordis::Fiber| {
         panic!("plugin hook boom")
     }))
     .unwrap();
     let ran_after = ran.clone();
-    root.on_internal_plugin(Arc::new(move |_fiber: &cordis::Fiber| {
+    root.on_internal_plugin(Arc::new(move |_fiber: &zeokeel_cordis::Fiber| {
         ran_after.fetch_add(1, Ordering::SeqCst);
     }))
     .unwrap();
@@ -67,14 +67,16 @@ fn internal_plugin_hook_panic_is_contained() {
 fn internal_status_hook_panic_is_contained() {
     let root = Context::root();
     let ran = Arc::new(AtomicUsize::new(0));
-    root.on_internal_status(Arc::new(|_fiber: &cordis::Fiber, _old: FiberState| {
-        panic!("status hook boom")
-    }))
+    root.on_internal_status(Arc::new(
+        |_fiber: &zeokeel_cordis::Fiber, _old: FiberState| panic!("status hook boom"),
+    ))
     .unwrap();
     let ran_after = ran.clone();
-    root.on_internal_status(Arc::new(move |_fiber: &cordis::Fiber, _old: FiberState| {
-        ran_after.fetch_add(1, Ordering::SeqCst);
-    }))
+    root.on_internal_status(Arc::new(
+        move |_fiber: &zeokeel_cordis::Fiber, _old: FiberState| {
+            ran_after.fetch_add(1, Ordering::SeqCst);
+        },
+    ))
     .unwrap();
 
     let fiber = root
@@ -112,12 +114,12 @@ fn internal_service_hook_panic_is_contained() {
 fn internal_dispatch_hook_panic_is_contained() {
     let root = Context::root();
     let ran = Arc::new(AtomicUsize::new(0));
-    root.on_internal_dispatch(Arc::new(|_info: &cordis::DispatchInfo| {
+    root.on_internal_dispatch(Arc::new(|_info: &zeokeel_cordis::DispatchInfo| {
         panic!("dispatch hook boom")
     }))
     .unwrap();
     let ran_after = ran.clone();
-    root.on_internal_dispatch(Arc::new(move |_info: &cordis::DispatchInfo| {
+    root.on_internal_dispatch(Arc::new(move |_info: &zeokeel_cordis::DispatchInfo| {
         ran_after.fetch_add(1, Ordering::SeqCst);
     }))
     .unwrap();
@@ -131,9 +133,10 @@ fn internal_dispatch_hook_panic_is_contained() {
 fn internal_get_hook_panic_falls_through() {
     let root = Context::root();
     root.on_internal_get(Arc::new(
-        |_ctx: &Context, _name: &str, _next: &cordis::GetNext<'_>| -> Option<ServiceValue> {
-            panic!("get hook boom")
-        },
+        |_ctx: &Context,
+         _name: &str,
+         _next: &zeokeel_cordis::GetNext<'_>|
+         -> Option<ServiceValue> { panic!("get hook boom") },
     ))
     .unwrap();
 
@@ -150,9 +153,10 @@ fn internal_get_hook_panic_falls_through() {
 fn internal_config_hook_panic_falls_through() {
     let root = Context::root();
     root.on_internal_config(Arc::new(
-        |_fiber: &cordis::Fiber, _config: Value, _next: &cordis::ConfigNext<'_>| -> Value {
-            panic!("config hook boom")
-        },
+        |_fiber: &zeokeel_cordis::Fiber,
+         _config: Value,
+         _next: &zeokeel_cordis::ConfigNext<'_>|
+         -> Value { panic!("config hook boom") },
     ))
     .unwrap();
 
@@ -213,7 +217,7 @@ fn parallel_async_listener_panic_is_contained() {
     })
     .unwrap();
 
-    cordis::block_on(root.events().parallel_async("containment.par", &[], None));
+    zeokeel_cordis::block_on(root.events().parallel_async("containment.par", &[], None));
     assert_eq!(hits.load(Ordering::SeqCst), 1, "other listeners still run");
     assert_kernel_usable(&root);
 }
@@ -236,7 +240,7 @@ fn serial_async_listener_panic_is_contained() {
     })
     .unwrap();
 
-    let bailed = cordis::block_on(root.events().serial_async("containment.ser", &[], None));
+    let bailed = zeokeel_cordis::block_on(root.events().serial_async("containment.ser", &[], None));
     assert!(bailed.is_none(), "a panicking listener does not bail");
     assert_eq!(hits.load(Ordering::SeqCst), 1, "other listeners still run");
     assert_kernel_usable(&root);
@@ -281,7 +285,7 @@ impl Plugin for SchemaPlugin {
         Some(Arc::new(BoomSchema))
     }
 
-    fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         Ok(())
     }
 }

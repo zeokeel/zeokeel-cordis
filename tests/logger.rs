@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use cordis::logger::LOGGER;
-use cordis::{
+use zeokeel_cordis::logger::LOGGER;
+use zeokeel_cordis::{
     Context, LogExporter, LogLevel, LogRecord, LoggerService, Plugin, Result, TracingExporter,
 };
 
@@ -96,7 +96,7 @@ fn logger_filters_and_exports() {
 #[test]
 fn logger_exporter_unloads_with_fiber() {
     struct ExportPlugin {
-        logger_slot: Arc<Mutex<Option<cordis::Logger>>>,
+        logger_slot: Arc<Mutex<Option<zeokeel_cordis::Logger>>>,
         exporter: Arc<CountingExporter>,
     }
 

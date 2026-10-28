@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use cordis::{
+use serde_json::Value;
+use zeokeel_cordis::{
     block_on, cleanup, AsyncPlugin, BoxFuture, ConfigSchema, Context, CordisError, EventResult,
     Fiber, FiberState, Plugin, PluginKey, ServiceKey,
 };
-use serde_json::Value;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -46,7 +46,7 @@ fn named(key: &'static str) -> PluginKey {
     PluginKey::Named(key)
 }
 
-fn fmt_replace(result: &cordis::Result<Vec<Fiber>>) -> String {
+fn fmt_replace(result: &zeokeel_cordis::Result<Vec<Fiber>>) -> String {
     match result {
         Ok(fibers) => format!("Ok({} fibers)", fibers.len()),
         Err(error) => format!("Err({error:?})"),
@@ -69,7 +69,7 @@ impl Plugin for SvcPlugin {
         self.label
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         if self.provides {
             ctx.provide(SVC, Arc::new(self.value))?;
         }
@@ -96,7 +96,7 @@ impl Plugin for Noop {
         self.label
     }
 
-    fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         self.applies.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -117,15 +117,15 @@ impl Plugin for EchoConfig {
         self.schema.clone()
     }
 
-    fn apply(&self, _ctx: Context, config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, config: Value) -> zeokeel_cordis::Result<()> {
         self.seen.lock().unwrap().push(config);
         Ok(())
     }
 }
 
-fn config_marker_hook(root: &Context) -> cordis::Disposer {
+fn config_marker_hook(root: &Context) -> zeokeel_cordis::Disposer {
     root.on_internal_config(Arc::new(
-        |_fiber: &cordis::Fiber, config: Value, next: &cordis::ConfigNext| {
+        |_fiber: &zeokeel_cordis::Fiber, config: Value, next: &zeokeel_cordis::ConfigNext| {
             let mut value = next.next(config);
             if let Some(text) = value.as_str() {
                 value = serde_json::json!(format!("{text}|R"));
@@ -166,7 +166,7 @@ impl Plugin for Dependent {
         &["r6.svc"]
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         self.applies.fetch_add(1, Ordering::SeqCst);
         self.seen
             .lock()
@@ -299,7 +299,7 @@ impl Plugin for LeafPlugin {
         self.label
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let cleanups = self.cleanups.clone();
         ctx.effect(move || {
             vec![cleanup(move || {
@@ -321,7 +321,7 @@ impl Plugin for ParentV1 {
         self.label
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         ctx.plugin(self.leaf.clone(), Value::Null)?;
         let cleanups = self.cleanups.clone();
         ctx.effect(move || {
@@ -344,7 +344,7 @@ impl Plugin for ParentV2 {
         self.label
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         for _ in 0..self.leaves {
             ctx.plugin(
                 Arc::new(LeafPlugin {
@@ -429,7 +429,7 @@ impl Plugin for BlockSecondApply {
         "r6-block-a"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let call = self.applies.fetch_add(1, Ordering::SeqCst);
         ctx.provide(SVC, Arc::new(1u32))?;
         if call == 1 {
@@ -522,7 +522,7 @@ fn t05_replace_pending_fiber_waits_for_inject() {
             fn inject(&self) -> &'static [&'static str] {
                 &["r6.missing"]
             }
-            fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 Ok(())
             }
         }
@@ -564,7 +564,7 @@ fn t06_replace_failed_fiber_reloads() {
             fn name(&self) -> &'static str {
                 "r6-initially-failed"
             }
-            fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 Err(CordisError::InvalidPlugin("first boom".into()))
             }
         }
@@ -646,7 +646,7 @@ fn t08_replace_during_dispose_busy_settles_consistent() {
             fn name(&self) -> &'static str {
                 "r6-gated-dispose"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.provide(SVC, Arc::new(1u32))?;
                 let started = self.started.clone();
                 let release = self.release.clone();
@@ -883,7 +883,7 @@ fn t12_replace_unknown_and_same_key() {
             fn name(&self) -> &'static str {
                 "r6-same"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.provide(SVC, Arc::new(self.value))?;
                 Ok(())
             }
@@ -973,7 +973,7 @@ impl Plugin for FailingReplacement {
         self.label
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         ctx.provide(SVC, Arc::new(self.value))?;
         ctx.on("r6.fail.event", |_args| EventResult::Continue)?;
         let cleanups = self.cleanups.clone();
@@ -1074,7 +1074,7 @@ fn t16_replace_async_apply_error_rolls_back() {
                 &'a self,
                 ctx: Context,
                 _config: Value,
-            ) -> BoxFuture<'a, cordis::Result<()>> {
+            ) -> BoxFuture<'a, zeokeel_cordis::Result<()>> {
                 let applies = self.applies.clone();
                 Box::pin(async move {
                     applies.fetch_add(1, Ordering::SeqCst);
@@ -1128,7 +1128,7 @@ fn t17_multi_fiber_replace_one_apply_failure_is_consistent() {
             fn name(&self) -> &'static str {
                 self.label
             }
-            fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let call = self.calls.fetch_add(1, Ordering::SeqCst);
                 if call >= 1 {
                     return Err(CordisError::InvalidPlugin("second fiber boom".into()));
@@ -1205,7 +1205,7 @@ fn t18_mixed_api_replace_is_safe() {
                 &'a self,
                 ctx: Context,
                 _config: Value,
-            ) -> BoxFuture<'a, cordis::Result<()>> {
+            ) -> BoxFuture<'a, zeokeel_cordis::Result<()>> {
                 let value = self.value;
                 let applies = self.applies.clone();
                 Box::pin(async move {
@@ -1223,7 +1223,7 @@ fn t18_mixed_api_replace_is_safe() {
             fn name(&self) -> &'static str {
                 self.label
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.provide(SVC, Arc::new(self.value))?;
                 Ok(())
             }
@@ -1402,7 +1402,7 @@ fn t21_replace_child_fiber_under_parent() {
             fn name(&self) -> &'static str {
                 "r6-child-parent"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.plugin(self.child.clone(), Value::Null)?;
                 Ok(())
             }
@@ -1465,7 +1465,7 @@ fn t22_multi_fiber_replace_busy_does_not_migrate_registry() {
             fn name(&self) -> &'static str {
                 "r6-multi-busy-a"
             }
-            fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let call = self.applies.fetch_add(1, Ordering::SeqCst);
                 if call == 1 {
                     self.started.fetch_add(1, Ordering::SeqCst);

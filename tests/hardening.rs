@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use cordis::*;
+use zeokeel_cordis::*;
 
 type Trace = Arc<Mutex<Vec<&'static str>>>;
 

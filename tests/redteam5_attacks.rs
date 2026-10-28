@@ -14,11 +14,11 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
-use cordis::{
+use serde_json::Value;
+use zeokeel_cordis::{
     block_on, cleanup, cleanup_async, AsyncPlugin, BoxFuture, Context, CordisError, EventResult,
     Fiber, FiberState, Plugin, ServiceKey,
 };
-use serde_json::Value;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -116,7 +116,7 @@ impl Plugin for Leaf {
         "r5-leaf"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let cleanups = self.cleanups.clone();
         ctx.effect(move || {
             vec![cleanup(move || {
@@ -141,7 +141,7 @@ impl Plugin for AsyncLeaf {
         "r5-async-leaf"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let cleanups = self.cleanups.clone();
         ctx.effect_async(move || {
             vec![cleanup_async(move || {
@@ -167,7 +167,7 @@ impl Plugin for Loader {
         "r5-loader"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         for child in &self.children {
             ctx.plugin(child.clone(), Value::Null)?;
         }
@@ -367,7 +367,7 @@ impl Plugin for Chain {
         "r5-chain"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         if self.remaining > 0 {
             ctx.plugin(
                 Arc::new(Chain {
@@ -436,7 +436,7 @@ impl Plugin for FailingLoader {
         "r5-failing-loader"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         for child in &self.children {
             ctx.plugin(child.clone(), Value::Null)?;
         }
@@ -506,7 +506,7 @@ impl AsyncPlugin for AsyncFailingLoader {
         &'a self,
         ctx: Context,
         _config: Value,
-    ) -> BoxFuture<'a, cordis::Result<()>> {
+    ) -> BoxFuture<'a, zeokeel_cordis::Result<()>> {
         let children = self.children.clone();
         Box::pin(async move {
             for child in &children {
@@ -560,7 +560,7 @@ impl AsyncPlugin for AsyncCancelLoader {
         &'a self,
         ctx: Context,
         _config: Value,
-    ) -> BoxFuture<'a, cordis::Result<()>> {
+    ) -> BoxFuture<'a, zeokeel_cordis::Result<()>> {
         let cleanups = self.cleanups.clone();
         Box::pin(async move {
             ctx.plugin(
@@ -669,7 +669,7 @@ impl Plugin for FailChild {
         "r5-fail-child"
     }
 
-    fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         Err(CordisError::InvalidPlugin("child boom".into()))
     }
 }
@@ -717,7 +717,7 @@ fn c12_cross_loading_cycle_is_contained() {
             fn name(&self) -> &'static str {
                 "r5-cycle"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.plugin(Arc::new(Cycle), Value::Null)?;
                 Ok(())
             }
@@ -754,7 +754,7 @@ fn c13_deep_chain_is_contained() {
             fn name(&self) -> &'static str {
                 "r5-deep-chain"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 if self.remaining > 0 {
                     ctx.plugin(
                         Arc::new(DeepChain {
@@ -802,7 +802,7 @@ impl Plugin for RestartBomb {
         "r5-restart-bomb"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let call = self.applies.fetch_add(1, Ordering::SeqCst);
         let cleanups = self.cleanups.clone();
         ctx.effect(move || {
@@ -880,7 +880,7 @@ impl Plugin for GatedChild {
         "r5-gated-child"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let started = self.started.clone();
         let release = self.release.clone();
         let cleanups = self.cleanups.clone();
@@ -950,7 +950,7 @@ impl Plugin for GatedAsyncChild {
         "r5-gated-async-child"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         if let Some(gate) = self.gate.lock().unwrap().take() {
             let started = self.started.clone();
             let completed = self.completed.clone();
@@ -1050,7 +1050,7 @@ fn c17_dispose_child_from_parent_cleanup() {
             fn name(&self) -> &'static str {
                 "r5-parent-disposes-child"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let child = ctx.plugin(
                     Arc::new(Leaf {
                         cleanups: self.child_cleanups.clone(),
@@ -1119,7 +1119,7 @@ impl Plugin for PendingChild {
         &["r5.missing.service"]
     }
 
-    fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         Ok(())
     }
 }
@@ -1169,7 +1169,7 @@ impl Plugin for ProbeChild {
         "r5-probe-child"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         ctx.provide(PROBE_SERVICE, Arc::new(DropProbe(self.drops.clone())))?;
         ctx.on("r5.probe.event", |_args| EventResult::Continue)?;
         Ok(())

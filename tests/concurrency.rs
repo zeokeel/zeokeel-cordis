@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::Duration;
 
-use cordis::{
+use serde_json::Value;
+use zeokeel_cordis::{
     block_on, cleanup, cleanup_async, AsyncCleanup, AsyncDisposer, Cleanup, Context, CordisError,
     FiberState, Plugin,
 };
-use serde_json::Value;
 
 type Trace = Arc<Mutex<Vec<&'static str>>>;
 
@@ -64,7 +64,7 @@ impl Plugin for BlockingCleanup {
         "blocking-cleanup"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let started = self.started.clone();
         let release = self.release.clone();
         let fiber = ctx.fiber();
@@ -222,7 +222,7 @@ impl Plugin for EffectsPlugin {
         "effects"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         for effect in &self.sync {
             ctx.effect(effect)?;
         }

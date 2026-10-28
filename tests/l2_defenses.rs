@@ -6,8 +6,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cordis::{cleanup, Context, FiberQuota, FiberState, IsolationCapabilities, Plugin, Result};
 use serde_json::Value;
+use zeokeel_cordis::{
+    cleanup, Context, FiberQuota, FiberState, IsolationCapabilities, Plugin, Result,
+};
 
 #[test]
 fn isolation_capabilities_are_reported() {
@@ -83,8 +85,8 @@ impl Plugin for TooManyListeners {
     }
 
     fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
-        ctx.on("l2", |_| cordis::EventResult::Continue)?;
-        ctx.on("l2", |_| cordis::EventResult::Continue)?;
+        ctx.on("l2", |_| zeokeel_cordis::EventResult::Continue)?;
+        ctx.on("l2", |_| zeokeel_cordis::EventResult::Continue)?;
         Ok(())
     }
 }

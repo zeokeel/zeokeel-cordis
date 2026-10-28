@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use cordis::{
+use zeokeel_cordis::{
     ConfigNext, Context, DispatchInfo, EventResult, Fiber, FiberState, ListenerOverride,
     ListenerRequest, Plugin, Result, ServiceKey, UpdateNext,
 };
@@ -313,9 +313,9 @@ fn internal_get_and_set_waterfalls() {
     // get: a hook may resolve the read itself.
     let override_hook = root
         .on_internal_get(Arc::new(
-            |_ctx: &Context, name: &str, next: &cordis::GetNext<'_>| {
+            |_ctx: &Context, name: &str, next: &zeokeel_cordis::GetNext<'_>| {
                 if name == "injected" {
-                    Some(Arc::new("from-hook".to_string()) as cordis::ServiceValue)
+                    Some(Arc::new("from-hook".to_string()) as zeokeel_cordis::ServiceValue)
                 } else {
                     next.next()
                 }
@@ -339,7 +339,7 @@ fn internal_get_and_set_waterfalls() {
     let recording = Arc::clone(&writes);
     let forward = root
         .on_internal_set(Arc::new(
-            move |_ctx: &Context, _name: &str, _value: &_, next: &cordis::SetNext<'_>| {
+            move |_ctx: &Context, _name: &str, _value: &_, next: &zeokeel_cordis::SetNext<'_>| {
                 recording.fetch_add(1, Ordering::SeqCst);
                 next.next()
             },

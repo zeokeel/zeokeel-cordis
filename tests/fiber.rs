@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use cordis::{
+use zeokeel_cordis::{
     block_on, cleanup, cleanup_async, ConfigSchema, Context, CordisError, EffectMeta, FiberState,
     JsonConfigSchema, Plugin, Result,
 };
@@ -68,7 +68,7 @@ fn fiber_reports_effects_and_awaits_settlement() {
 #[test]
 fn effect_disposer_removes_its_meta_node() {
     struct OneEffectPlugin {
-        disposer: Arc<Mutex<Option<cordis::Disposer>>>,
+        disposer: Arc<Mutex<Option<zeokeel_cordis::Disposer>>>,
     }
 
     impl Plugin for OneEffectPlugin {

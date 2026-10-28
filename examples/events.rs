@@ -4,8 +4,8 @@
 
 use std::sync::Arc;
 
-use cordis::{waterfall_terminal, Context, EventResult, Plugin, Result};
 use serde_json::{json, Value};
+use zeokeel_cordis::{waterfall_terminal, Context, EventResult, Plugin, Result};
 
 struct Listeners;
 

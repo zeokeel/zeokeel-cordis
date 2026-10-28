@@ -25,12 +25,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cordis::{
+use serde_json::{json, Value};
+use zeokeel_cordis::{
     async_waterfall_terminal, block_on, cleanup, cleanup_async, waterfall_terminal, AsyncPlugin,
     BoxFuture, ConfigSchema, Context, CordisError, EventResult, Fiber, FiberState, LogExporter,
     LogRecord, Plugin, ServiceKey, ServiceValue,
 };
-use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -99,7 +99,7 @@ impl Plugin for NoopPlugin {
         "rt-noop"
     }
 
-    fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         Ok(())
     }
 }
@@ -134,7 +134,7 @@ impl Plugin for SlowSync {
         "rt01-slow-sync"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         if let Some(tx) = self.started.lock().unwrap().take() {
             let _ = tx.send(());
         }
@@ -239,7 +239,7 @@ impl AsyncPlugin for SlowAsync {
         &'a self,
         ctx: Context,
         _config: Value,
-    ) -> BoxFuture<'a, cordis::Result<()>> {
+    ) -> BoxFuture<'a, zeokeel_cordis::Result<()>> {
         Box::pin(async move {
             let early_cleanup = self.early_cleanup_ran.clone();
             ctx.effect_labeled("early", move || {
@@ -440,7 +440,7 @@ impl Plugin for PanicCleanupPlugin {
         "rt05-panic-cleanup"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         ctx.effect(|| vec![cleanup(|| panic!("cleanup boom"))])?;
         ctx.on("rt05.evt", |_args| EventResult::Continue)?;
         ctx.provide(RT05_KEY, Arc::new(1u32))?;
@@ -537,7 +537,7 @@ impl Plugin for FailAfterAsyncEffect {
         "rt07-deferred-async"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let cleanup_flag = self.cleanup_ran.clone();
         ctx.effect_async(move || {
             vec![cleanup_async(move || {
@@ -626,7 +626,7 @@ impl Plugin for MixedLaneRollback {
         "rt08-mixed-rollback"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let sync_log = self.log.clone();
         ctx.effect(move || {
             vec![cleanup(move || {
@@ -855,7 +855,7 @@ impl Plugin for RestartBomb {
         "rt13-restart-bomb"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         if call == 0 {
             ctx.on("rt13.evt", |_args| EventResult::Continue)?;
@@ -907,7 +907,7 @@ fn rt13_dispose_during_restart_apply_cannot_leave_a_zombie() {
             assert!(dispose.is_ok(), "dispose during restart must not panic");
             let dispose_result = dispose.expect("no panic");
             assert!(
-                matches!(dispose_result, Err(cordis::CordisError::LifecycleBusy)),
+                matches!(dispose_result, Err(zeokeel_cordis::CordisError::LifecycleBusy)),
                 "dispose during restart must be rejected with LifecycleBusy, got {dispose_result:?}"
             );
             assert_eq!(fiber.state(), FiberState::Loading);
@@ -1064,7 +1064,7 @@ impl Plugin for SchemaPlugin {
         Some(Arc::new(BoomSchema))
     }
 
-    fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         Ok(())
     }
 }
@@ -1132,7 +1132,7 @@ fn rt19_async_waterfall_panic_is_contained_and_stops_the_chain() {
     let root = Context::root();
     let terminal_ran = Arc::new(AtomicBool::new(false));
     root.on_waterfall_async("rt19.pipeline", |_args, _next| {
-        cordis::boxed(async { panic!("async middleware boom") })
+        zeokeel_cordis::boxed(async { panic!("async middleware boom") })
     })
     .expect("register panicking async middleware");
     let terminal_flag = terminal_ran.clone();
@@ -1176,7 +1176,7 @@ impl Plugin for NameBomb {
         }
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         ctx.on("rt21.evt", |_args| EventResult::Continue)?;
         Ok(())
     }

@@ -4,11 +4,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cordis::{
+use serde_json::Value;
+use zeokeel_cordis::{
     cleanup, cleanup_async, AsyncPlugin, BoxFuture, Context, FiberState, Plugin, PluginKey,
     ServiceKey,
 };
-use serde_json::Value;
 
 static SVC: ServiceKey<u32> = ServiceKey::new("replace-svc");
 
@@ -27,7 +27,7 @@ impl Plugin for ProviderA {
         "replace-a"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         ctx.provide(SVC, Arc::new(1u32))?;
         let trace = self.trace.clone();
         ctx.effect(move || vec![cleanup(move || trace.lock().unwrap().push("a-cleanup"))])?;
@@ -45,7 +45,7 @@ impl Plugin for ProviderB {
         "replace-b"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         ctx.provide(SVC, Arc::new(self.value))?;
         let trace = self.trace.clone();
         ctx.effect(move || vec![cleanup(move || trace.lock().unwrap().push("b-cleanup"))])?;
@@ -67,7 +67,7 @@ impl AsyncPlugin for ProviderBAsync {
         &'a self,
         ctx: Context,
         _config: Value,
-    ) -> BoxFuture<'a, cordis::Result<()>> {
+    ) -> BoxFuture<'a, zeokeel_cordis::Result<()>> {
         let value = self.value;
         let applied = self.applied.clone();
         Box::pin(async move {
@@ -98,7 +98,7 @@ impl Plugin for Dependent {
         &["replace-svc"]
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         self.applies.fetch_add(1, Ordering::SeqCst);
         if let Some(value) = ctx.get(SVC) {
             self.seen.lock().unwrap().push(*value);
@@ -183,7 +183,10 @@ fn replace_unknown_runtime_errors() {
         )
         .err()
         .expect("unknown key must fail");
-    assert!(matches!(error, cordis::CordisError::InvalidPlugin(_)));
+    assert!(matches!(
+        error,
+        zeokeel_cordis::CordisError::InvalidPlugin(_)
+    ));
 }
 
 #[test]
@@ -193,7 +196,7 @@ fn replace_async_plugin_via_registry() {
         .plugin(Arc::new(ProviderA { trace: trace() }), Value::Null)
         .expect("provider a");
     let applied = Arc::new(AtomicUsize::new(0));
-    let replaced = cordis::block_on(root.registry().replace_async(
+    let replaced = zeokeel_cordis::block_on(root.registry().replace_async(
         named("replace-a"),
         Arc::new(ProviderBAsync {
             value: 3,
@@ -229,7 +232,7 @@ fn replace_on_disposed_fiber_fails_safely() {
     // the missing runtime (or Disposed if it raced the finalization).
     assert!(matches!(
         error,
-        cordis::CordisError::InvalidPlugin(_) | cordis::CordisError::Disposed
+        zeokeel_cordis::CordisError::InvalidPlugin(_) | zeokeel_cordis::CordisError::Disposed
     ));
 }
 
@@ -252,7 +255,7 @@ fn replace_keeps_the_raw_config() {
         fn name(&self) -> &'static str {
             "replace-echo-config"
         }
-        fn apply(&self, _ctx: Context, config: Value) -> cordis::Result<()> {
+        fn apply(&self, _ctx: Context, config: Value) -> zeokeel_cordis::Result<()> {
             self.seen
                 .lock()
                 .unwrap()

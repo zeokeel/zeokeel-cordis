@@ -14,11 +14,11 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
-use cordis::{
+use serde_json::{json, Value};
+use zeokeel_cordis::{
     block_on, cleanup, cleanup_async, AsyncDisposer, AsyncPlugin, BoxFuture, Context, CordisError,
     Fiber, FiberState, Plugin, ServiceKey,
 };
-use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -104,7 +104,7 @@ impl Plugin for Gated {
         "r4-gated"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let started = self.started.clone();
         let release = self.release.clone();
         ctx.effect(move || {
@@ -183,7 +183,7 @@ impl Plugin for Simple {
         "r4-simple"
     }
 
-    fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         self.applies.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -299,7 +299,7 @@ fn r4_04_panic_in_cleanup_releases_the_lifecycle_slot() {
             fn name(&self) -> &'static str {
                 "r4-panic-cleanup"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.effect(|| vec![cleanup(|| panic!("cleanup boom"))])?;
                 Ok(())
             }
@@ -333,7 +333,7 @@ fn r4_05_panic_in_apply_during_restart_releases_the_slot() {
             fn name(&self) -> &'static str {
                 "r4-panic-apply"
             }
-            fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let calls = self.applies.fetch_add(1, Ordering::SeqCst);
                 if calls >= 1 {
                     panic!("apply boom");
@@ -378,7 +378,7 @@ fn r4_06_error_return_releases_the_slot() {
                 &'a self,
                 _ctx: Context,
                 _config: Value,
-            ) -> BoxFuture<'a, cordis::Result<()>> {
+            ) -> BoxFuture<'a, zeokeel_cordis::Result<()>> {
                 Box::pin(async { Ok(()) })
             }
         }
@@ -447,7 +447,7 @@ fn r4_08_reentrant_dispose_in_cleanup_is_safe() {
             fn name(&self) -> &'static str {
                 "r4-reentrant-dispose"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let trace = self.trace.clone();
                 ctx.effect(move || vec![cleanup(move || trace.lock().unwrap().push("old"))])?;
                 let trace = self.trace.clone();
@@ -499,7 +499,7 @@ fn r4_09_reentrant_restart_in_cleanup_does_not_leak_effects() {
             fn name(&self) -> &'static str {
                 "r4-reentrant-restart"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 self.applies.fetch_add(1, Ordering::SeqCst);
                 let fiber = ctx.fiber();
                 let cleanups = self.cleanups.clone();
@@ -569,7 +569,7 @@ fn r4_10_reentrant_update_in_cleanup_does_not_leak_effects() {
             fn name(&self) -> &'static str {
                 "r4-reentrant-update"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 self.applies.fetch_add(1, Ordering::SeqCst);
                 let fiber = ctx.fiber();
                 let cleanups = self.cleanups.clone();
@@ -633,7 +633,7 @@ fn r4_11_cross_fiber_dispose_from_cleanup() {
             fn name(&self) -> &'static str {
                 "r4-target"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let cleanups = self.cleanups.clone();
                 ctx.effect(move || {
                     vec![cleanup(move || {
@@ -648,7 +648,7 @@ fn r4_11_cross_fiber_dispose_from_cleanup() {
             fn name(&self) -> &'static str {
                 "r4-disposer"
             }
-            fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 Ok(())
             }
         }
@@ -701,7 +701,7 @@ fn r4_12_reentrant_async_dispose_in_async_cleanup() {
                 &'a self,
                 ctx: Context,
                 _config: Value,
-            ) -> BoxFuture<'a, cordis::Result<()>> {
+            ) -> BoxFuture<'a, zeokeel_cordis::Result<()>> {
                 let cell = self.cell.clone();
                 let results = self.results.clone();
                 Box::pin(async move {
@@ -762,7 +762,7 @@ fn r4_13_dispose_during_slow_apply_is_fenced_not_busy() {
             fn name(&self) -> &'static str {
                 "r4-slow-dispose"
             }
-            fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 self.started.fetch_add(1, Ordering::SeqCst);
                 let rx = self.release.lock().unwrap();
                 let _ = rx.recv_timeout(Duration::from_secs(5));
@@ -815,7 +815,7 @@ fn r4_14_restart_during_slow_apply_stays_consistent() {
             fn name(&self) -> &'static str {
                 "r4-slow-restart"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let call = self.applies.fetch_add(1, Ordering::SeqCst);
                 let cleanups = self.cleanups.clone();
                 ctx.effect(move || {
@@ -884,7 +884,7 @@ fn r4_15_stale_activation_failure_does_not_clobber_the_restart() {
             fn name(&self) -> &'static str {
                 "r4-stale-failure"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let call = self.applies.fetch_add(1, Ordering::SeqCst);
                 if call == 0 {
                     self.started.fetch_add(1, Ordering::SeqCst);
@@ -959,7 +959,7 @@ fn r4_16_cancelled_dispose_async_releases_the_slot() {
             fn name(&self) -> &'static str {
                 "r4-pending"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.effect_async(|| {
                     vec![cleanup_async(|| async {
                         std::future::pending::<()>().await;
@@ -1004,7 +1004,7 @@ fn r4_17_cancel_before_poll_and_after_disposed() {
             fn name(&self) -> &'static str {
                 "r4-noop"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.effect(|| vec![cleanup(|| {})])?;
                 Ok(())
             }
@@ -1040,7 +1040,7 @@ fn r5_01_cancel_at_second_await_preserves_order() {
             fn name(&self) -> &'static str {
                 "r5-mixed"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let trace = self.trace.clone();
                 ctx.effect(move || vec![cleanup(move || trace.lock().unwrap().push("s1"))])?;
                 let trace = self.trace.clone();
@@ -1181,7 +1181,7 @@ fn r5_04_cancel_before_first_poll_keeps_fiber_state() {
             fn name(&self) -> &'static str {
                 "r5-noop"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.effect(|| vec![cleanup(|| {})])?;
                 Ok(())
             }
@@ -1212,7 +1212,7 @@ fn r5_05_cancel_during_deferred_drain_runs_remaining() {
                 &'a self,
                 ctx: Context,
                 _config: Value,
-            ) -> BoxFuture<'a, cordis::Result<()>> {
+            ) -> BoxFuture<'a, zeokeel_cordis::Result<()>> {
                 let remaining = self.remaining_runs.clone();
                 Box::pin(async move {
                     ctx.effect_async(move || {
@@ -1286,7 +1286,7 @@ fn r5_06_fiber_cancel_with_reactor_remaining_must_not_hang() {
             fn name(&self) -> &'static str {
                 "r5-fiber-reactor"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let completed = self.completed.clone();
                 ctx.effect_async(move || {
                     vec![
@@ -1349,7 +1349,7 @@ fn r5_07_deferred_cancel_with_reactor_remaining_must_not_hang() {
                 &'a self,
                 ctx: Context,
                 _config: Value,
-            ) -> BoxFuture<'a, cordis::Result<()>> {
+            ) -> BoxFuture<'a, zeokeel_cordis::Result<()>> {
                 let completed = self.completed.clone();
                 Box::pin(async move {
                     ctx.effect_async(move || {
@@ -1411,7 +1411,7 @@ fn r5_08_cancel_outside_runtime_restores_remaining_cleanup() {
             fn name(&self) -> &'static str {
                 "r5-outside-runtime"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let completed = self.completed.clone();
                 let gate = self.gate.lock().unwrap().take().unwrap();
                 ctx.effect_async(move || {
@@ -1476,7 +1476,7 @@ fn r5_09_cancel_while_cleanup_would_panic() {
             fn name(&self) -> &'static str {
                 "r5-boom"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.effect_async(|| {
                     vec![cleanup_async(|| async {
                         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1517,7 +1517,7 @@ fn r5_10_cancel_loses_at_most_the_in_flight_cleanup() {
             fn name(&self) -> &'static str {
                 "r5-loss-bound"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let completed = self.completed.clone();
                 let started = self.started.clone();
                 ctx.effect_async(move || {
@@ -1584,7 +1584,7 @@ fn r5_11_cancel_then_busy_then_retry() {
             fn name(&self) -> &'static str {
                 "r5-pending"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.effect_async(|| {
                     vec![cleanup_async(|| async {
                         std::future::pending::<()>().await;

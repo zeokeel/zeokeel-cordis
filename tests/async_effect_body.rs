@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use cordis::{
+use zeokeel_cordis::{
     block_on, cleanup, cleanup_async, Context, CordisError, EffectMeta, FiberState, Plugin, Result,
 };
 

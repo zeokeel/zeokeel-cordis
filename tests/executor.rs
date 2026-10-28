@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use cordis::*;
+use zeokeel_cordis::*;
 
 struct CountingExecutor {
     runs: Arc<AtomicUsize>,

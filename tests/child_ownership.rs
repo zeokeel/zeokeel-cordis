@@ -5,8 +5,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use cordis::{cleanup, Context, FiberState, Plugin};
 use serde_json::Value;
+use zeokeel_cordis::{cleanup, Context, FiberState, Plugin};
 
 struct Leaf {
     cleanups: Arc<AtomicUsize>,
@@ -17,7 +17,7 @@ impl Plugin for Leaf {
         "leaf"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let cleanups = self.cleanups.clone();
         ctx.effect(move || {
             vec![cleanup(move || {
@@ -39,7 +39,7 @@ impl Plugin for Parent {
         "parent"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         for _ in 0..self.children {
             ctx.plugin(
                 Arc::new(Leaf {
@@ -49,7 +49,9 @@ impl Plugin for Parent {
             )?;
         }
         if self.fail {
-            return Err(cordis::CordisError::InvalidPlugin("boom".to_string()));
+            return Err(zeokeel_cordis::CordisError::InvalidPlugin(
+                "boom".to_string(),
+            ));
         }
         Ok(())
     }
@@ -131,7 +133,7 @@ fn nested_cascade_disposes_the_whole_subtree() {
         fn name(&self) -> &'static str {
             "grandparent"
         }
-        fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+        fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
             ctx.plugin(
                 Arc::new(Parent {
                     children: 2,

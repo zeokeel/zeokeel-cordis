@@ -121,9 +121,12 @@ pub(crate) fn contained_validate(
     schema: &dyn ConfigSchema,
     value: Value,
 ) -> std::result::Result<Value, Vec<String>> {
-    crate::internal::contained("cordis::config", "ConfigSchema::validate", None, || {
-        Some(schema.validate(value))
-    })
+    crate::internal::contained(
+        "zeokeel_cordis::config",
+        "ConfigSchema::validate",
+        None,
+        || Some(schema.validate(value)),
+    )
     .unwrap_or_else(|| Err(vec!["config schema panicked during validation".to_string()]))
 }
 
@@ -137,9 +140,12 @@ pub(crate) fn contained_merge(
     overrides: &[Value],
 ) -> Value {
     let fallback = base.clone();
-    crate::internal::contained("cordis::config", "ConfigSchema::merge", None, || {
-        Some(schema.merge(base, overrides))
-    })
+    crate::internal::contained(
+        "zeokeel_cordis::config",
+        "ConfigSchema::merge",
+        None,
+        || Some(schema.merge(base, overrides)),
+    )
     .unwrap_or(fallback)
 }
 

@@ -57,7 +57,7 @@ impl Accessor {
         // `Context::get` / `get_named`; the placeholder fails every typed
         // downcast, so the read degrades to "value not available".
         crate::internal::contained(
-            "cordis::reflect",
+            "zeokeel_cordis::reflect",
             "accessor get()",
             Arc::new(()) as ServiceValue,
             || (self.get)(ctx),

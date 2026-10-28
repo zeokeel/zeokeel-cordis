@@ -13,11 +13,11 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::task::{Context as TaskContext, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use cordis::{
+use serde_json::{json, Value};
+use zeokeel_cordis::{
     block_on, cleanup, cleanup_async, AsyncDisposer, AsyncPlugin, BoxFuture, ConfigSchema, Context,
     CordisError, Fiber, FiberState, Plugin, ServiceKey, ServiceValue,
 };
-use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -94,7 +94,7 @@ impl Plugin for Provider {
         "at-provider"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         ctx.provide(self.key, Arc::new(self.value))?;
         if let Some(next) = self.set_after {
             ctx.set(self.key.name(), Arc::new(next))?;
@@ -131,7 +131,7 @@ impl Plugin for Dependent {
         self.inject
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         self.applies.fetch_add(1, Ordering::SeqCst);
         self.seen
             .lock()
@@ -252,7 +252,7 @@ impl Plugin for AnyProvider {
         "at2-provider"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         ctx.provide_any(self.key, Arc::new(Greeter("v1")))?;
         Ok(())
     }
@@ -273,7 +273,7 @@ impl Plugin for AnyDependent {
         &["at2.greeter"]
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         self.applies.fetch_add(1, Ordering::SeqCst);
         self.seen
             .lock()
@@ -334,7 +334,7 @@ impl Plugin for PlainProvider {
         "at3-provider"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         ctx.provide(self.key, Arc::new(self.value))?;
         Ok(())
     }
@@ -535,7 +535,7 @@ impl Plugin for Cyclic {
         self.inject
     }
 
-    fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         self.applies.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -606,7 +606,7 @@ impl Plugin for Link {
         self.inject
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         self.applies.fetch_add(1, Ordering::SeqCst);
         ctx.provide(self.key, Arc::new(1u32))?;
         Ok(())
@@ -763,7 +763,7 @@ impl Plugin for SetThenProvide {
         "at9-provider"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         ctx.provide(S9, Arc::new(1u32))?;
         // Registered after provide: the revertible set's inverse effect is
         // drained before the provide cleanup, i.e. while the fiber is Unloading.
@@ -794,7 +794,7 @@ impl Plugin for StateProbe {
         &["at9.svc"]
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         self.applies.fetch_add(1, Ordering::SeqCst);
         let state = self.provider.state();
         self.trace
@@ -927,7 +927,7 @@ fn at12_set_from_non_owner_fails() {
             fn name(&self) -> &'static str {
                 "at12-thief"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 self.set_forbidden.store(
                     matches!(
                         ctx.set("at10.svc", Arc::new(2u32)),
@@ -1009,7 +1009,10 @@ fn at14_vetoed_set_registers_no_inverse() {
         .unwrap();
     let hook = root
         .on_internal_set(Arc::new(
-            |_ctx: &Context, _name: &str, _value: &ServiceValue, _next: &cordis::SetNext| false,
+            |_ctx: &Context,
+             _name: &str,
+             _value: &ServiceValue,
+             _next: &zeokeel_cordis::SetNext| false,
         ))
         .unwrap();
     let provider_ctx = provider.context().unwrap();
@@ -1045,7 +1048,7 @@ fn at15_set_during_unload_fails_cleanly() {
             fn name(&self) -> &'static str {
                 "at15-provider"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.provide(S10, Arc::new(1u32))?;
                 let result = self.result.clone();
                 let cleanup_ctx = ctx.clone();
@@ -1097,7 +1100,7 @@ fn at16_set_while_dependent_is_running_settles() {
             fn inject(&self) -> &'static [&'static str] {
                 &["at16.t"]
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 self.applies.fetch_add(1, Ordering::SeqCst);
                 self.seen
                     .lock()
@@ -1111,7 +1114,7 @@ fn at16_set_while_dependent_is_running_settles() {
             fn name(&self) -> &'static str {
                 "at16-provider"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.provide(T, Arc::new(1u32))?;
                 ctx.set("at16.t", Arc::new(2u32))?;
                 Ok(())
@@ -1148,9 +1151,9 @@ fn at16_set_while_dependent_is_running_settles() {
 // 3. Raw config
 // ---------------------------------------------------------------------------
 
-fn add_marker_hook(root: &Context) -> cordis::Disposer {
+fn add_marker_hook(root: &Context) -> zeokeel_cordis::Disposer {
     root.on_internal_config(Arc::new(
-        |_fiber: &Fiber, config: Value, next: &cordis::ConfigNext| {
+        |_fiber: &Fiber, config: Value, next: &zeokeel_cordis::ConfigNext| {
             let mut value = next.next(config);
             if let Some(text) = value.as_str() {
                 value = json!(format!("{text}|R"));
@@ -1170,7 +1173,7 @@ impl Plugin for EchoConfig {
         "at17-echo"
     }
 
-    fn apply(&self, _ctx: Context, config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, config: Value) -> zeokeel_cordis::Result<()> {
         self.seen.lock().unwrap().push(config);
         Ok(())
     }
@@ -1219,7 +1222,7 @@ fn at18_update_hook_replacement_is_the_new_raw_config() {
     let _hook = add_marker_hook(&root);
     let _replacer = root
         .on_internal_update(Arc::new(
-            |_fiber: &Fiber, _config: Value, no_save: bool, next: &cordis::UpdateNext| {
+            |_fiber: &Fiber, _config: Value, no_save: bool, next: &zeokeel_cordis::UpdateNext| {
                 let _ = next.next(json!("z"), no_save);
             },
         ))
@@ -1272,7 +1275,7 @@ impl Plugin for SchemaEcho {
         Some(Arc::new(RejectNonString))
     }
 
-    fn apply(&self, _ctx: Context, config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, config: Value) -> zeokeel_cordis::Result<()> {
         self.seen.lock().unwrap().push(config);
         Ok(())
     }
@@ -1312,7 +1315,7 @@ impl AsyncPlugin for AsyncEcho {
         &'a self,
         _ctx: Context,
         config: Value,
-    ) -> BoxFuture<'a, cordis::Result<()>> {
+    ) -> BoxFuture<'a, zeokeel_cordis::Result<()>> {
         let seen = self.seen.clone();
         Box::pin(async move {
             seen.lock().unwrap().push(config);
@@ -1383,7 +1386,7 @@ impl Plugin for ChangingSchemaPlugin {
         Some(self.schema.clone())
     }
 
-    fn apply(&self, _ctx: Context, config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, config: Value) -> zeokeel_cordis::Result<()> {
         self.seen.lock().unwrap().push(config);
         Ok(())
     }
@@ -1442,7 +1445,7 @@ impl Plugin for BoomSchemaPlugin {
         Some(Arc::new(BoomSchema))
     }
 
-    fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         Ok(())
     }
 }
@@ -1488,7 +1491,7 @@ impl Plugin for ChainLink {
         self.inject
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         if let Some(key) = self.provide {
             ctx.provide(key, Arc::new(1u32))?;
         }
@@ -1615,7 +1618,7 @@ fn at24_dependent_cleanup_sees_withdrawn_but_present() {
             fn inject(&self) -> &'static [&'static str] {
                 &["at24.svc"]
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let observations = self.observations.clone();
                 let key = self.key;
                 let cleanup_ctx = ctx.clone();
@@ -1664,7 +1667,7 @@ fn at25_any_lane_withdrawal_and_reprovide() {
             fn name(&self) -> &'static str {
                 "at25-provider"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.provide_any(ANY, Arc::new(Greeter("v1")))?;
                 Ok(())
             }
@@ -1680,7 +1683,7 @@ fn at25_any_lane_withdrawal_and_reprovide() {
             fn inject(&self) -> &'static [&'static str] {
                 &["at2.greeter"]
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 self.applies.fetch_add(1, Ordering::SeqCst);
                 self.seen
                     .lock()
@@ -1784,7 +1787,7 @@ fn at27_async_dependent_unloads_after_refresh_async() {
                 &'a self,
                 ctx: Context,
                 _config: Value,
-            ) -> BoxFuture<'a, cordis::Result<()>> {
+            ) -> BoxFuture<'a, zeokeel_cordis::Result<()>> {
                 let cleanups = self.cleanups.clone();
                 Box::pin(async move {
                     ctx.effect(move || {

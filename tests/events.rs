@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use cordis::{Context, EventOptions, EventResult};
+use zeokeel_cordis::{Context, EventOptions, EventResult};
 
 type Listener = Arc<dyn Fn(&[Value]) -> EventResult + Send + Sync>;
 
@@ -138,14 +138,14 @@ fn event_waterfall_respects_context_filter() {
         })
         .expect("isolated middleware");
 
-    let terminal = Some(cordis::waterfall_terminal(|args: &[Value]| {
+    let terminal = Some(zeokeel_cordis::waterfall_terminal(|args: &[Value]| {
         args.first().cloned().unwrap_or(Value::Null)
     }));
     assert_eq!(root.waterfall("demo", &[json!(1)], terminal), json!(1));
     assert_eq!(root_seen.load(Ordering::SeqCst), 1);
     assert_eq!(isolated_seen.load(Ordering::SeqCst), 0);
 
-    let terminal = Some(cordis::waterfall_terminal(|args: &[Value]| {
+    let terminal = Some(zeokeel_cordis::waterfall_terminal(|args: &[Value]| {
         args.first().cloned().unwrap_or(Value::Null)
     }));
     assert_eq!(isolated.waterfall("demo", &[json!(2)], terminal), json!(2));
@@ -182,7 +182,7 @@ fn bail_ignores_null_and_false_values() {
 
     // `Bail(Value::Null)`/`Bail(false)` never stop a `serial_async` chain either.
     assert_eq!(
-        cordis::block_on(root.serial_async("demo", &[])),
+        zeokeel_cordis::block_on(root.serial_async("demo", &[])),
         Some(json!("stop"))
     );
 }

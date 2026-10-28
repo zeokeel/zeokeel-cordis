@@ -9,8 +9,8 @@
 //!
 //! ```no_run
 //! # use serde_json::{json, Value};
-//! # use cordis::{Context, waterfall_terminal};
-//! # fn demo(ctx: &Context) -> cordis::Result<()> {
+//! # use zeokeel_cordis::{Context, waterfall_terminal};
+//! # fn demo(ctx: &Context) -> zeokeel_cordis::Result<()> {
 //! ctx.on_waterfall("request", |_args, next| {
 //!     let value = next.next(); // explicit continuation
 //!     json!({ "wrapped": value })

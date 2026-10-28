@@ -9,11 +9,11 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::task::{Context as TaskContext, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
-use cordis::{
+use serde_json::Value;
+use zeokeel_cordis::{
     block_on, cleanup, cleanup_async, AsyncPlugin, BoxFuture, Context, CordisError, EventResult,
     Fiber, FiberState, Plugin, ServiceKey,
 };
-use serde_json::Value;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -112,7 +112,7 @@ impl Plugin for GatedWork {
         self.label
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let started = self.started.clone();
         let release = self.release.clone();
         ctx.effect(move || {
@@ -140,7 +140,7 @@ impl Plugin for GatedApply {
         self.label
     }
 
-    fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         self.started.fetch_add(1, Ordering::SeqCst);
         let rx = self.release.lock().unwrap().take();
         if let Some(rx) = rx {
@@ -159,7 +159,7 @@ impl Plugin for Capturing {
         "r7-capturing"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         *self.cell.lock().unwrap() = Some((ctx.clone(), ctx.fiber()));
         Ok(())
     }
@@ -227,7 +227,7 @@ fn t02_when_idle_waits_for_async_activation() {
                 &'a self,
                 _ctx: Context,
                 _config: Value,
-            ) -> BoxFuture<'a, cordis::Result<()>> {
+            ) -> BoxFuture<'a, zeokeel_cordis::Result<()>> {
                 let started = self.started.clone();
                 let release = self.release.lock().unwrap().take();
                 Box::pin(async move {
@@ -291,7 +291,7 @@ fn t03_when_idle_waits_for_restart() {
             fn name(&self) -> &'static str {
                 "r7-restart-slow"
             }
-            fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let call = self.applies.fetch_add(1, Ordering::SeqCst);
                 if call >= 1 {
                     self.started.fetch_add(1, Ordering::SeqCst);
@@ -354,7 +354,7 @@ fn t04_idle_with_terminal_and_pending_fibers() {
             fn inject(&self) -> &'static [&'static str] {
                 &["r7.missing"]
             }
-            fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 Ok(())
             }
         }
@@ -363,7 +363,7 @@ fn t04_idle_with_terminal_and_pending_fibers() {
             fn name(&self) -> &'static str {
                 "r7-failing"
             }
-            fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 Err(CordisError::InvalidPlugin("boom".into()))
             }
         }
@@ -471,7 +471,7 @@ fn t07_is_idle_when_idle_stress() {
             fn name(&self) -> &'static str {
                 "r7-sleepy"
             }
-            fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 std::thread::sleep(Duration::from_millis(1));
                 Ok(())
             }
@@ -512,12 +512,12 @@ fn t08_gate_flapping_terminates() {
             fn inject(&self) -> &'static [&'static str] {
                 &["r7.gated"]
             }
-            fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 Ok(())
             }
         }
         let root = Context::root();
-        let gate = cordis::ServiceGate::new(false);
+        let gate = zeokeel_cordis::ServiceGate::new(false);
         let _provided = root
             .provide_gated(KEY, Arc::new(1u32), &gate)
             .expect("provide gated");
@@ -585,7 +585,7 @@ fn t10_cancel_slow_sync_apply_rolls_back() {
             fn name(&self) -> &'static str {
                 "r7-looper"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.provide(SVC, Arc::new(1u32))?;
                 ctx.on("r7.cancel.event", |_args| EventResult::Continue)?;
                 let cleanups = self.cleanups.clone();
@@ -658,7 +658,7 @@ fn t11_cancel_async_plugin_after_await_rolls_back() {
                 &'a self,
                 ctx: Context,
                 _config: Value,
-            ) -> BoxFuture<'a, cordis::Result<()>> {
+            ) -> BoxFuture<'a, zeokeel_cordis::Result<()>> {
                 let started = self.started.clone();
                 let release = self.release.lock().unwrap().take();
                 let cleanups = self.cleanups.clone();
@@ -735,7 +735,7 @@ fn t12_cancel_pending_fiber_before_activation() {
             fn inject(&self) -> &'static [&'static str] {
                 &["r7.pending.dep"]
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.provide(SVC, Arc::new(1u32))?;
                 let cleanups = self.cleanups.clone();
                 ctx.effect(move || {
@@ -876,7 +876,7 @@ fn t16_cancel_and_concurrent_dispose_is_safe() {
             fn name(&self) -> &'static str {
                 "r7-cancel-dispose-looper"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.provide(SVC, Arc::new(1u32))?;
                 let cleanups = self.cleanups.clone();
                 ctx.effect(move || {

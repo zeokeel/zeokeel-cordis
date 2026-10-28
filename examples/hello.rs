@@ -4,8 +4,8 @@
 
 use std::sync::Arc;
 
-use cordis::{cleanup, Context, Plugin, Result};
 use serde_json::Value;
+use zeokeel_cordis::{cleanup, Context, Plugin, Result};
 
 struct Greeter;
 

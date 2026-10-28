@@ -3,7 +3,7 @@
 从零开始：安装、写插件、注册服务、处理依赖、管理生命周期、做测试。本文所有示例都对应
 [`examples/`](../examples/) 下的可运行代码，建议边读边跑。
 
-- 版本：v0.3.0（Rust 1.85+，edition 2021）
+- 版本：v0.4.0（Rust 1.85+，edition 2021）
 - 规范：[`spec/CORDIS-CORE.md`](../spec/CORDIS-CORE.md)（英文，编号用例）
 - 设计：[`DESIGN.md`](DESIGN.md)；API 速查：`cargo doc --open`
 
@@ -36,13 +36,13 @@
 
 ```toml
 [dependencies]
-zeokeel-cordis = "0.3.0"
+zeokeel-cordis = "0.4.0"
 serde_json = "1"   # 插件配置用 serde_json::Value
 ```
 
-> crates.io 包名是 `zeokeel-cordis`，库目标名仍是 `cordis`，代码里继续 `use cordis::...`；
+> crates.io 包名 `zeokeel-cordis` 与库目标名 `zeokeel_cordis` 一致：代码里统一 `use zeokeel_cordis::...`；
 > 需要跟仓库最新代码时可用 git 依赖：
-> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.3.0" }`。
+> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.4.0" }`。
 
 - MSRV：Rust **1.85+**
 - 同步宿主不需要异步运行时；异步宿主可选 tokio，但内核本身不依赖 tokio
@@ -65,7 +65,7 @@ cargo run --example async_plugin
 
 ```rust
 use std::sync::Arc;
-use cordis::{cleanup, Context, Plugin, Result};
+use zeokeel_cordis::{cleanup, Context, Plugin, Result};
 use serde_json::Value;
 
 struct Greeter;
@@ -117,7 +117,7 @@ let b = root.clone();    // 同一个作用域的句柄（共享 isolate 映射�
 
 ```rust
 use std::sync::Arc;
-use cordis::{ConfigSchema, Context, Plugin, Result};
+use zeokeel_cordis::{ConfigSchema, Context, Plugin, Result};
 use serde_json::Value;
 
 struct HttpPlugin;
@@ -163,7 +163,7 @@ impl Plugin for HttpPlugin {
 
 ```rust
 use std::sync::Arc;
-use cordis::{Context, Plugin, Result, ServiceKey};
+use zeokeel_cordis::{Context, Plugin, Result, ServiceKey};
 use serde_json::Value;
 
 struct Clock { started: std::time::Instant }
@@ -199,7 +199,7 @@ impl Plugin for ClockPlugin {
 ### 4.3 trait object 服务
 
 ```rust
-use cordis::{ServiceKey, Context, Result};
+use zeokeel_cordis::{ServiceKey, Context, Result};
 
 trait Storage: Send + Sync {
     fn put(&self, key: &str, value: Vec<u8>);
@@ -264,7 +264,7 @@ let provider = root.plugin(Arc::new(ClockPlugin), Value::Null)?; // 重新提供
 `provide_gated` / `provide_checked` 在「服务存在」之上再加一层「当前是否可用」：
 
 ```rust
-use cordis::ServiceGate;
+use zeokeel_cordis::ServiceGate;
 
 // 方式一：闭包式可用性检查（每次重新判定）
 ctx.provide_checked(KEY, Arc::new(value), || online.load(Ordering::SeqCst))?;
@@ -326,7 +326,7 @@ ctx.effect_stream(stream, "consumer")?;
 ### 7.1 同步事件
 
 ```rust
-use cordis::EventResult;
+use zeokeel_cordis::EventResult;
 
 ctx.on("before-request", |args| {
     println!("got {}", args[0]);
@@ -361,7 +361,7 @@ let v = ctx.serial_async("fetch", &args).await; // 按注册顺序，遇到 bail
 ### 7.3 waterfall 中间件
 
 ```rust
-use cordis::waterfall_terminal;
+use zeokeel_cordis::waterfall_terminal;
 
 ctx.on_waterfall("make-response", |_args, next| {
     // next.next()：继续执行剩余中间件（最后是终端行为）
@@ -396,7 +396,7 @@ waterfall 是显式 `next` 的中间件链：不调用 `next` 就等于否决后
 
 ```rust
 use std::sync::Arc;
-use cordis::{block_on, cleanup_async, AsyncPlugin, BoxFuture, Context, Result};
+use zeokeel_cordis::{block_on, cleanup_async, AsyncPlugin, BoxFuture, Context, Result};
 use serde_json::Value;
 
 struct Ticker;
@@ -430,7 +430,7 @@ fn main() -> Result<()> {
   直接用 `.await` 或安装宿主执行器：
 
 ```rust
-use cordis::exec::{set_blocking_executor, BlockingExecutor};
+use zeokeel_cordis::exec::{set_blocking_executor, BlockingExecutor};
 use std::sync::Arc;
 
 struct MyExecutor;
@@ -633,7 +633,7 @@ fn plugin_activation_and_cleanup() {
 }
 ```
 
-- 同步测试直接用 `cordis::block_on(...)`；tokio 测试里用 `.await`，不要嵌套 `block_on`；
+- 同步测试直接用 `zeokeel_cordis::block_on(...)`；tokio 测试里用 `.await`，不要嵌套 `block_on`；
 - 每个测试结束调用 `root.dispose_all()`，避免 fiber 图泄漏；
 - 慢测试建议加 watchdog（另起线程 + 超时），避免死锁把 CI 挂死；
 - 内核仓库的 `tests/redteam*.rs` 提供了大量攻击性断言写法可参考。
@@ -689,7 +689,7 @@ A：不能，内核没有 ABI/动态加载（见「已知限制」）。需要�
 
 ```rust
 use std::time::Duration;
-use cordis::{Context, FiberQuota, IsolationCapabilities};
+use zeokeel_cordis::{Context, FiberQuota, IsolationCapabilities};
 
 // 1) 启动时自省：确认这个构建能遏制什么
 println!("{}", IsolationCapabilities::detect().summary());

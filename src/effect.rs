@@ -71,7 +71,7 @@ impl Drop for Disposer {
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "panic".to_string());
                 tracing::error!(
-                    target: "cordis::fiber",
+                    target: "zeokeel_cordis::fiber",
                     "disposer cleanup panicked during drop: {message}"
                 );
             }

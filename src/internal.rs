@@ -53,7 +53,7 @@ pub(crate) fn contained<T>(
         Ok(value) => value,
         Err(payload) => {
             tracing::error!(
-                target: "cordis::containment",
+                target: "zeokeel_cordis::containment",
                 component = target,
                 callback = callback,
                 panic = %panic_message(payload.as_ref()),
@@ -178,7 +178,7 @@ impl ConfigNext<'_> {
                 // A panicking hook falls through to the rest of the chain with
                 // the incoming config, so the caller still gets a value.
                 let fallback = config.clone();
-                match contained("cordis::internal", "internal/config", None, || {
+                match contained("zeokeel_cordis::internal", "internal/config", None, || {
                     Some(hook(self.fiber, config, &next))
                 }) {
                     Some(value) => value,
@@ -219,10 +219,11 @@ impl UpdateNext<'_> {
                     ran: self.ran,
                 };
                 let fallback = config.clone();
-                let outcome = contained("cordis::internal", "internal/update", None, || {
-                    hook(self.fiber, config, no_save, &next);
-                    Some(())
-                });
+                let outcome =
+                    contained("zeokeel_cordis::internal", "internal/update", None, || {
+                        hook(self.fiber, config, no_save, &next);
+                        Some(())
+                    });
                 if outcome.is_none() {
                     // Panicked: fall through; the terminal runs at most once,
                     // so an already-run terminal is not repeated.
@@ -254,7 +255,7 @@ impl GetNext<'_> {
                     name: self.name,
                     terminal: self.terminal,
                 };
-                match contained("cordis::internal", "internal/get", None, || {
+                match contained("zeokeel_cordis::internal", "internal/get", None, || {
                     Some(hook(self.ctx, self.name, &next))
                 }) {
                     Some(value) => value,
@@ -287,7 +288,7 @@ impl SetNext<'_> {
                     value: self.value,
                     terminal: self.terminal,
                 };
-                match contained("cordis::internal", "internal/set", None, || {
+                match contained("zeokeel_cordis::internal", "internal/set", None, || {
                     Some(hook(self.ctx, self.name, self.value, &next))
                 }) {
                     Some(written) => written,
@@ -438,13 +439,15 @@ impl InternalBus {
 
     pub(crate) fn emit_plugin(&self, fiber: &Fiber) {
         for hook in self.plugin.snapshot() {
-            contained("cordis::internal", "internal/plugin", (), || hook(fiber));
+            contained("zeokeel_cordis::internal", "internal/plugin", (), || {
+                hook(fiber)
+            });
         }
     }
 
     pub(crate) fn emit_status(&self, fiber: &Fiber, old: FiberState) {
         for hook in self.status.snapshot() {
-            contained("cordis::internal", "internal/status", (), || {
+            contained("zeokeel_cordis::internal", "internal/status", (), || {
                 hook(fiber, old)
             });
         }
@@ -452,7 +455,7 @@ impl InternalBus {
 
     pub(crate) fn emit_service(&self, ctx: &Context, name: &str, value: Option<&ServiceValue>) {
         for hook in self.service.snapshot() {
-            contained("cordis::internal", "internal/service", (), || {
+            contained("zeokeel_cordis::internal", "internal/service", (), || {
                 hook(ctx, name, value)
             });
         }
@@ -474,7 +477,9 @@ impl InternalBus {
             args: args.to_vec(),
         };
         for hook in self.dispatch.snapshot() {
-            contained("cordis::internal", "internal/dispatch", (), || hook(&info));
+            contained("zeokeel_cordis::internal", "internal/dispatch", (), || {
+                hook(&info)
+            });
         }
         self.dispatch_depth.fetch_sub(1, Ordering::SeqCst);
     }
@@ -569,9 +574,12 @@ impl InternalBus {
         request: &ListenerRequest<'_>,
     ) -> Option<ListenerOverride> {
         self.listener.snapshot().into_iter().find_map(|hook| {
-            contained("cordis::internal", "internal/listener", None, || {
-                hook(request)
-            })
+            contained(
+                "zeokeel_cordis::internal",
+                "internal/listener",
+                None,
+                || hook(request),
+            )
         })
     }
 }

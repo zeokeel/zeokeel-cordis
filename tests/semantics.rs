@@ -8,11 +8,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use cordis::{
+use serde_json::{json, Value};
+use zeokeel_cordis::{
     cleanup, cleanup_async, AsyncDisposer, Context, Disposer, FiberState, Plugin, ServiceKey,
     ServiceValue,
 };
-use serde_json::{json, Value};
 
 static SVC: ServiceKey<u32> = ServiceKey::new("svc");
 
@@ -39,7 +39,7 @@ impl Plugin for EchoConfig {
         "echo-config"
     }
 
-    fn apply(&self, _ctx: Context, config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, config: Value) -> zeokeel_cordis::Result<()> {
         self.seen
             .lock()
             .unwrap()
@@ -88,7 +88,7 @@ impl Plugin for Provider {
         "provider"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         ctx.provide(SVC, Arc::new(1u32))?;
         if let Some(value) = self.set_to {
             let service: ServiceValue = Arc::new(value);
@@ -119,7 +119,7 @@ impl Plugin for Dependent {
         &["svc"]
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         self.applies.fetch_add(1, Ordering::SeqCst);
         if let Some(value) = ctx.get(SVC) {
             self.seen.lock().unwrap().push(*value);

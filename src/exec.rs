@@ -35,8 +35,8 @@ pub(crate) type PanicPayload = Box<dyn Any + Send + 'static>;
 /// future:
 ///
 /// ```
-/// let listener = cordis::async_waterfall_listener(|_args, next| {
-///     cordis::boxed(async move { next.next().await })
+/// let listener = zeokeel_cordis::async_waterfall_listener(|_args, next| {
+///     zeokeel_cordis::boxed(async move { next.next().await })
 /// });
 /// ```
 pub fn boxed<'a, F>(future: F) -> BoxFuture<'a, F::Output>

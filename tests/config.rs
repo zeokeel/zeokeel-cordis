@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use cordis::{
+use zeokeel_cordis::{
     ConfigSchema, Context, CordisError, FiberState, JsonConfigSchema, JsonType, Plugin, Result,
 };
 
@@ -179,7 +179,10 @@ fn update_hook_replacement_is_validated() {
         .expect("plugin fiber");
     let _hook = root
         .on_internal_update(Arc::new(
-            |_fiber: &cordis::Fiber, _config: Value, _no_save: bool, next: &cordis::UpdateNext| {
+            |_fiber: &zeokeel_cordis::Fiber,
+             _config: Value,
+             _no_save: bool,
+             next: &zeokeel_cordis::UpdateNext| {
                 // Replace with a value that violates the plugin's schema.
                 next.next(json!({"model": 42}), false);
             },

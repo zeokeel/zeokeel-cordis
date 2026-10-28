@@ -9,11 +9,11 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::task::{Context as TaskContext, Wake, Waker};
 use std::time::Duration;
 
-use cordis::{
+use serde_json::Value;
+use zeokeel_cordis::{
     block_on, cleanup, cleanup_async, AsyncPlugin, BoxFuture, Context, Fiber, FiberState, Plugin,
     ServiceKey,
 };
-use serde_json::Value;
 
 fn watchdog<T, F>(label: &str, timeout: Duration, body: F) -> T
 where
@@ -96,7 +96,7 @@ impl Plugin for Capture {
         "r8-capture"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         *self.cell.lock().unwrap() = Some((ctx.clone(), ctx.fiber()));
         Ok(())
     }
@@ -113,7 +113,7 @@ impl Plugin for GatedApply {
         self.label
     }
 
-    fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         self.started.fetch_add(1, Ordering::SeqCst);
         let rx = self.release.lock().unwrap().take();
         if let Some(rx) = rx {
@@ -135,7 +135,7 @@ impl Plugin for GatedChild {
         self.label
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let started = self.started.clone();
         let release = self.release.clone();
         let cleanups = self.cleanups.clone();
@@ -162,7 +162,7 @@ impl Plugin for ParentLoads {
         "r8-parent"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         ctx.plugin(self.child.clone(), Value::Null)?;
         Ok(())
     }
@@ -177,7 +177,7 @@ impl Plugin for AsyncLeaf {
         "r8-async-leaf"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let cleanups = self.cleanups.clone();
         ctx.effect_async(move || {
             vec![cleanup_async(move || {
@@ -455,7 +455,7 @@ fn t08_when_idle_waits_replace() {
             fn name(&self) -> &'static str {
                 "r8-replace-old"
             }
-            fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 Ok(())
             }
         }
@@ -470,7 +470,10 @@ fn t08_when_idle_waits_replace() {
         });
         let registry = root.registry();
         let replace_thread = std::thread::spawn(move || {
-            registry.replace(cordis::PluginKey::Named("r8-replace-old"), new_plugin)
+            registry.replace(
+                zeokeel_cordis::PluginKey::Named("r8-replace-old"),
+                new_plugin,
+            )
         });
         while started.load(Ordering::SeqCst) == 0 {
             std::thread::sleep(Duration::from_millis(1));
@@ -762,7 +765,7 @@ fn t14_cancel_siblings_and_async_checkpoint_rollback() {
                 &'a self,
                 ctx: Context,
                 _config: Value,
-            ) -> BoxFuture<'a, cordis::Result<()>> {
+            ) -> BoxFuture<'a, zeokeel_cordis::Result<()>> {
                 let started = self.started.clone();
                 let release = self.release.lock().unwrap().take();
                 let cleanups = self.cleanups.clone();
@@ -944,7 +947,7 @@ fn t17_replace_cycles_no_runtime_leak() {
             fn name(&self) -> &'static str {
                 self.label
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 self.applies.fetch_add(1, Ordering::SeqCst);
                 ctx.provide(SVC, Arc::new(self.value))?;
                 let cleanups = self.cleanups.clone();
@@ -970,7 +973,7 @@ fn t17_replace_cycles_no_runtime_leak() {
                 Value::Null,
             )
             .unwrap();
-        let mut key = cordis::PluginKey::Named("r8-cycle-0");
+        let mut key = zeokeel_cordis::PluginKey::Named("r8-cycle-0");
         for cycle in 1..=50u32 {
             let label: &'static str = Box::leak(format!("r8-cycle-{cycle}").into_boxed_str());
             let new_plugin: Arc<dyn Plugin> = Arc::new(Versioned {
@@ -984,7 +987,7 @@ fn t17_replace_cycles_no_runtime_leak() {
                 .replace(key, new_plugin)
                 .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));
             assert_eq!(replaced.len(), 1);
-            key = cordis::PluginKey::Named(label);
+            key = zeokeel_cordis::PluginKey::Named(label);
             assert_eq!(
                 root.registry().size(),
                 1,

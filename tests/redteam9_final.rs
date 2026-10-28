@@ -6,8 +6,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use cordis::{cleanup, cleanup_async, Context, EventResult, FiberState, Plugin, ServiceKey};
 use serde_json::Value;
+use zeokeel_cordis::{
+    cleanup, cleanup_async, Context, EventResult, FiberState, Plugin, ServiceKey,
+};
 
 fn watchdog<T, F>(label: &str, timeout: Duration, body: F) -> T
 where
@@ -58,7 +60,7 @@ impl Plugin for Leaf {
         self.label
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let cleanups = self.cleanups.clone();
         ctx.effect(move || {
             vec![cleanup(move || {
@@ -84,7 +86,7 @@ impl Plugin for AsyncLeaf {
         "r9-async-leaf"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         let cleanups = self.cleanups.clone();
         ctx.effect_async(move || {
             vec![cleanup_async(move || {
@@ -107,7 +109,7 @@ impl Plugin for ParentLoads {
         "r9-parent"
     }
 
-    fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+    fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
         ctx.plugin(self.child.clone(), Value::Null)?;
         Ok(())
     }
@@ -180,7 +182,7 @@ fn t02_reentrant_dispose_all_from_cleanup() {
             fn name(&self) -> &'static str {
                 "r9-reentrant"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 *self.root.lock().unwrap() = Some(ctx.clone());
                 let root = self.root.clone();
                 let results = self.results.clone();
@@ -281,7 +283,7 @@ fn t04_dispose_all_during_restart_then_retry() {
             fn name(&self) -> &'static str {
                 "r9-restart-slow"
             }
-            fn apply(&self, _ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, _ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let call = self.applies.fetch_add(1, Ordering::SeqCst);
                 if call >= 1 {
                     self.started.fetch_add(1, Ordering::SeqCst);
@@ -344,7 +346,7 @@ fn t05_dispose_all_during_dispose_inflight() {
             fn name(&self) -> &'static str {
                 "r9-gated-dispose"
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let started = self.started.clone();
                 let release = self.release.clone();
                 ctx.effect(move || {
@@ -471,7 +473,7 @@ fn t08_panicking_cleanup_does_not_abort_shutdown() {
             fn name(&self) -> &'static str {
                 self.label
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 let cleanups = self.cleanups.clone();
                 let label = self.label;
                 ctx.effect(move || {
@@ -543,7 +545,7 @@ fn t09_leak_sanity_boot_cycles_and_replace() {
             fn name(&self) -> &'static str {
                 self.label
             }
-            fn apply(&self, ctx: Context, _config: Value) -> cordis::Result<()> {
+            fn apply(&self, ctx: Context, _config: Value) -> zeokeel_cordis::Result<()> {
                 ctx.provide(SVC, Arc::new(self.value))?;
                 let cleanups = self.cleanups.clone();
                 ctx.effect(move || {
@@ -568,7 +570,7 @@ fn t09_leak_sanity_boot_cycles_and_replace() {
                     Value::Null,
                 )
                 .unwrap();
-            let mut key = cordis::PluginKey::Named("r9-replace-0");
+            let mut key = zeokeel_cordis::PluginKey::Named("r9-replace-0");
             for cycle in 1..=50u32 {
                 let label: &'static str = Box::leak(format!("r9-replace-{cycle}").into_boxed_str());
                 let replaced = root
@@ -583,7 +585,7 @@ fn t09_leak_sanity_boot_cycles_and_replace() {
                     )
                     .unwrap_or_else(|error| panic!("replace {cycle}: {error:?}"));
                 assert_eq!(replaced.len(), 1);
-                key = cordis::PluginKey::Named(label);
+                key = zeokeel_cordis::PluginKey::Named(label);
                 assert_eq!(root.registry().size(), 1);
                 assert_eq!(root.registry().fiber_count(), 1);
             }

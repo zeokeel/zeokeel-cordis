@@ -15,7 +15,7 @@
 
 - Rust **1.85+**（edition 2021）· MIT · 零 `unsafe`（`#![forbid(unsafe_code)]`）
 - 通用、无产品逻辑、静态链接、无 ABI/FFI/动态加载
-- **v0.3.x 功能冻结**：不再新增语义能力，只接受 bugfix、安全性修复与文档修正
+- **v0.4.x 语义冻结**：不再新增语义能力，只接受 bugfix、安全性修复与文档修正
 
 ---
 
@@ -59,19 +59,20 @@ Cordis 把「动态组合」拆成两个正交维度：
 
 ```toml
 [dependencies]
-zeokeel-cordis = "0.3.0"
+zeokeel-cordis = "0.4.0"
 serde_json = "1"   # 插件配置是 serde_json::Value
 ```
 
-> crates.io 发布名为 `zeokeel-cordis`；库目标名仍是 `cordis`，代码里继续 `use cordis::...`。
+> crates.io 包名 `zeokeel-cordis` 与库目标名 `zeokeel_cordis` 一致：代码里统一
+> `use zeokeel_cordis::...`。
 > 需要跟仓库最新未发布代码时，可换成 git 依赖：
-> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.3.0" }`。
+> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.4.0" }`。
 
 最小插件（完整可运行版本：[`examples/hello.rs`](examples/hello.rs)）：
 
 ```rust
 use std::sync::Arc;
-use cordis::{cleanup, Context, Plugin, Result};
+use zeokeel_cordis::{cleanup, Context, Plugin, Result};
 use serde_json::Value;
 
 struct Greeter;
@@ -129,7 +130,7 @@ fn main() -> Result<()> {
 观测），**默认关闭**——核心内核不含任何监督策略：
 
 ```toml
-zeokeel-cordis = { version = "0.3.0", features = ["supervision"] }
+zeokeel-cordis = { version = "0.4.0", features = ["supervision"] }
 ```
 
 详见 [`docs/KERNEL-ISOLATION.md`](docs/KERNEL-ISOLATION.md)。
@@ -196,7 +197,7 @@ GitHub topics —
 
 ## 状态与许可证
 
-- 当前版本 **v0.3.0**（CORE-001…CORE-051）；v0.3.x 为功能冻结线。
+- 当前版本 **v0.4.0**（CORE-001…CORE-051）；v0.4.x 为语义冻结线。
 - MIT，见 [LICENSE](LICENSE)；论文版权归原作者。
 
 维护仓库：<https://github.com/zeokeel/zeokeel-cordis>（提交作者 `zeokeel-dev`）。
