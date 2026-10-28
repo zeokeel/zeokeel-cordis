@@ -2294,7 +2294,23 @@ impl ReparkGuard<'_> {
 impl Drop for ReparkGuard<'_> {
     fn drop(&mut self) {
         if let Some(fiber) = self.fiber.take() {
-            self.registry.park_unload(&fiber.data, self.target);
+            // F4/S7: a recovery that is cancelled while finishing the *root*
+            // frame leaves the fiber on its target state (`Pending`) with the
+            // restored async cleanups parked in `deferred_async`. Re-park those
+            // too: the next recovery pass drains the deferred cleanups, so the
+            // restored cleanup runs exactly once before `when_idle` returns
+            // (instead of silently waiting for an explicit dispose).
+            let needs_repark = fiber
+                .data
+                .lock()
+                .map(|data| {
+                    data.state == FiberState::Unloading
+                        || (data.state != FiberState::Disposed && !data.deferred_async.is_empty())
+                })
+                .unwrap_or(true);
+            if needs_repark {
+                self.registry.park_unload(&fiber.data, self.target);
+            }
         }
     }
 }

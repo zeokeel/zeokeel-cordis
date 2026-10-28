@@ -3671,3 +3671,76 @@ fn f5_when_idle_sees_parked_frames_parked_after_entry() {
         scenario(true);
     });
 }
+
+// ---------------------------------------------------------------------------
+// S7 (0.4.4 P1): a cancelled recovery that finishes the cascade *root* frame on
+// its target state must still drain the restored deferred cleanups — they may
+// not be silently postponed until an explicit dispose.
+// ---------------------------------------------------------------------------
+
+/// E's S7 scenario: 3 dependents with gated async cleanups; cancel the raw
+/// `Registry::when_idle` recovery mid-pass (it parks on the first restored
+/// cleanup), then a fresh `when_idle` must run every restored cleanup exactly
+/// once before returning.
+#[test]
+fn s7_cancelled_recovery_drains_root_deferred_cleanup() {
+    watchdog("s7", Duration::from_secs(60), || {
+        let gate = Arc::new(AsyncLatch::default());
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        let (root, fibers) = f1_chain(3, gate.clone(), runs.clone());
+        f1_park_mid_cascade(&fibers[0]);
+        assert!(fibers[1..]
+            .iter()
+            .any(|fiber| fiber.state() == FiberState::Unloading));
+
+        // Start the raw registry recovery and cancel it while it awaits the
+        // first restored cleanup. (This is the S7 path: the fiber it was
+        // finishing lands on `Pending` with restored cleanups in `deferred_async`.)
+        let registry = root.registry();
+        {
+            let mut waiter = Box::pin(registry.when_idle());
+            assert!(
+                poll_once_pin(waiter.as_mut()).is_pending(),
+                "S7 setup: the recovery must park on a restored cleanup"
+            );
+            drop(waiter);
+        }
+
+        gate.open();
+        let (done_tx, done_rx) = mpsc::channel();
+        let idle_root = root.clone();
+        std::thread::spawn(move || {
+            block_on(idle_root.when_idle());
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("S7: when_idle must return after finishing the restored cleanups");
+
+        let mut recorded = runs.lock().unwrap().clone();
+        recorded.sort_unstable();
+        assert_eq!(
+            recorded,
+            vec!["F1", "F2", "F3"],
+            "S7: every restored dependent cleanup must run exactly once (no duplicate, no silent postponement)"
+        );
+        for (index, fiber) in fibers.iter().enumerate() {
+            assert_ne!(
+                fiber.state(),
+                FiberState::Unloading,
+                "S7: fiber {index} stuck in Unloading"
+            );
+        }
+        assert!(
+            root.registry().is_idle(),
+            "S7: the registry must be quiescent once when_idle returns"
+        );
+        // The provider's own deferred cleanups remain explicit-retry work (A-9).
+        block_on(fibers[0].dispose_async()).expect("retried provider dispose");
+        let mut recorded = runs.lock().unwrap().clone();
+        recorded.sort_unstable();
+        assert_eq!(recorded, vec!["F0", "F1", "F2", "F3"]);
+        let _ = root.dispose_all();
+        assert!(root.registry().keys().is_empty());
+    });
+}

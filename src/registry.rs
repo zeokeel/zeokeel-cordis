@@ -157,7 +157,7 @@ impl Plugin for RootPlugin {
 
 /// An **async plugin**: same contract as [`Plugin`] except that activation is a
 /// future awaited by the host (`Context::plugin_async`), so plugins may
-/// perform asynchronous initialization (database/settings/network) without
+/// perform asynchronous I/O-bound initialization without
 /// blocking a thread or using a sync bridge.
 ///
 /// Async plugins are activated, restarted and updated through the `*_async`
@@ -830,7 +830,13 @@ impl Registry {
         let limit = self.fiber_count().saturating_add(8).max(16);
         for _ in 0..limit {
             let (own, total) = self.quiescence_snapshot();
-            if self.is_idle_excluding_with_total(own, total) {
+            // S7: a recovery pass cancelled while finishing a frame leaves the
+            // fiber on its target state (`Pending`) with restored cleanups in
+            // `deferred_async`. Such an entry is re-parked, and `is_idle()` alone
+            // would be `true` for a `Pending` fiber — do not return until the
+            // recoverable set is empty, so the restored cleanup runs exactly
+            // once before `when_idle` completes.
+            if self.is_idle_excluding_with_total(own, total) && !self.has_parked_unloads() {
                 return;
             }
             if self.has_parked_unloads() {
@@ -1607,7 +1613,14 @@ impl Registry {
             let Ok(fiber) = data.lock() else {
                 continue;
             };
-            if fiber.state != FiberState::Unloading {
+            // F4/S7: a cancelled recovery can finish a frame on its target state
+            // (`Pending`) while leaving restored async cleanups in
+            // `deferred_async`. Those entries stay recoverable until the
+            // deferred cleanups are drained; a `Disposed` fiber is left alone
+            // (its deferred cleanups are explicit-retry work, A-9).
+            let recoverable = fiber.state == FiberState::Unloading
+                || (fiber.state != FiberState::Disposed && !fiber.deferred_async.is_empty());
+            if !recoverable {
                 continue;
             }
             let id = fiber.id;
