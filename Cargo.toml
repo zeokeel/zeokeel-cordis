@@ -5,8 +5,9 @@ edition = "2021"
 license = "MIT"
 rust-version = "1.85"
 repository = "https://github.com/zeokeel/Cordis"
+homepage = "https://github.com/zeokeel/Cordis"
 description = "Cordis-paradigm pluggable kernel core for Rust: context/service/fiber/effect/events/registry"
-keywords = ["cordis", "plugin", "dependency-injection", "kernel"]
+keywords = ["cordis", "plugin", "plugin-system", "dependency-injection", "kernel"]
 categories = ["development-tools"]
 readme = "README.md"
 

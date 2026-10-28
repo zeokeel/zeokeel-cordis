@@ -6,6 +6,11 @@
 > 这是**内核**，不是框架：只提供组合原语与生命周期语义。模块加载、热更新、权限、沙箱、
 > 进程/WASM 隔离都属于使用它的宿主（embedder）。
 
+[![CI](https://github.com/zeokeel/Cordis/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/zeokeel/Cordis/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust 1.85+](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](#快速开始)
+[![cargo audit](https://img.shields.io/badge/security-cargo--audit-brightgreen.svg)](https://github.com/zeokeel/Cordis/actions/workflows/ci.yml)
+
 - Rust **1.85+**（edition 2021）· MIT · 零 `unsafe`（`#![forbid(unsafe_code)]`）
 - 通用、无产品逻辑、静态链接、无 ABI/FFI/动态加载
 - **v0.3.x 功能冻结**：不再新增语义能力，只接受 bugfix、安全性修复与文档修正
@@ -162,6 +167,24 @@ cordis = { git = "https://github.com/zeokeel/Cordis", tag = "v0.3.0", features =
 - **无抢占**：watchdog/取消是协作式的；内核不会强杀插件线程。
 
 完整清单与实测数据见 [`docs/KERNEL-ISOLATION.md`](docs/KERNEL-ISOLATION.md)。
+
+## 参与项目
+
+| 文档 | 内容 |
+| --- | --- |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 开发环境、测试命令、提交规范、PR 清单、发布流程 |
+| [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) | 社区行为准则（Contributor Covenant v2.1）|
+| [SECURITY.md](SECURITY.md) | 漏洞私有报告流程、威胁模型与隔离边界 |
+| [CHANGELOG.md](CHANGELOG.md) | 版本变更记录（Keep a Changelog）|
+| [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE) | Bug / 功能请求模板 |
+| [`.github/pull_request_template.md`](.github/pull_request_template.md) | PR 检查清单 |
+
+**项目标签**：Cargo keywords —
+`cordis`、`plugin`、`plugin-system`、`dependency-injection`、`kernel`；
+GitHub topics —
+`rust`、`cordis`、`plugin-system`、`dependency-injection`、`kernel`、`composability`。
+
+> 安全漏洞请**不要**公开报告，按 [SECURITY.md](SECURITY.md) 使用 GitHub Security Advisories。
 
 ---
 

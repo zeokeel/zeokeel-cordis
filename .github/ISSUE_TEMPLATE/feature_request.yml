@@ -1,0 +1,51 @@
+name: 功能请求
+description: 提出新的能力或改进建议
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Cordis 是**内核**且处于 **v0.3.x 功能冻结**：默认只讨论 bugfix、安全、性能与文档。
+        新语义能力需要先证明它属于内核职责（见 README「内核 / 宿主边界」）。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 要解决的问题
+      description: 使用场景、当前限制、为什么现有 API 不够
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: API 草案、语义变化、对现有契约的影响
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 备选方案
+    validations:
+      required: false
+  - type: dropdown
+    id: layer
+    attributes:
+      label: 该能力应属于哪一层？
+      description: 内核只负责组合原语；很多需求属于宿主层
+      options:
+        - 内核（L1：context/service/fiber/effect/events）
+        - 可选 supervision（L2：配额/watchdog/能力自省）
+        - Embedder 层（loader/HMR/权限/沙箱/进程或 WASM 隔离）
+        - 不确定
+    validations:
+      required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 检查项
+      options:
+        - label: 我已搜索过现有 issue 与 spec
+          required: true
+        - label: 我理解 v0.3.x 处于功能冻结
+          required: true

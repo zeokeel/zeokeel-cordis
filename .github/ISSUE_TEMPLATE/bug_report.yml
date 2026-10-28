@@ -1,0 +1,70 @@
+name: Bug 报告
+description: 内核行为不符合规范或文档
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        安全漏洞请不要公开报告，改用 [私有安全渠道](../../security/advisories/new)。
+        提交前请确认问题在 [`spec/CORDIS-CORE.md`](../../spec/CORDIS-CORE.md) 与
+        [`README.md`](../../README.md) 的承诺范围内。
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / commit
+      description: crate 版本或 commit SHA（`cargo metadata` / `git rev-parse HEAD`）
+      placeholder: "v0.3.0 / 92b698f"
+    validations:
+      required: true
+  - type: input
+    id: rustc
+    attributes:
+      label: Rust 版本与平台
+      placeholder: "rustc 1.85.0 (2025-xx-xx); Linux x86_64"
+    validations:
+      required: true
+  - type: dropdown
+    id: features
+    attributes:
+      label: 启用的 feature
+      options:
+        - 默认（无 feature）
+        - supervision
+        - 其他（在下方说明）
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 最小可复现代码或测试；能附上 `cargo test` 失败输出更好
+      placeholder: |
+        1. cargo new repro && cd repro
+        2. 添加依赖 ...
+        3. cargo run
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+      description: 对应规范条目（CORE-0xx）或文档描述
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      description: 错误输出、panic backtrace、fiber 状态或死锁/挂起表现
+    validations:
+      required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: 检查项
+      options:
+        - label: 我已搜索过现有 issue
+          required: true
+        - label: 这不是安全问题（安全问题走 SECURITY.md）
+          required: true

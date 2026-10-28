@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞（私有报告）
+    url: https://github.com/zeokeel/Cordis/security/advisories/new
+    about: 请勿公开报告安全漏洞；详见 SECURITY.md
+  - name: 使用问题 / 设计讨论
+    url: https://github.com/zeokeel/Cordis/discussions
+    about: 不确定是否为 bug、需要用法讨论时使用（若 Discussions 未开启请用 issue 模板）
