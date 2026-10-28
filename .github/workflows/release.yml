@@ -60,12 +60,21 @@ jobs:
             -H 'User-Agent: zeokeel-cordis-release-workflow' \
             "https://crates.io/api/v1/crates/zeokeel-cordis/${version}")
           echo "crates.io status for ${version}: ${code}"
-          if [[ "$code" == "200" ]]; then
-            echo "already=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::zeokeel-cordis ${version} is already published on crates.io; skipping publish."
-          else
-            echo "already=false" >> "$GITHUB_OUTPUT"
-          fi
+          case "$code" in
+            200)
+              echo "already=true" >> "$GITHUB_OUTPUT"
+              echo "::warning::zeokeel-cordis ${version} is already published on crates.io; skipping publish."
+              ;;
+            404)
+              echo "already=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              # A transient API error (403/429/5xx) must not be mistaken for
+              # "not published": that would race a duplicate publish.
+              echo "cannot determine crates.io state for ${version} (HTTP ${code})" >&2
+              exit 1
+              ;;
+          esac
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy
@@ -92,6 +101,32 @@ jobs:
       # compile on its own before anything is uploaded.
       - name: verify package
         run: cargo package --locked
+      # Release-time hard gates: the same guarantees CI enforces must hold for
+      # the exact commit that is about to be published.
+      - name: no unfinished markers
+        run: |
+          if grep -rn -E "(TODO|FIXME|XXX|HACK|unimplemented!|todo!)" \
+              src tests examples docs spec README.md CHANGELOG.md CONTRIBUTING.md; then
+            echo "unfinished markers found; finish or remove them" >&2
+            exit 1
+          fi
+          if grep -rn "#\[ignore" src tests; then
+            echo "ignored tests are not allowed in a release gate" >&2
+            exit 1
+          fi
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: cargo deny (licenses, advisories, bans, sources)
+        run: cargo deny check
+      # The SBOM is part of the release evidence: generate it *before* the
+      # upload, and require byte-for-byte reproducibility.
+      - name: generate SBOM (CycloneDX, reproducible)
+        run: |
+          python3 scripts/sbom.py target/sbom-a.cdx.json
+          python3 scripts/sbom.py target/sbom-b.cdx.json
+          cmp target/sbom-a.cdx.json target/sbom-b.cdx.json
       - name: publish dry run
         if: steps.existing.outputs.already != 'true'
         run: cargo publish --dry-run --locked
@@ -103,14 +138,16 @@ jobs:
       # Attach the checksums of the staged crate to the GitHub release
       # (creating it if the maintainer did not). This runs on re-runs too, so a
       # failed bookkeeping step can be repaired by re-running the workflow.
-      - name: checksums + GitHub release asset
+      - name: checksums + SBOM + GitHub release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           version="${{ steps.meta.outputs.version }}"
           crate="target/package/zeokeel-cordis-${version}.crate"
           sha256sum "${crate}" | tee "${crate}.sha256"
+          cp target/sbom-a.cdx.json "target/zeokeel-cordis-${version}.cdx.json"
           if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release create "${GITHUB_REF_NAME}" --generate-notes
           fi
-          gh release upload "${GITHUB_REF_NAME}" "${crate}.sha256" --clobber
+          gh release upload "${GITHUB_REF_NAME}" \
+            "${crate}.sha256" "target/zeokeel-cordis-${version}.cdx.json" --clobber

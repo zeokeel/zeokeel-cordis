@@ -56,6 +56,19 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --all-targets --locked -- -D warnings
+      # A released kernel must not ship unfinished work: no TODO/FIXME/HACK
+      # markers, no ignored tests, no unimplemented!().
+      - name: no unfinished markers
+        run: |
+          if grep -rn -E "(TODO|FIXME|XXX|HACK|unimplemented!|todo!)" \
+              src tests examples docs spec README.md CHANGELOG.md CONTRIBUTING.md; then
+            echo "unfinished markers found; finish or remove them" >&2
+            exit 1
+          fi
+          if grep -rn "#\[ignore" src tests; then
+            echo "ignored tests are not allowed in a release gate" >&2
+            exit 1
+          fi
       # Executable architecture guard: the kernel must not grow business/I/O/
       # runtime dependencies or domain vocabulary (see docs/KERNEL-BOUNDARY.md).
       - name: kernel boundary
@@ -89,6 +102,20 @@ jobs:
       # file listing: catches manifest/include/readme mistakes before release.
       - name: package verify
         run: cargo package --locked
+      # The SBOM is release evidence: validate the generator and its
+      # reproducibility on every CI run, not only at release time.
+      - name: SBOM generator (reproducible)
+        run: |
+          python3 scripts/sbom.py target/sbom-a.cdx.json
+          python3 scripts/sbom.py target/sbom-b.cdx.json
+          cmp target/sbom-a.cdx.json target/sbom-b.cdx.json
+          python3 - <<'SBOM'
+          import json
+          doc = json.load(open("target/sbom-a.cdx.json"))
+          assert doc["bomFormat"] == "CycloneDX" and doc["specVersion"] == "1.5"
+          assert doc["components"], "SBOM must list runtime dependencies"
+          assert all(c.get("hashes") for c in doc["components"]), "every component needs a checksum"
+          SBOM
       - name: release build (overflow-checks)
         run: cargo build --release --locked
       - name: panic=abort is rejected at compile time
@@ -118,7 +145,121 @@ jobs:
         run: cargo test --locked
       - name: test (MSRV, supervision feature)
         run: cargo test --locked --features supervision
+      # Lint-set drift between 1.85 and stable is explicit and narrow: these
+      # two lints fire on 1.85 but not on the current stable clippy. Everything
+      # else must be warning-free on the MSRV too.
+      - name: clippy (MSRV, documented lint-set drift allowances)
+        run: >-
+          cargo clippy --locked --all-targets --
+          -D warnings
+          -A clippy::mutex_integer -A clippy::needless_lifetimes
+      - name: clippy (MSRV, supervision feature)
+        run: >-
+          cargo clippy --locked --all-targets --features supervision --
+          -D warnings
+          -A clippy::mutex_integer -A clippy::needless_lifetimes
       - name: doc (MSRV, all features)
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --locked --all-features
+
+  # Line coverage is a release gate, not a dashboard: the measured baseline is
+  # ~86.6% lines (all features). The threshold is a floor with a little slack
+  # so unrelated toolchain changes cannot silently erode coverage.
+  coverage:
+    name: coverage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Measure coverage
+        run: cargo llvm-cov --locked --all-features --fail-under-lines 85.5
+
+  # Miri checks the kernel against undefined behaviour and leaks. Unit tests
+  # leak deliberate test scaffolding, so they run with leak checking disabled;
+  # `miri_leaks` is a dedicated leak-clean scenario with leak checking enabled.
+  miri:
+    name: miri
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install Rust nightly with Miri
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: nightly
+          components: miri,rust-src
+      - name: Miri (unit tests, no leak check)
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation -Zmiri-ignore-leaks
+        run: cargo miri test --lib
+      - name: Miri (leak-checked scenario)
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: cargo miri test --test miri_leaks
+
+  # The kernel is a library that must behave the same on the big three
+  # platforms. This job is deliberately separate from the Ubuntu gate so a
+  # platform-specific regression (thread/timeout/ordering assumptions) is
+  # attributable.
+  cross-platform:
+    name: cross-platform (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+      - name: test (default)
+        run: cargo test --locked
+      - name: kernel boundary
+        run: cargo test --locked --test kernel_boundary
+      - name: test (supervision feature)
+        run: cargo test --locked --features supervision
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Check licenses, advisories, bans and sources
+        run: cargo deny check
+
+  workflows:
+    name: lint workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      # actionlint is not a cargo tool; use the pinned official image.
+      - name: Lint GitHub Actions workflows
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12

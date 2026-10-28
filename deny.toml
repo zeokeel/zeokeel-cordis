@@ -1,0 +1,48 @@
+# cargo-deny configuration for the kernel crate.
+#
+# The kernel keeps a deliberately small, general-purpose dependency tree
+# (serde_json, tracing, futures-util plus their transitive dependencies); this
+# configuration makes that policy enforceable in CI:
+# - only well-known permissive/OSI licenses are accepted;
+# - no yanked or RUSTSEC-advisory dependencies;
+# - crates must come from crates.io (no git/path surprises);
+# - duplicate versions are reported as warnings (Rust allows them, kernel
+#   consumers should still notice).
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+  "CC0-1.0",
+  "Unlicense",
+  "MPL-2.0",
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+# Allowances for licenses that are not present in the current dependency tree;
+# keeping a superset avoids churn when dependencies change.
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
