@@ -86,15 +86,64 @@ chore: ...          杂项
 - 公开 API 必须有 rustdoc（CI 以 `-D warnings` 检查失效链接）；
 - 不引入与内核职责无关的能力（loader、HMR、权限、沙箱、进程/WASM 隔离属宿主）。
 
+## 内核边界
+
+本仓库是**内核**，不是业务框架：内核只提供与业务无关的组合原语（context、service、
+fiber、effect、events、registry、config schema 机制、exec 桥、logger 设施、L2 观测
+原语）；业务逻辑、I/O、传输、持久化、领域配置与领域策略属于**插件层**或**宿主**。
+完整约定（三层模型、绝不属于内核清单、扩展点、依赖方向）见
+[`docs/KERNEL-BOUNDARY.md`](docs/KERNEL-BOUNDARY.md)。
+
+### 提交到 `src/` 的三条判据
+
+任何进入 `src/**` 或内核公共 API 的改动必须**同时**满足：
+
+1. **通用性**：不假设具体业务、产品、厂商、平台或部署形态；任何宿主都能用；
+2. **无业务名词**：公共类型/函数/错误/日志中不出现业务领域词汇（订单、支付、租户、
+   HTTP、数据库、缓存、环境变量等），也不出现具体传输/存储/运行时品牌；
+3. **可被任何宿主使用**：不绑定特定运行时、传输、存储或配置来源；运行时/IO/策略通过
+   扩展点注入（`BlockingExecutor`、`LogExporter`、`Plugin`/effect、L2 观测等）。
+
+**任一条不满足** → 业务能力应做成 example、插件或独立 crate，或由宿主实现；不要为了
+"方便"加进内核。
+
+### 运行时依赖与护栏（`tests/kernel_boundary.rs` v3）
+
+- 运行时依赖必须 ⊆ **`serde_json`、`tracing`、`futures-util`**。护栏会解析
+  `[dependencies]` 平铺、`[dependencies.X]` 表、`[target.'cfg(...)'.dependencies(.X)]`
+  （含 `[target.'cfg(...)'.dependencies]` 平铺 section），并把 `package = "..."` /
+  单引号 `package = '...'` 重命名解析成**真实包名**；禁止 `[build-dependencies]`、
+  `build =`/`build.rs`、`src/bin`，`[lib] path` 只能是 `src/lib.rs`，
+  `[features]` 只允许 `default`/`supervision` 且不得 `dep:` 引用依赖；
+- `src/**`（递归）不得引用：`std::fs`/`std::net`/`std::process`/`std::env`/`std::os`/
+  `std::path`/`std::io`、套接字/`File::open`/`OpenOptions`/`Command::new`、
+  `thread::spawn`/`thread::Builder`（`thread::park`/`current`/`Thread`/`panicking`
+  保留给 executor 与 panic 路径）。`tokio::`/`async_std::`/`smol::`/`reqwest::`/
+  `hyper::`/`sqlx::`、`env!`/`option_env!`/`include!`/`include_str!`/`include_bytes!`；
+  检查前会做注释词法器剥离（字符串保留）、`use` 分组展开与空白归一化；
+- 业务领域词按**标识符分词**匹配：代码 + 字符串里的 `payment_gateway`、`PaymentService`
+  等 snake_case/CamelCase 复合词都会命中 HARD 列表；另对**公开文档**（`///`/`//!`/
+  `/**...*/`/`#[doc="..."]`）用 `FORBIDDEN_DOC_WORDS` 扫描（同列表去掉 http/server/client，
+  因为内核文档需要描述 embedder 边界）；文件名 stem 同样检查；
+- `#![forbid(unsafe_code)]`（注释剥离后必须真实存在）与公共 API 上限 **420**
+  （含 `pub use`/`pub mod`，绊线）由护栏断言；调高 cap 或修改词表/匹配规则需评审并配
+  CHANGELOG 说明；
+- `[dev-dependencies]` 与 `examples/` **不检查**（测试专用 / 不进入库产物），但不得把
+  dev 依赖变成运行时依赖；
+- CI 的 `kernel boundary` 步骤（`cargo test --locked --test kernel_boundary`，**10 个测试**
+  = 4 个真实断言 + 6 个防绕过自测）以及全量 `cargo test --locked` 都会执行；
+  **PR 必须通过，不得 `#[ignore]` 或弱化断言来绕过**。
+
 ## Pull Request 清单
 
+- [ ] `cargo test --locked --test kernel_boundary` 通过（内核边界护栏）
 - [ ] `cargo test --locked` 与 `cargo test --locked --features supervision` 通过
 - [ ] `cargo fmt --all -- --check` 通过
 - [ ] 两种 feature 配置的 clippy 均为 `-D warnings` 干净（`--locked`）
 - [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked`（以及 `--all-features`）通过
 - [ ] 依赖有变更时已提交更新后的 `Cargo.lock`
 - [ ] 语义变更已同步 spec + tests + docs + CHANGELOG
-- [ ] 变更保持内核范围（见 README「内核 / 宿主边界」）
+- [ ] 变更满足内核边界三条判据（见 [`docs/KERNEL-BOUNDARY.md`](docs/KERNEL-BOUNDARY.md) 与上节「内核边界」）
 
 ## 发布流程（维护者）
 

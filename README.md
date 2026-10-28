@@ -63,14 +63,14 @@ cargo add zeokeel-cordis
 
 ```toml
 [dependencies]
-zeokeel-cordis = "0.4.3"
+zeokeel-cordis = "0.4.4"
 serde_json = "1"   # 插件配置是 serde_json::Value
 ```
 
 > crates.io 包名 `zeokeel-cordis` 与库目标名 `zeokeel_cordis` 一致：代码里统一
 > `use zeokeel_cordis::...`。
 > 需要跟仓库最新未发布代码时，可换成 git 依赖：
-> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.4.3" }`。
+> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.4.4" }`。
 
 最小插件（完整可运行版本：[`examples/hello.rs`](examples/hello.rs)）：
 
@@ -131,11 +131,32 @@ fn main() -> Result<()> {
 **宿主负责**：模块加载器与热更新、定时器/事件循环、权限与审计、资源配额策略、
 线程/fd 计量、进程隔离（L3）或 WASM 沙箱（L4）、UI/产品契约。
 
+### 内核 vs 插件层
+
+三层职责：**内核**（`src/**`，与业务无关的组合原语）→ **插件层**（业务能力，实现
+`Plugin`/`AsyncPlugin`）→ **宿主**（运行时、加载器、IO、权限、沙箱）。依赖方向单向：
+插件/宿主 → 内核；内核运行时依赖仅 `serde_json`、`tracing`、`futures-util`。
+
+- **绝不属于内核**：业务领域逻辑（订单/用户/租户等）、IO/网络/持久化/消息队列/HTTP/
+  数据库/缓存/文件系统/环境变量/进程管理、领域配置 schema、业务指标命名、业务策略
+  （重试/限流/鉴权等）——这些应做成 example/插件/独立 crate，或由宿主实现；
+- **扩展点**：`Plugin` trait、`internal/*` hooks、events/waterfall、L2 隔离、logger
+  exporter、exec blocking executor——业务需求通过这些点接入，**不改内核**；
+- **可执行护栏（v3 防绕过）**：`tests/kernel_boundary.rs`（10 个测试 = 4 个真实断言 +
+  6 个自测）会按真实包名解析依赖（平铺/表/target 平铺 section、`package =` /单引号
+  `package = '...'` 重命名，禁 build 脚本/
+  build-deps/`src/bin`，锁 `src/lib.rs`）、递归扫描 `src/**`（注释词法器剥离、字符串保留、
+  `use` 分组展开、空白归一化）禁用 IO/环境/线程创建/运行时 API 与 `env!`/`include*`、
+  业务词按标识符分词（`payment_gateway`/`PaymentService`）并扫描公开文档（doc 词表允许
+  http/server/client）、检查文件名，并断言 `forbid(unsafe_code)` + 公共 API 上限 420
+  （含 pub use/pub mod）；CI `kernel boundary` 步骤强制执行，**PR 必须通过**。完整约定、
+  三条判据与常见误判见 [`docs/KERNEL-BOUNDARY.md`](docs/KERNEL-BOUNDARY.md)。
+
 可选 feature `supervision` 提供 L2 监督原语（能力自省、per-fiber 配额、心跳与 watchdog
 观测），**默认关闭**——核心内核不含任何监督策略：
 
 ```toml
-zeokeel-cordis = { version = "0.4.3", features = ["supervision"] }
+zeokeel-cordis = { version = "0.4.4", features = ["supervision"] }
 ```
 
 详见 [`docs/KERNEL-ISOLATION.md`](docs/KERNEL-ISOLATION.md)。
@@ -149,6 +170,7 @@ zeokeel-cordis = { version = "0.4.3", features = ["supervision"] }
 | [`docs/DESIGN.md`](docs/DESIGN.md) | 设计思想、论文概念映射、12 条不变量、Rust 设计决策 |
 | [`docs/GUIDE.md`](docs/GUIDE.md) | 使用指南：服务、依赖注入、effect、事件、异步、隔离、热替换、关闭、测试 |
 | [`docs/KERNEL-ISOLATION.md`](docs/KERNEL-ISOLATION.md) | 故障边界、L1–L4 隔离模型、编译期强制、L2 API |
+| [`docs/KERNEL-BOUNDARY.md`](docs/KERNEL-BOUNDARY.md) | 内核 vs 插件层/宿主职责边界、依赖方向、扩展点与 CI 边界护栏 |
 | [`spec/CORDIS-CORE.md`](spec/CORDIS-CORE.md) | 规范性语义与编号用例（CORE-001…CORE-051，`tests/` 一一对应）|
 | [`docs/CORDIS-RUST.md`](docs/CORDIS-RUST.md) | Rust 移植笔记（与 TS 实现的差异、panic 策略）|
 | [`docs/dev/HARDENING-LOG.md`](docs/dev/HARDENING-LOG.md) | 历史开发记录（v0.3 时代）：缺陷清单与逐轮加固日志；历史快照，非当前行为（取消语义见 0.4.2 A-9）|
@@ -158,11 +180,18 @@ zeokeel-cordis = { version = "0.4.3", features = ["supervision"] }
 ## 质量与严格构建
 
 - **全量测试**：`cargo test`（默认构建）与 `cargo test --features supervision` 两套都必须全绿；
-  0.4.3 实测：默认构建 **404 passed / 0 failed**（含 7 个 doc-tests）、
-  `--features supervision` **415 passed / 0 failed**（0.4.2 为 365 / 371，0.4.1 基线
-  311 / 317）。本版扩展了
-  `tests/regression_core.rs` / `tests/regression_semantics.rs` 与 R3-A1/R3-A4/C1–C5/S1–S3/R1
-  审计回归用例（深链迭代卸载、动态卸载记账、when_idle 注册帧、配额活资源等）
+  0.4.4 实测：默认构建 **415 passed / 0 failed**（含 7 个 doc-tests）、
+  `--features supervision` **426 passed / 0 failed**（0.4.3 为 404 / 415，0.4.2 为
+  365 / 371，0.4.1 基线 311 / 317）。本版新增 S7 回归 1 个与 `tests/kernel_boundary.rs`
+  的 10 个架构测试（4 个真实断言 + 6 个自测），并延续 0.4.3 的
+  `regression_core` / `regression_semantics` 审计回归套件
+- **0.4.4 加固**：修复 S7——取消 recovery 时级联 root 帧的 deferred cleanup 收尾
+  （`ReparkGuard` 条件放宽为 `Unloading || (非 Disposed 且 deferred 非空)`、
+  `take_parked_unloads` 重新纳入可恢复集合、`when_idle()` 返回条件
+  `idle && !has_parked_unloads`，restored cleanup 在返回前恰好一次）；新增内核边界文档
+  [`docs/KERNEL-BOUNDARY.md`](docs/KERNEL-BOUNDARY.md) 与 **v3 架构护栏**
+  `tests/kernel_boundary.rs`（10 个测试 = 4 个真实断言 + 6 个自测，CI `kernel boundary`
+  步骤强制执行，PR 必须过）。反向依赖索引优化**不在 0.4.4**，移至 0.4.5（设计评审中）。
 - **0.4.3 加固**：R3-A4 动态卸载父 fiber 记账无界泄漏（60k churn 60001 effects → 10k churn
   峰值 1，RSS 基本持平（实测 +≈1 MB））、R3-A1 深依赖链迭代卸载（栈 O(1)；2 MiB 线程
   depth 800 在 **0.4.3 debug+release 均通过**，0.4.2 对照 debug 约 480 层即 abort、release
@@ -175,8 +204,8 @@ zeokeel-cordis = { version = "0.4.3", features = ["supervision"] }
 - 编译器强制 `panic = "unwind"`（`panic=abort` 直接编译失败，CI 反证）；
   release 开启 `overflow-checks`、`codegen-units=1`、thin LTO
 - **CI 实际行为**（`.github/workflows/ci.yml`）：
-  - `rust` 作业（stable）：fmt、clippy ×2、test ×2、doc ×2、examples 构建 + 冒烟运行、
-    真实 `cargo package` verify、release 构建、`panic=abort` 反证；
+  - `rust` 作业（stable）：fmt、clippy ×2、**kernel boundary 架构测试**、test ×2、doc ×2、
+    examples 构建 + 冒烟运行、真实 `cargo package` verify、release 构建、`panic=abort` 反证；
   - `msrv` 作业（**Rust 1.85.0**）：test ×2 与 `doc --all-features`（**不跑 clippy**——
     lint 集合随 stable 漂移，MSRV 只需 build/test/doc 通过）；
   - `cargo audit`（RustSec）供应链漏洞门禁；
@@ -214,6 +243,9 @@ zeokeel-cordis = { version = "0.4.3", features = ["supervision"] }
 - **深依赖链卸载已支持（0.4.3）**：迭代级联、栈 O(1)。2 MiB 线程 depth 800 在 0.4.3
   **debug 与 release 均通过**；0.4.2 对照为 debug 约 480 层即 abort、release 约 2200 层才
   abort。`MAX_PLUGIN_DEPTH = 256` 仍只限制插件**加载**深度。
+- **性能 backlog（0.4.4）**：5000 fiber fanout 场景下 `create`/`dispose_all` 比 0.4.2 慢
+  约 **25–35%**（1k fiber 更快或持平，RSS 与正确性无回归）；反向依赖索引优化计划在
+  **0.4.5**（设计评审中），0.4.4 不声称已实现。
 - **事件作用域过滤 = isolate 映射相等**（非子树）；无类型化事件表。
 - **无抢占**：watchdog/取消是协作式的；内核不会强杀插件线程。
 
@@ -241,8 +273,8 @@ GitHub topics —
 
 ## 状态与许可证
 
-- 当前版本 **v0.4.3**（CORE-001…CORE-051；0.4.2/0.4.3 均为修复/加固补丁，未新增 CORE
-  用例）；v0.4.x 为语义冻结线。
+- 当前版本 **v0.4.4**（CORE-001…CORE-051；0.4.2/0.4.3/0.4.4 均为修复/加固补丁，未新增
+  CORE 用例）；v0.4.x 为语义冻结线。
 - MIT，见 [LICENSE](LICENSE)；论文版权归原作者。
 
 维护仓库：<https://github.com/zeokeel/zeokeel-cordis>（提交作者 `zeokeel-dev`）。

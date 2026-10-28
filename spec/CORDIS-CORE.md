@@ -1,18 +1,18 @@
 # Cordis Core — normative specification
 
-Status: **v0.4.3**. The Rust crate (repository root) is the reference implementation of
+Status: **v0.4.4**. The Rust crate (repository root) is the reference implementation of
 this document. A behavior that is not written here is not part of the contract.
 
-Editorial revision v0.4.3: the prose and the API surface below were re-checked against
-the `v0.4.3` crate. No CORE case is added, renumbered or removed — v0.4.2 and v0.4.3
-are patch releases that fix the implementation against requirements this document
+Editorial revision v0.4.4: the prose and the API surface below were re-checked against
+the `v0.4.4` crate. No CORE case is added, renumbered or removed — v0.4.2, v0.4.3 and
+v0.4.4 are patch releases that fix the implementation against requirements this document
 already implied, plus contracts stated outside it (`docs/CORDIS-RUST.md` §3 panic
 policy, `docs/DESIGN.md` I5 type-error reporting). v0.4.3 additionally makes explicit
 the deep-dependency-chain teardown order, the `when_idle` self-registration exclusion,
 Plugin metadata panic containment, live-resource quota accounting, nested-effect
 diagnostics filtering and the `AccessorWriteRejected` error. Where a release makes a
-previously unstated edge explicit it is marked "(v0.4.3)" below; such a mark is a
-clarification of an existing case, not a new case.
+previously unstated edge explicit it is marked "(v0.4.3)"/"(v0.4.4)" below; such a
+mark is a clarification of an existing case, not a new case.
 
 ## 1. Scope
 
@@ -36,6 +36,17 @@ is core semantics.
 The core does *not* own: module loading, timers, configuration file formats, agent
 or tool contracts, permissions, sandboxing, UI composition. These are embedder
 concerns built on top of the core.
+
+> **Editorial note (v0.4.4): kernel vs plugin boundary.** The kernel/plugin/embedder
+> layering, the "never in the kernel" list (business domain logic; I/O, network,
+> persistence, HTTP, databases, caches, filesystem, environment, process control;
+> domain config schemas; business metrics; business policy), the dependency
+> direction (`src/**` may use only `serde_json`, `tracing`, `futures-util`) and the
+> extension points are documented in
+> [`docs/KERNEL-BOUNDARY.md`](../docs/KERNEL-BOUNDARY.md) and enforced by
+> `tests/kernel_boundary.rs` plus a CI step. This note adds **no CORE case**: it
+> only states where implementers and embedders are expected to put business
+> capabilities (plugins/examples/separate crates or the host, not the kernel).
 
 ## 2. Core model
 

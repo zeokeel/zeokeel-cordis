@@ -5,7 +5,7 @@
 > 下面 L2–L4 只是写给 embedder 的**建议方案**（在 crate 之外实现），不是本 crate 的
 > 实现范围。内核自身只承诺 §3 所列的 in-process fault containment。
 
-> 适用版本：v0.4.3（v0.2.0 基线 + v0.3.0 加固 + v0.4.2/0.4.3 的遏制与语义修正）。
+> 适用版本：v0.4.4（v0.2.0 基线 + v0.3.0 加固 + v0.4.2/0.4.3/0.4.4 的遏制与语义修正）。
 > 本文回答一个问题：**"插件崩溃会不会拖垮内核？"** 答案分两半——**可捕获的 panic
 > 不会；Rust 进程内不可恢复的故障会**。本文给出实测证据、我们据此作出的承诺，以及
 > 要做到"Linux 内核级"所必需的外层隔离方案。
@@ -249,8 +249,9 @@ CI 另加 `cargo audit`（RustSec）作业，对依赖做供应链漏洞门禁�
 - 隔离探针：`target/scratch/redteam-isolation/`（`iso` = unwind 构建、`aborter` = abort 构建，
   `run.sh` 逐个场景，`timeout` 作 watch-dog；该目录是 gitignored 的本地探针产物）。
 - 内核内遏制测试：`tests/containment.rs`（11 个边界用例）、`tests/hardening.rs`
-  （CORE-028…039）、v0.3 新增的退化测试，以及 v0.4.2/v0.4.3 的加固回归套件
-  `tests/regression_core.rs` / `tests/regression_semantics.rs` / `tests/l2_defenses.rs`
+  （CORE-028…039）、v0.3 新增的退化测试，v0.4.2/v0.4.3 的加固回归套件
+  `tests/regression_core.rs` / `tests/regression_semantics.rs` / `tests/l2_defenses.rs`，
+  以及 v0.4.4 的架构护栏 `tests/kernel_boundary.rs`（10 个测试 = 4 个真实断言 + 6 个自测）
   （部分需要内部状态的用例以 `src/fiber.rs` 内的 unit test 断言，见 CHANGELOG）。
   深依赖链回归：`regression_core::r1_deep_plugin_chain_activates_on_a_2mib_thread`
   （2 MiB 线程上的深层 plugin 链激活 + 迭代卸载；加载深度受 `MAX_PLUGIN_DEPTH = 256` 限制）
@@ -259,7 +260,7 @@ CI 另加 `cargo audit`（RustSec）作业，对依赖做供应链漏洞门禁�
   depth 800」对照验证来自轮 4 探针：0.4.3 debug+release 均 PASS，0.4.2 对照 debug 约 480
   层即 abort。
 - 结论复跑：`cargo test`（默认构建）与 `cargo test --features supervision`
-  （启用 L2 API 的全部用例）；两套都应全绿（v0.4.3：404 / 415）。
+  （启用 L2 API 的全部用例）；两套都应全绿（v0.4.4：415 / 426）。
 
 ## 8. 与 Linux 内核类比（为什么这个答案是诚实的）
 

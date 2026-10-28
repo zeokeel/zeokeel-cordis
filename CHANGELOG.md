@@ -8,6 +8,65 @@
 **v0.4.x 语义冻结**：不再新增语义能力；仅接受 bugfix、安全修复、性能改进（不改变语义）
 与文档修正。
 
+## [0.4.4] - 2026-10-29
+
+**内核边界 + 取消 recovery 收尾补丁**：不新增语义能力，也不新增/重命名任何 CORE 用例。
+本版把「内核 vs 插件层 / 宿主」的可执行边界（文档 + CI 护栏）固化，并修复 S7——取消
+recovery 时级联根帧的 deferred cleanup 可能延后到显式 dispose 的 P2 边界。反向依赖索引
+优化**不在本版**（移至 0.4.5，设计评审中）。默认 `cargo test`（含 7 个 doc-tests）
+**415 passed / 0 failed**、`--features supervision` **426 passed / 0 failed**（以发布前
+门禁最终实测为准；0.4.3 为 404/415，本版为 +S7 1 个 + `kernel_boundary` 10 个）。
+
+### Fixed
+
+- **S7：取消 recovery 的 root 帧 deferred cleanup 收尾**：恢复在级联根帧上被取消时，fiber
+  可能已落到目标态（`Pending`），但 `CancelSafeDrain` 恢复出的剩余 async cleanup 留在
+  `deferred_async`；旧行为下 `when_idle()` 会先报 idle，要等下一次显式
+  `dispose`/`dispose_all` 才执行。修复为：
+  - `ReparkGuard` 的 re-park 条件放宽为
+    `state == Unloading || (state != Disposed && !deferred_async.is_empty())`；
+  - `Registry::take_parked_unloads` 把上述两类帧重新纳入**可恢复集合**（`Disposed` 帧的
+    deferred cleanup 仍按 A-9 留给显式重试）；
+  - `when_idle()` 的返回条件改为 `idle && !has_parked_unloads()`。
+  于是恢复出的 cleanup 在 `when_idle()` 返回前**恰好执行一次**（不重复、不静默延后）。
+  回归：`regression_core::s7_cancelled_recovery_drains_root_deferred_cleanup`。
+
+### Docs
+
+- 新增 [`docs/KERNEL-BOUNDARY.md`](docs/KERNEL-BOUNDARY.md)：内核 / 插件层 / 宿主三层职责、
+  **绝不属于内核**清单、依赖方向（`src/**` 仅允许 `serde_json` / `tracing` /
+  `futures-util`）、扩展点、三条判据与常见误判。
+- 新增 **v3 架构护栏** `tests/kernel_boundary.rs`（10 个测试 = 4 个真实断言 + 6 个自测）：
+  - 依赖：解析 `[dependencies]` 平铺 / `[dependencies.X]` 表 /
+    `[target.'cfg(...)'.dependencies(.X)]`（含 `[target.'cfg(...)'.dependencies]` 平铺
+    section），把 `package = "..."` / 单引号 `package = 'tokio'` 重命名解析为**真实包名**；运行时依赖 ⊆ `{serde_json, tracing,
+    futures-util}`；禁 `[build-dependencies]`、`build =`/`build.rs`、`src/bin`；`[lib] path`
+    只能是 `src/lib.rs`；`[features]` 仅 `default`/`supervision` 且不得 `dep:` 引用依赖；
+  - 源码：递归扫描 `src/**`，注释用词法器剥离（**字符串保留**）、`use` 分组展开、全空白
+    归一化；禁 `std::fs/net/process/env/os/path/io`、套接字/`File::open`/`OpenOptions`/
+    `Command::new`、`thread::spawn`/`thread::Builder`（保留 `park`/`current` 等 executor
+    原语）、tokio/async-std/smol/reqwest/hyper/sqlx、`env!`/`option_env!`/`include!`/
+    `include_str!`/`include_bytes!`；
+  - 业务词：代码 + 字符串按**标识符分词**（`payment_gateway`/`PaymentService` 均命中）+
+    文件名 stem；**公开文档**（`///`/`//!`/`/**...*/`/`#[doc]`）单独用 doc 词表扫描
+    （允许 http/server/client），普通注释与 `#[cfg(test)]` 模块不参与代码词扫描；
+  - 契约：注释剥离后真实存在 `#![forbid(unsafe_code)]`；公共 API 上限 **420**（含
+    `pub use`/`pub mod`，tripwire）；
+  - 6 个自测证明能抓：表依赖/`package =` 重命名、`[target.'cfg(...)'.dependencies]` 平铺
+    section 与单引号 `package = 'tokio'` 重命名、`use` 分组+空格归一化路径、
+    snake_case/CamelCase 分词、doc 注释收集、注释伪造 `#![forbid(unsafe_code)]` 与
+    字符串 `//` 误剥。
+  CI 的 `kernel boundary` 步骤（`cargo test --locked --test kernel_boundary`）强制执行；
+  **PR 必须通过**，不得 `#[ignore]`/弱化断言绕过。
+- `README.md` / `CONTRIBUTING.md` / `docs/DESIGN.md` 同步边界分层与判据；
+  `spec/CORDIS-CORE.md` 仅加 editorial note 指向边界文档（**不新增 CORE ID**）。
+
+### Backlog（移出本版）
+
+- **反向依赖索引（性能）**：从 0.4.4 **移至 0.4.5**（设计评审中）。0.4.3 报告的
+  5000-fiber fanout `create`/`dispose_all` 慢约 25–35% 仍是已知 backlog（见 0.4.3
+  Known limitations，计划版本已更新为 0.4.5）；0.4.4 不声称该优化已实现。
+
 ## [0.4.3] - 2026-10-29
 
 **审计加固补丁**：不新增语义能力，也不新增/重命名任何 CORE 用例；修复第三轮对抗审计确认的
@@ -167,13 +226,15 @@
   当作一个条目、**无法单独定位**其中某个坏插件。这是对已损坏插件的最佳努力隔离（非受支持
   配置），宿主应修复其 `key()`。
 - **性能 backlog（0.4.3 已知回归）**：5000 fiber fanout 场景下 create / `dispose_all` 比
-  0.4.2 慢约 **25–35%**（1k fiber 更快或持平，RSS 与正确性无回归）。计划在 0.4.4 以反向
-  依赖索引优化；在此之前超大 fanout 的宿主应评估批量操作的耗时。
+  0.4.2 慢约 **25–35%**（1k fiber 更快或持平，RSS 与正确性无回归）。计划在 **0.4.5** 以
+  反向依赖索引优化（0.4.4 已将该优化移出）；在此之前超大 fanout 的宿主应评估批量操作的
+  耗时。
 - **取消 recovery 时少数 restored cleanup 延后（0.4.3 已知边界，P2）**：当一次 recovery
   正在处理 parked 帧、且在某个作为级联根的 fiber 上被取消时，该 fiber 完成到 `Pending` 后，
   其 `CancelSafeDrain` 恢复的剩余 async cleanup 可能被留在 `deferred_async`，直到下一次显式
   `dispose`/`dispose_all` 才执行（不会重复执行，也不会永久 `Unloading`/挂起；`when_idle`
-  可能先行报 idle）。计划在 0.4.4 让恢复路径把这些 deferred cleanup 重新纳入可恢复集合。
+  可能先行报 idle）。**已在 0.4.4（S7）修复**：恢复路径把这类帧重新纳入可恢复集合，
+  `when_idle()` 返回前会先执行完恢复出的 cleanup（见 0.4.4 Fixed）。
 - 其余进程内不可遏制边界不变：插件自身递归导致的栈溢出、`panic="abort"`、OOM/allocator
   abort、`unsafe` UB、`process::abort/exit`、死循环/死锁、外部 kill（见
   `docs/KERNEL-ISOLATION.md`）。

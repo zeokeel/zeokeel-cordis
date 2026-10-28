@@ -3,8 +3,8 @@
 Companion to `spec/CORDIS-CORE.md`. This file records how the Rust port relates to
 the JavaScript Cordis reference, what the Rust-only extensions add, which failures
 the kernel contains, and what the crate deliberately does not support. It is
-descriptive; the specification stays normative. Baseline: crate version `0.4.3`
-(tag `v0.4.3`).
+descriptive; the specification stays normative. Baseline: crate version `0.4.4`
+(tag `v0.4.4`).
 
 ## 1. Deliberate differences from the TypeScript reference
 
@@ -317,6 +317,14 @@ existing contracts and make the previously unstated edges below explicit. See
     leave it set and disable later recovery), and the batch of taken frames is
     owned by a **`ReparkGuard`/`RecoveryBatch`**: a recovery cancelled mid-batch
     re-parks every unprocessed/failed frame instead of losing it.
+  - **S7 (v0.4.4):** a recovery cancelled while finishing the cascade **root**
+    can leave the fiber on its target state (`Pending`) with
+    `CancelSafeDrain`-restored cleanups in `deferred_async`. `ReparkGuard` now
+    also re-parks frames that are `Unloading` **or** non-`Disposed` with a
+    non-empty deferred list, `take_parked_unloads` re-admits them, and
+    `when_idle()` returns only when idle **and** no parked unloads remain — the
+    restored cleanup runs exactly once before it returns (0.4.3 could report
+    idle early and defer them to an explicit dispose).
   - **F5:** `when_idle()` is recovery-aware in **both** `Context::when_idle()`
     and the raw public `Registry::when_idle()`: the wait loop retries recovery
     whenever parked frames are recoverable (woken on idle or parked-recoverable,
@@ -475,18 +483,20 @@ still waits for the teardown.
   idempotent/deduped/bounded and may be deferred; an async cleanup already in
   flight at cancellation time stays unrecoverable (A-9), while `is_idle()`
   remains strictly `false` until recovery runs.
-- **Deferred cleanups can outlive a cancelled recovery (v0.4.3, P2).** If a
-  recovery pass is cancelled while it is finishing the *root* frame of a
-  cascade, the remaining `CancelSafeDrain`-restored async cleanups of that
-  fiber can stay in `deferred_async` until the next explicit
-  `dispose`/`dispose_all`; they are not run twice, and the fiber does not stay
-  `Unloading`, but `when_idle()` may report idle before they run. Scheduled for
-  0.4.4 (re-add them to the recoverable set).
+- **Deferred cleanups outliving a cancelled recovery — fixed in v0.4.4 (S7).**
+  In 0.4.3, cancelling a recovery while it finished the cascade *root* could
+  leave `CancelSafeDrain`-restored cleanups in `deferred_async` until an
+  explicit `dispose`/`dispose_all` (the fiber was on its target state, so
+  `when_idle()` could report idle first). v0.4.4 re-parks frames that are
+  `Unloading` **or** non-`Disposed` with non-empty `deferred_async`
+  (`ReparkGuard`), re-admits them in `take_parked_unloads`, and makes
+  `when_idle()` return only when idle **and** `!has_parked_unloads()`; each
+  restored cleanup runs exactly once before the wait completes.
 - **Performance backlog (v0.4.3).** On a 5000-fiber fanout, create /
   `dispose_all` are about **25–35% slower** than 0.4.2 (1k fibers are faster or
   on par; RSS and correctness show no regression). A reverse-dependency index is
-  planned for **0.4.4**; until then very large fanouts should evaluate batch
-  timing.
+  planned for **0.4.5** (moved out of 0.4.4; design review in progress); until
+  then very large fanouts should evaluate batch timing.
 - **Degraded plugin keys are not individually addressable (C2).** Every plugin
   whose `Plugin::key()` panics shares one
   `PluginKey::Named("<panicked plugin>")` runtime, so `keys`/`replace`/`delete`
