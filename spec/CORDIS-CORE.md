@@ -1,17 +1,18 @@
 # Cordis Core — normative specification
 
-Status: **v0.4.2**. The Rust crate (repository root) is the reference implementation of
+Status: **v0.4.3**. The Rust crate (repository root) is the reference implementation of
 this document. A behavior that is not written here is not part of the contract.
 
-Editorial revision v0.4.2: the prose and the API surface below were re-checked against
-the `v0.4.2` crate. No CORE case is added, renumbered or removed — v0.4.2 is a patch
-release that fixes the implementation against requirements this document already
-implied, plus two contracts stated outside it: the waterfall panic policy in
-`docs/CORDIS-RUST.md` §3 (sync and async lanes must behave the same) and the
-"service type errors must be reported, not silently accepted" invariant
-`docs/DESIGN.md` I5. Where 0.4.2 makes a previously unstated edge explicit it is
-marked "(v0.4.2)" below; such a mark is a clarification of the existing case,
-not a new case.
+Editorial revision v0.4.3: the prose and the API surface below were re-checked against
+the `v0.4.3` crate. No CORE case is added, renumbered or removed — v0.4.2 and v0.4.3
+are patch releases that fix the implementation against requirements this document
+already implied, plus contracts stated outside it (`docs/CORDIS-RUST.md` §3 panic
+policy, `docs/DESIGN.md` I5 type-error reporting). v0.4.3 additionally makes explicit
+the deep-dependency-chain teardown order, the `when_idle` self-registration exclusion,
+Plugin metadata panic containment, live-resource quota accounting, nested-effect
+diagnostics filtering and the `AccessorWriteRejected` error. Where a release makes a
+previously unstated edge explicit it is marked "(v0.4.3)" below; such a mark is a
+clarification of an existing case, not a new case.
 
 ## 1. Scope
 
@@ -91,6 +92,11 @@ concerns built on top of the core.
   defence in depth, so a store entry can never change its concrete type. An
   `internal/set` hook can only veto the write, it cannot substitute a value.
   A wrong-typed overwrite can no longer silently replace a service.
+  **Accessor write rejection (v0.4.3)**: when a computed accessor has a setter and
+  that setter returns `false` (the owner inspected the value and rejected it), the
+  write returns `CordisError::AccessorWriteRejected(name)` — distinct from
+  `ServiceWriteForbidden` (another fiber owns the service) and
+  `AccessorReadOnly` (the accessor has no setter).
 - **Injection gate vs. read lane (v0.4.2)**: `ctx.service_available(name)` and the
   `inject` gate use the **strict** query — the service must be stored, its
   availability check must pass, **and** the providing fiber must be `Active`.
@@ -184,6 +190,25 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   loads below a root-level plugin are accepted and the next one fails.
   Context-only nesting (`extend`/`intercept`/`extend_meta`, e.g. 300 levels)
   consumes no budget at all.
+  **Dynamic child bookkeeping is bounded (v0.4.3, R3-A4)**: a child fiber that
+  disposes itself detaches its ownership effect from the parent's effect list
+  (and its effect-node / weak-child-list entries), and a parent effect list that
+  grows past a threshold amortizes away already-disposed ownership effects, so
+  repeated dynamic load/unload cycles cannot accumulate an unbounded effect list
+  on the parent.
+  **Deep dependency chains unload iteratively (v0.4.3, R3-A1)**: unloading uses a
+  two-phase, order-preserving cascade — every transitively-unready fiber is
+  *begun* provider-before-dependent (marked `Unloading`, services withdrawn,
+  effects taken) and the frames are then drained in reverse order (an equivalent
+  dependents-before-provider cleanup order); ownership descendants are collected
+  with an explicit DFS stack. The call stack is therefore O(1) in the chain depth:
+  on a 2 MiB thread, depth 800 passes in both debug and release builds in v0.4.3
+  (v0.4.2 comparison: debug aborted at about 480 levels, release at about 2200),
+  far beyond anything the 256-level loading limit can create. The cascade has a
+  `fiber_count + 2` fixed-point bound;
+  any leftover dependent stays `Active` and can be retried by a later
+  dispose/refresh. This supersedes the former "deep chain dispose can overflow
+  the stack" limitation.
 - **Pending-dispose finalisation (v0.4.2)**: when a parent unload flags a busy
   child for disposal, every lifecycle entry point (`restart`, `restart_async`,
   `update`, `update_async`) finalises the pending dispose on **all** exit paths —
@@ -202,6 +227,16 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   parent reached its target state and its effects were taken. A failed activation
   rollback and stale-activation discard log sweep panics instead of propagating
   them.
+- **Plugin metadata panics are contained (v0.4.3, C2)**: `Plugin::name` /
+  `::key` / `::inject` / `::config_schema` (and the `AsyncPlugin` counterparts)
+  are embedder code invoked during creation, replacement, restart, diagnostics
+  and dependency resolution. A panic in them is caught, logged and degraded
+  deterministically: `name()` → `"<panicked plugin>"`,
+  `key()` → `PluginKey::Named("<panicked plugin>")` (such plugins share one
+  runtime), `inject()` → `&[]` (no dependency gating), `config_schema()` →
+  `None` (raw config accepted, no validation). It never unwinds out of
+  `ctx.plugin`/replace or poisons a kernel lock; the affected plugin is still a
+  broken plugin (best-effort isolation, not a repair).
 - **Activation epochs (v0.4.2)**: effects registered during an activation attempt
   are tagged with that attempt's epoch (a thread-local activation frame, carried
   across executor migration for async activation), so a concurrent restart
@@ -246,7 +281,9 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   immediately there (v0.4.2 boundary; the registry-level registration guard is
   not visible to it).
 - Diagnostics: `fiber.uid`, `fiber.parent`, `fiber.get_effects()` returning the
-  `EffectMeta` tree (CORE-012).
+  `EffectMeta` tree (CORE-012). Since v0.4.3 the snapshot is filtered to **live**
+  effect nodes: a nested effect disposed early by the user no longer leaves a
+  ghost node under its parent's metadata (C3).
 
 ### 2.4 Effects
 
@@ -351,9 +388,50 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   for shutdown/health; it does not provide preemption or forced cancellation.
   Since v0.4.2 the whole registration→activation window of `ctx.plugin*` counts
   as in-flight work: from the context entry point through the `internal/plugin`
-  create hook and up to the end of activation. `is_idle()`/`when_idle()` stay
-  busy for that window, so a hook that blocks inside it keeps the registry
-  non-idle.
+  create hook and up to the end of activation. Since v0.4.3 (R3-A3/C4) the
+  registry records which **thread created** each in-flight registration:
+  `when_idle()` subtracts the caller's own registrations, so a create hook can
+  await it without waiting for itself, while external waiters keep the full
+  registration-window guarantee. `is_idle()` stays **strict** (it excludes
+  nothing, so the window is non-idle for every observer). **Boundary:** two
+  threads whose registrations mutually await each other's window can still
+  deadlock; the kernel does not detect cyclic registration dependencies.
+- **Cancelled-cascade recovery (v0.4.3, F1/F4/F5)**: a cancelled async unload
+  cascade may temporarily park non-root dependents in `Unloading`.
+  - **Recovery entries (F1)**: `Registry::when_idle()`/`Context::when_idle()`,
+    `refresh_async()`, `dispose_all()`, and a retried root
+    `Fiber::dispose()`/`dispose_async()` recover such parked frames to their
+    **original cascade target** (`Pending` for dependency dependents,
+    `Disposed` for ownership children); unstarted deferred async cleanups run
+    exactly once during recovery.
+  - **Latched safely (F4)**: the single-recoverer latch is an RAII guard (a
+    cancelled or panicking recovery cannot leave it set and disable later
+    recovery), and the batch of taken frames is re-parked on cancellation:
+    recovery interrupted mid-batch loses no frame.
+  - **Waits keep recovering (F5)**: `when_idle()` is recovery-aware on **both**
+    the `Context` and the raw public `Registry` API — the wait loop retries
+    recovery whenever parked frames are recoverable (bounded, with a fallback),
+    so frames parked while waiting cannot hang it. **Synchronous `refresh()`
+    deliberately does not recover parked frames**: it may run on a reactor
+    thread, where draining async cleanups synchronously would deadlock; it
+    skips `Unloading` frames and leaves recovery to the entries above.
+  - Recovery is idempotent, deduplicated and bounded by the number of
+    concurrently parked frames; it is deferred to the next root operation while
+    a cancellation unwind or another unload is in progress. If the cancellation
+    lands while an async cleanup is executing, that in-flight future is not
+    recoverable (the A-9 boundary) but the fiber never stays permanently
+    `Unloading`; `is_idle()` is strict and remains `false` until recovery runs.
+- **Quotas count live resources (v0.4.3, S1, `supervision` feature)**: per-fiber
+  `FiberQuota` limits apply to live effects/listeners/child fibers. Effects
+  whose disposer has run are pruned from the quota check, a listener slot is
+  released exactly once by whichever path comes first (user disposer, a `once`
+  listener's auto-removal, or fiber unload), and child fibers are counted by live
+  weak handles. Released slots are reusable immediately; exceeding a limit still
+  returns `CordisError::QuotaExceeded` and rolls the activation back. The kernel
+  itself holds internal effects (the root logger provide effect plus one
+  ownership effect per dynamically loaded child fiber) and the quota counts them:
+  **`max_effects` should be ≥2**; a quota of `1` starves the kernel itself and no
+  plugin can load.
 - **Cooperative cancellation (v0.3.0)**: `Fiber::cancel()`/`is_cancelled()` set
   a flag and `Context::checkpoint()` returns `Err(CordisError::Cancelled)` once
   set, so long-running plugin work can unwind through the normal failure/rollback
@@ -407,7 +485,9 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   but **no exporter**: records only reach the ring buffer until the embedder
   installs one with `ctx.log_exporter(...)` (v0.4.2 clarification —
   `TracingExporter` is the adapter that forwards records to `tracing`; the
-  kernel's own diagnostic `tracing` events are an independent channel).
+  kernel's own diagnostic `tracing` events are an independent channel). An
+  **invalid numeric level** in logger config is clamped to the safe end
+  (`Error`) since v0.4.3 (S2); string levels are unchanged.
 - `Context::resolve_config` merges `ConfigSchema` layers base → root intercept →
   child intercept → head; `Plugin::config_schema` validation failures surface as
   `CordisError::Validation` and never replace the previous config (CORE-024).
@@ -431,7 +511,9 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
     `required(name)` demands an explicit value.
 - `ctx.accessor` / `ctx.accessor_with_setter` expose computed context properties;
   reads of services first consult accessors, and a setter-less accessor rejects
-  writes with `CordisError::AccessorReadOnly`. A panicking accessor getter is
+  writes with `CordisError::AccessorReadOnly`. Since v0.4.3 a **writeable**
+  accessor whose setter returns `false` rejects the write with the dedicated
+  `CordisError::AccessorWriteRejected(name)` (S3). A panicking accessor getter is
   contained and the read is treated as **absent**: `ctx.get` / `get_named` /
   `get_any` return `None` (v0.4.2; the old placeholder value is gone).
   `ctx.extend_meta` / `ctx.meta` / `ctx.meta_any` store and read metadata on
@@ -448,6 +530,8 @@ fn apply_async<'a>(&'a self, ctx: Context, config: Value) -> BoxFuture<'a, Resul
 
 - `ctx.plugin_async(Arc<dyn AsyncPlugin>, Value)` awaits activation when `inject`
   dependencies are already available; otherwise the fiber stays `Pending`.
+  `AsyncPlugin` metadata callbacks are contained with the same degradation as the
+  sync trait (v0.4.3, C2).
 - `ctx.refresh_async()` re-evaluates fibers (including awaiting async
   activation/unload). The synchronous `ctx.refresh()` intentionally only handles
   sync plugins. Both run a **bounded fixed point**: at most 64 passes, each
@@ -533,7 +617,10 @@ already runs a lifecycle operation on the fiber). v0.4.2 adds
 `ServiceTypeMismatch(name)` (a `ctx.set`/`set_any` write with the wrong type) and
 `Rollback(message)`
 (a `Registry::replace` rollback did not complete; the message carries the
-original error and the rollback error).
+original error and the rollback error). v0.4.3 adds
+`AccessorWriteRejected(name)` (a computed accessor's setter inspected the write
+and returned `false`; distinct from `ServiceWriteForbidden` and
+`AccessorReadOnly`).
 
 `impl Context` (grouped):
 
@@ -588,13 +675,15 @@ Every case below is asserted by the Rust test-suite in `tests/`
 violation, not a test bug. Test names are listed per ID where the mapping is 1:1;
 group IDs point at the file that owns the cases.
 
-The v0.4.2 fixes (no new cases, see §6) are additionally covered by
+The v0.4.2/v0.4.3 fixes (no new cases, see §6) are additionally covered by
 `tests/regression_core.rs` (lifecycle/registry hardening: FIX-1…FIX-9, FIX-14,
-concurrent replace/dispose `D-1`, replace reload panic `D-2`) and
+concurrent replace/dispose `D-1`, replace reload panic `D-2`, and the v0.4.3
+audit set `r1_*` / `c1_*` / `c2_*` / `c3_*` / `c4_*` / `r3a4_*`), by
 `tests/regression_semantics.rs` (injection/config/reflect/waterfall hardening:
-FIX-12…FIX-21, plus async-teardown retry/self-join S-1/S-2). Fixes that need
-internal state which the public API cannot
-construct are asserted by `#[cfg(test)]` unit tests inside `src/fiber.rs`.
+FIX-12…FIX-21, async-teardown retry/self-join S-1/S-2, `c4_when_idle_*`), and by
+`tests/l2_defenses.rs` (live-resource quota slots, S1). Fixes that need internal
+state which the public API cannot construct are asserted by `#[cfg(test)]` unit
+tests inside `src/fiber.rs`.
 
 | ID | Requirement | Test(s) |
 | --- | --- | --- |
@@ -602,14 +691,14 @@ construct are asserted by `#[cfg(test)]` unit tests inside `src/fiber.rs`.
 | CORE-002 | Child contexts inherit provider registrations | `service::service_is_visible_across_sibling_fibers` |
 | CORE-003 | `isolate` shadows a service for the child subtree only | `lifecycle::isolate_shadows_parent_service`, `context::isolate_without_label_creates_fresh_scopes` |
 | CORE-004 | Duplicate provide in one scope is rejected | `service::duplicate_service_is_rejected`, `service::default_scope_rejects_duplicates_but_isolate_shadows` |
-| CORE-005 | Missing `inject` keeps the fiber Pending | `lifecycle::plugin_waits_for_injected_service` |
+| CORE-005 | Missing `inject` keeps the fiber Pending | `lifecycle::plugin_waits_for_injected_service`, `regression_semantics::fix12b_panicking_inject_is_contained_and_keeps_services_working` |
 | CORE-006 | Gate flips activate and unload the dependent fiber | `service::service_check_gates_dependents` |
 | CORE-007 | Effects clean up in reverse registration order, exactly once | `async_conformance::sync_and_async_effects_share_reverse_registration_order`, `async_conformance::async_cleanup_runs_in_reverse_order_once` |
 | CORE-008 | A disposer runs exactly once | `async_conformance::async_disposer_is_single_shot` |
 | CORE-009 | Fiber dispose awaits async cleanups before returning | `async_conformance::sync_dispose_awaits_async_cleanups_before_returning` |
 | CORE-010 | Provider unload unregisters its services | `service::service_auto_register_and_dispose`, `service::provided_service_disposer_removes_service` |
 | CORE-011 | Cleanup panic does not skip remaining cleanups (async lane; same policy as CORE-030) | `async_conformance::async_cleanup_panic_does_not_skip_remaining_cleanups` |
-| CORE-012 | Effect diagnostics tree reflects registrations | `fiber::fiber_reports_effects_and_awaits_settlement`, `fiber::effect_disposer_removes_its_meta_node` |
+| CORE-012 | Effect diagnostics tree reflects registrations (live nodes only since v0.4.3, C3) | `fiber::fiber_reports_effects_and_awaits_settlement`, `fiber::effect_disposer_removes_its_meta_node`, `regression_core::c3_disposed_nested_effect_is_not_reported_in_the_tree` |
 | CORE-013 | Availability check gates lookups and dependents | `async_conformance::checked_service_predicate_controls_lookups` |
 | CORE-014 | Closed gate does not fall back to an ancestor provider | `async_conformance::closed_gate_does_not_fall_back_to_an_ancestor_provider` |
 | CORE-015 | Availability check may re-enter the context | `service::availability_check_may_read_other_services` |
@@ -620,9 +709,9 @@ construct are asserted by `#[cfg(test)]` unit tests inside `src/fiber.rs`.
 | CORE-020 | Waterfall middleware order and veto semantics (no `Bail` in this lane) | `events::event_waterfall_respects_context_filter`, `async_conformance::waterfall_*` (5 sync-lane cases), `async_conformance::async_waterfall_*` (2 async-lane cases) — 8 cases |
 | CORE-021 | Internal hooks (plugin/service/config/get/set/update/listener/dispatch) | `internal::*` (8 cases) |
 | CORE-022 | Registry map API + runtime dedupe/reclaim | `registry::registry_map_api`, `registry::registry_reuses_runtime_for_same_plugin`, `registry::registry_typed_plugin_identity`, `registry::delete_runtime_with_no_fibers_is_rejected_gracefully` |
-| CORE-023 | Logger buffer/seq/threshold/exporters/intercept | `logger::*` (5 cases) |
+| CORE-023 | Logger buffer/seq/threshold/exporters/intercept | `logger::*` (6 cases: incl. `logger::invalid_numeric_logger_level_clamps_to_error`, S2) |
 | CORE-024 | Config schema validation and merge precedence | `config::*` (5 cases) + `service::service_resolve_config_merges_intercepts` |
-| CORE-025 | Accessors, metadata, labeled isolates | `context::context_accessor_and_set`, `context::accessor_is_scoped_to_its_fiber`, `context::accessor_shadows_service_of_same_name`, `context::extend_meta_attaches_metadata`, `context::isolate_labeled_shares_scope` |
+| CORE-025 | Accessors, metadata, labeled isolates | `context::context_accessor_and_set`, `context::accessor_is_scoped_to_its_fiber`, `context::accessor_shadows_service_of_same_name`, `context::extend_meta_attaches_metadata`, `context::isolate_labeled_shares_scope`, `service::accessor_setter_rejection_uses_a_dedicated_error` |
 | CORE-026 | Fiber diagnostics (`uid`/`parent`/`assert_active`/`await_settled`) | `fiber::fiber_uid_parent_and_assert_active`, `fiber::await_settled_rethrows_startup_errors`, `fiber::await_settled_waits_for_async_effect_cleanup` |
 | CORE-027 | Async effect bodies/streams and restart cleanup | `async_effect_body::*` (4 cases), `async_conformance::restart_async_drains_and_reapplies_async_effects`, `lifecycle::restart_reapplies_plugin_and_update_config` |
 | CORE-028 | Failed activation rolls back effects and services | `hardening::failed_apply_rolls_back_effects_and_services` |
@@ -643,12 +732,33 @@ construct are asserted by `#[cfg(test)]` unit tests inside `src/fiber.rs`.
 | CORE-043 | Concurrent async dispose joins the in-flight cleanup | `semantics::concurrent_async_dispose_joins_the_inflight_cleanup` |
 | CORE-044 | A disposed fiber is final (no restart/activation resurrection) | `redteam::rt12_restart_after_dispose_fails_safely`, `redteam::rt01_sync_dispose_during_apply_must_not_end_active` |
 | CORE-045 | Concurrent lifecycle calls are exclusive (`LifecycleBusy`) | `concurrency::concurrent_dispose_returns_lifecycle_busy`, `concurrency::reentrant_lifecycle_calls_are_allowed`, `redteam::rt13_dispose_during_restart_apply_cannot_leave_a_zombie` |
-| CORE-046 | Cancelling an async disposal: an `AsyncDisposer` restores unstarted cleanups for the next dispose (S-1); a cancelled fiber unload completes the teardown (sync inline, async deferred) and lands in its target state (A-9); a same-disposer cleanup's `dispose_blocking` **and** its own async `dispose()` return immediately (drain-frame self-join, R2-1), while same-thread independent joiners still wait | `concurrency::cancelling_dispose_async_restores_unstarted_effects`, `concurrency::cancelling_async_disposer_restores_unstarted_cleanups`, `redteam3_attacks::at29_concurrent_dispose_joins_inflight`, `regression_semantics::fix15_cancelled_teardown_is_retried_by_dispose_blocking`, `regression_semantics::fix15_cancelled_dispose_async_is_retried_by_fiber_dispose`, `regression_semantics::fix15_self_join_from_cleanup_returns_instead_of_deadlocking`, `regression_semantics::fix15_self_join_from_fiber_cleanup_returns_instead_of_deadlocking`, `regression_semantics::fix15_self_join_from_cleanup_via_async_dispose_returns`, `regression_core::a2_cancelled_refresh_async_finishes_the_teardown`, `regression_core::a9_cancelled_dispose_async_completes_the_teardown` |
-| CORE-047 | Child fibers are owned by their parent (cascade + rollback) | `child_ownership::*` (5 cases) |
+| CORE-046 | Cancelling an async disposal: an `AsyncDisposer` restores unstarted cleanups for the next dispose (S-1); a cancelled fiber unload completes the teardown (sync inline, async deferred) and lands in its target state (A-9); a same-disposer cleanup's `dispose_blocking` **and** its own async `dispose()` return immediately (drain-frame self-join, R2-1), while same-thread independent joiners still wait | `concurrency::cancelling_dispose_async_restores_unstarted_effects`, `concurrency::cancelling_async_disposer_restores_unstarted_cleanups`, `redteam3_attacks::at29_concurrent_dispose_joins_inflight`, `regression_semantics::fix15_cancelled_teardown_is_retried_by_dispose_blocking`, `regression_semantics::fix15_cancelled_dispose_async_is_retried_by_fiber_dispose`, `regression_semantics::fix15_self_join_from_cleanup_returns_instead_of_deadlocking`, `regression_semantics::fix15_self_join_from_fiber_cleanup_returns_instead_of_deadlocking`, `regression_semantics::fix15_self_join_from_cleanup_via_async_dispose_returns`, `regression_core::a2_cancelled_refresh_async_finishes_the_teardown`, `regression_core::a9_cancelled_dispose_async_completes_the_teardown`, `regression_core::f1_retried_root_dispose_async_recovers_parked_cascade`, `regression_core::f1_dispose_all_recovers_parked_cascade`, `regression_core::f1_refresh_async_recovers_parked_cascade`, `regression_core::f4_cancelled_recovery_releases_the_latch_for_the_next_when_idle`, `regression_core::f4_cancelled_refresh_recovery_is_retried_by_when_idle`, `regression_semantics::f1_when_idle_recovers_parked_cascade_after_cancel`, `regression_semantics::f4_cancelled_recovery_does_not_latch_the_next_when_idle` |
+| CORE-047 | Child fibers are owned by their parent (cascade + rollback); deep chains unload iteratively and ownership bookkeeping stays bounded | `child_ownership::*` (5 cases), `regression_core::c1_deep_chain_dispose_is_iterative_and_ordered`, `regression_core::c1_three_level_cascade_order_is_dependents_first`, `regression_core::c1_cancelled_deep_cascade_still_completes`, `regression_core::c1_dependent_cleanup_panic_is_contained`, `regression_core::r1_deep_plugin_chain_activates_on_a_2mib_thread`, `regression_core::r3a4_dynamic_plugin_churn_keeps_parent_bookkeeping_bounded`, `regression_core::r3a4_long_churn_keeps_memory_and_effects_bounded`, `regression_core::r3a4_parent_dispose_then_child_dispose_is_idempotent`, `regression_core::r3a4_parent_sweep_races_child_self_dispose`, `regression_core::r3a4_cancelled_child_dispose_still_detaches`, `redteam5_attacks::c16_cancelled_parent_dispose_async_retry_disposes_all_children` |
 | CORE-048 | In-place plugin replacement keeps fiber identity and reloads | `replace::*` (6 cases) |
-| CORE-049 | Quiescence: `when_idle` resolves when no lifecycle work is in flight | `quiescence::fresh_registry_is_idle`, `quiescence::when_idle_waits_for_a_slow_activation`, `quiescence::when_idle_waits_for_an_async_disposal` |
+| CORE-049 | Quiescence: `when_idle` resolves when no lifecycle work is in flight; it excludes only the caller's own in-flight registrations (v0.4.3) while `is_idle` stays strict, and it is recovery-aware (v0.4.3, F5) — both `Context` and raw `Registry` APIs retry recovery of parked cancelled-cascade frames while waiting; sync `refresh()` deliberately does not recover | `quiescence::fresh_registry_is_idle`, `quiescence::when_idle_waits_for_a_slow_activation`, `quiescence::when_idle_waits_for_an_async_disposal`, `regression_semantics::c4_when_idle_inside_a_registration_frame_does_not_wait_for_itself`, `regression_core::c4_when_idle_inside_registration_frame_does_not_wait_for_itself`, `regression_semantics::fix11_registration_window_keeps_when_idle_blocked`, `regression_core::f5_when_idle_recovers_parked_frames_that_appear_while_waiting`, `regression_core::f5_repeated_cancel_then_when_idle_does_not_hang`, `regression_core::f5_raw_registry_when_idle_recovers_parked_cascade`, `regression_core::f5_when_idle_sees_parked_frames_parked_after_entry`, `regression_semantics::f5_when_idle_waits_for_active_unload_then_recovers_parked_frames`, `regression_semantics::f5_when_idle_recovers_parked_frames_that_appear_while_waiting`, `regression_semantics::f5_twenty_cancel_and_when_idle_rounds_do_not_hang` |
 | CORE-050 | Cooperative cancellation via `checkpoint` | `quiescence::checkpoint_observes_cooperative_cancellation` |
 | CORE-051 | `dispose_all` shutdown path reclaims the whole tree | `child_ownership::dispose_all_reclaims_the_whole_tree` |
+
+The optional `supervision` feature is not part of the CORE cases; its quota
+semantics (live-resource accounting, S1) are asserted by
+`tests/l2_defenses.rs` (`disposed_effects_free_the_effect_quota_slot`,
+`disposed_listeners_free_the_listener_quota_slot`,
+`once_listener_frees_its_quota_slot_when_it_auto_removes`,
+`listener_quota_release_is_idempotent_and_concurrency_safe`,
+`disposed_child_fibers_free_the_child_quota_slot`).
+
+The v0.4.3 audit fixes add **no CORE ID**; they are assertions about the cases
+above, and their regressions are: `regression_core::c1_*` / `r1_*` / `r3a4_*`
+(CORE-047, iterative deep-chain teardown and bounded child bookkeeping);
+`regression_core::c4_when_idle_inside_registration_frame_does_not_wait_for_itself`
+and `regression_semantics::c4_when_idle_inside_a_registration_frame_does_not_wait_for_itself`
+(CORE-049, self-registration exclusion);
+`regression_core::c3_disposed_nested_effect_is_not_reported_in_the_tree`
+(CORE-012, live effect diagnostics); `regression_core::c2_panicking_key_degrades_to_a_placeholder_runtime`
+and `redteam::rt21_fiber_name_does_not_call_user_code_under_the_lock` (§2.3,
+Plugin metadata containment); `service::accessor_setter_rejection_uses_a_dedicated_error`
+(CORE-025, `AccessorWriteRejected`); `logger::invalid_numeric_logger_level_clamps_to_error`
+(CORE-023, clamped levels).
 
 ## 5. Deliberate differences from the JavaScript Cordis reference
 
@@ -684,7 +794,7 @@ construct are asserted by `#[cfg(test)]` unit tests inside `src/fiber.rs`.
 - `0.y.z` — breaking changes may land in `y`.
 - Any change to a CORE case ID or to a documented ordering guarantees requires a
   `spec/` change in the same commit and a minor bump.
-- Embedders should pin a tag (`tag = "v0.4.2"`) and update deliberately.
+- Embedders should pin a tag (`tag = "v0.4.3"`) and update deliberately.
 - v0.4.2 is a **patch release**: no CORE case was added, renumbered or removed.
   It fixes defects in the implementation of existing cases and makes previously
   unstated edges explicit. Behavioral deltas are listed in `CHANGELOG.md`
@@ -703,9 +813,9 @@ construct are asserted by `#[cfg(test)]` unit tests inside `src/fiber.rs`.
     `CordisError::PluginFailed` before the rollback runs (D-2);
   - `dispose_all` panic priority over collected errors (CORE-051);
   - `is_idle`/`when_idle` cover the registration→activation window,
-    including the `internal/plugin` create hook (CORE-049); a create hook that
-    waits synchronously on `when_idle()` therefore waits on itself (0.4.1
-    returned immediately — observable change);
+    including the `internal/plugin` create hook (CORE-049); in 0.4.2 a create
+    hook waiting synchronously on `when_idle()` therefore waited on itself
+    (v0.4.3 fixes this by excluding the caller's own registrations, see below);
   - strict provider-`Active` injection gate and read-lane/strict-lane split
     (CORE-005/006/016);
   - type-checked `ctx.set`/`set_any` with `CordisError::ServiceTypeMismatch`
@@ -727,6 +837,35 @@ construct are asserted by `#[cfg(test)]` unit tests inside `src/fiber.rs`.
   - contained panicking accessors degrade to `None` (CORE-025, §2.7);
   - `MAX_PLUGIN_DEPTH` counted along the fiber parent chain (CORE-047);
   - one fiber per `ctx.inject` call, keyed by callback type (§2.6).
+- v0.4.3 is a **patch release**: no CORE case was added, renumbered or removed.
+  It fixes audit findings and documents the resulting behavior. Deltas
+  (compatibility notes in `CHANGELOG.md`):
+  - **deep dependency-chain teardown is iterative** (R3-A1, CORE-047): a
+    two-phase order-preserving cascade (begin provider-before-dependent, drain
+    in reverse; ownership descendants via explicit DFS stack) keeps the call
+    stack O(1) in chain depth — on a 2 MiB thread depth 800 passes in 0.4.3
+    debug and release (0.4.2 comparison: debug ≈480 levels → abort, release
+    ≈2200); the former "very deep chains can overflow the stack" limitation is
+    gone, and `MAX_PLUGIN_DEPTH = 256` still bounds loading only;
+  - **dynamic child bookkeeping is bounded** (R3-A4, CORE-047): a disposing
+    child detaches its ownership effect from the parent (plus effect-node /
+    weak-list entries) and parent effect lists amortize away disposed ownership
+    entries, so churn cannot grow the parent unboundedly;
+  - **`when_idle` excludes the caller's own registrations** (R3-A3/C4,
+    CORE-049): a create hook can await it without self-deadlock; `is_idle()`
+    stays strict; cross-thread cyclic registration dependencies remain a known
+    deadlock boundary;
+  - **Plugin metadata callbacks are contained** (C2, §2.3): panics in
+    `name`/`key`/`inject`/`config_schema` are logged and degraded
+    (`"<panicked plugin>"` / empty inject / no schema), never escaping the
+    `Result` APIs;
+  - **nested-effect diagnostics are filtered** (C3, §2.3 diagnostics);
+  - **supervision quotas count live resources** (S1, §2.6): effect/listener/
+    child slots released by unload, `once` auto-removal or concurrent dispose
+    are immediately reusable;
+  - **accessor write rejection has its own error** (S3, §2.2/§2.7):
+    `CordisError::AccessorWriteRejected`;
+  - **invalid numeric logger levels clamp to `Error`** (S2, §2.7).
 - v0.3.0 added CORE-040…CORE-050: raw-config retention and one-shot resolution,
   provider-identity epochs and withdrawal ordering, revertible/classified
   `ctx.set`, async-disposer joining, lifecycle exclusivity, cancel-safe disposal,

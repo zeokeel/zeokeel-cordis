@@ -10,6 +10,22 @@
 > 工作区 `rust/` 在 16:48–17:00 期间被另一条会话并发修改（见 §7），本文以 HEAD 为基线、
 > 单独标注在途状态。
 
+> **⚠️ 历史记录（v0.3 时代，非当前行为）**
+>
+> 本文是 2026-10 初、以 **v0.1.0** 为基线的缺陷清单与历轮加固记录，保留原文用于追溯，**不是
+> 当前行为的文档**：
+>
+> - 文中的测试数量（如 91 / 232 / 238 / 264 等）都是**各轮历史快照**；当前测试数与门禁
+>   结果见 [README](../../README.md)「质量与严格构建」与 CI。
+> - **取消语义已变更**：0.4.2 的 **A-9** 把「取消的 fiber unload」从「cancel-safe drain
+>   恢复 effect 后重试」改为**完成 teardown**（sync cleanup 内联执行、async cleanup 进
+>   fiber 的 `deferred_async` 由下一次 dispose 收尾，fiber 落到 `Pending`/`Disposed`）。
+>   本文 §10.8 的 **c16**（cancel-safe drain 恢复 effect + `ChildSweep` Drop 回填重试）是
+>   **已被取代的历史机制**；当前语义见 [`spec/CORDIS-CORE.md`](../../spec/CORDIS-CORE.md)
+>   §2.3（CORE-046）、[`docs/CORDIS-RUST.md`](../CORDIS-RUST.md) §2.3 与
+>   [`docs/KERNEL-ISOLATION.md`](../KERNEL-ISOLATION.md) §3。
+> - 文中与现状冲突的行号、API 名称与「在途/修复中」状态同样按历史快照阅读。
+
 ## 0. 结论（TL;DR）
 
 1. **线 K 的 7 项方向正确，但不是"问题全集"，且 4 项规模明显低估**：
@@ -667,15 +683,25 @@ embedder 层，不属于本 crate。`KERNEL-ISOLATION.md` 已加"L3/L4 只是 em
 red-team round-4（22 条 child-ownership 攻击）首轮 18/22，暴露 4 个根因，修复后
 **22/22 全绿**，全套 **232 tests**：
 
+> **（0.4.2 更新）** 232 tests 是当轮历史快照。本表 c16 的「cancel-safe drain 恢复 effect +
+> `ChildSweep` Drop 回填重试」机制已被 0.4.2 的 **A-9** 取代：取消的 fiber unload 现在
+> **完成 teardown**（sync cleanup 内联、async cleanup 延迟到 `deferred_async`，fiber 落到
+> `Pending`/`Disposed`），不再回退旧状态。以下内容保留为历史记录；当前语义见 spec §2.3
+> （CORE-046）与 `docs/CORDIS-RUST.md` §2.3。
+
 | 根因 | 修复 |
 |---|---|
 | c14 父 dispose 撞上子 fiber restart：ownership 清理吞掉 `LifecycleBusy`，父 Disposed 后子仍 Active | 子 fiber 增加 `dispose_requested` 标志：Busy 时置位，子的 restart/update 结束时 `finalize_requested_dispose` 在持有 lifecycle 的同一线程上完成 dispose |
-| c16 取消父 `dispose_async` 中途：在飞 ownership effect 丢失，重试后子卡 `Unloading` | ownership 改为**可恢复的 effect**（父效果表由 cancel-safe drain 恢复）+ 父 fiber 保留 `Weak` 子列表 + 取消安全的 sweep guard（`ChildSweep` 在 Drop 回填未处理的子）；重试时重新驱动 |
+| c16 取消父 `dispose_async` 中途：在飞 ownership effect 丢失，重试后子卡 `Unloading` | ownership 改为**可恢复的 effect**（父效果表由 cancel-safe drain 恢复）+ 父 fiber 保留 `Weak` 子列表 + 取消安全的 sweep guard（`ChildSweep` 在 Drop 回填未处理的子）；重试时重新驱动。**（历史机制：0.4.2 A-9 已改为「取消即完成 teardown」，见本节开头注）** |
 | c10 取消 `plugin_async` 后子仍 Active（deferred 路径） | 失败/取消回滚路径 `fail_fiber_*`/`discard_*` 都执行 `sweep_children_*`，子被同步/异步回收 |
 | c12 A→B→A 递归 loading → 栈溢出 SIGABRT | 增加 `MAX_PLUGIN_DEPTH = 256` 加载深度上限：超限返回 `InvalidPlugin`（深度 100/500/1000 正常，1500 之前会栈溢出——现在统一在 256 处被拦截，实测 c05/c12 通过）|
 
 已知边界（文档已写）：取消 disposal 时**最多丢失当时正在 await 的那一个 cleanup future**
 （Rust 无 cancel-safe await），其余 cleanup 在重试中按逆序执行一次；`c16` 断言按此边界修正。
+
+> **（0.4.2 更新）** 该「恢复 effect 后重试」的取消边界已被 A-9 取代：取消 unload 会完成
+> teardown（sync 内联 / async 延迟），fiber 不会停在 `Unloading` 或回退成假 `Active`；仅
+> 在飞的那一个 async cleanup future 不可恢复。当前语义见 spec §2.3 CORE-046。
 
 ### 10.9 第九轮：`Registry::replace`（CORE-048，上游 74b7905 的纯 Rust 移植）
 

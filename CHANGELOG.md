@@ -8,6 +8,178 @@
 **v0.4.x 语义冻结**：不再新增语义能力；仅接受 bugfix、安全修复、性能改进（不改变语义）
 与文档修正。
 
+## [0.4.3] - 2026-10-29
+
+**审计加固补丁**：不新增语义能力，也不新增/重命名任何 CORE 用例；修复第三轮对抗审计确认的
+缺陷（动态卸载记账泄漏、深依赖链卸载栈溢出、注册帧内 `when_idle` 自锁、supervision 配额
+记账、Plugin 元数据回调 panic 外泄、嵌套 effect 元数据残留等），并同步文档与工程流水线。
+默认 `cargo test`（含 7 个 doc-tests）**404 passed / 0 failed**、`--features supervision`
+**415 passed / 0 failed**。
+
+### Fixed
+
+- **R3-A4 动态加载父 fiber 记账无界泄漏**：频繁 `ctx.plugin`/子 fiber dispose 时，父 fiber 的
+  ownership effect 永不移除——60k churn 累积 **60001** 个 effect、RSS **+54.7 MB**。改为子 fiber
+  自身 dispose 时 `detach_child_ownership()` 从父 fiber 的 effect 表精确摘除对应 ownership
+  effect（连同嵌套 effect 节点与弱子列表，加锁顺序保持 parent-fiber → children → node），并在
+  父 effect 表超过阈值时**摊还 prune** 已 disposed 的 ownership effect（只 prune
+  `owner_child` 标记条目，绝不误删活跃 effect）。10k churn 后峰值 1 个 ownership
+  effect、RSS **基本持平**（10k churn 实测约 **+996 KB / <1 MB**）。
+- **R3-A1 深依赖链卸载栈溢出**：卸载走 `take_effects → retire_unready → unload` 相互递归，
+  调用栈深度≈依赖链层数。0.4.2 对照：2 MiB 线程 debug 构建约 **480 层**即栈溢出 abort
+  （depth 800 必失败），release 构建约 **2200 层**才 abort（depth 800 可过）。改为**两阶段
+  保序迭代级联**：先按 provider-before-dependent 顺序 *begin* 所有传递不可用 fiber（标记
+  `Unloading`、撤销服务、取走 effects），再按逆序 *drain*（等价于 dependents-before-provider
+  的清理顺序）；ownership 子树用显式 DFS 栈迭代收集，不再递归。0.4.3 在 2 MiB 线程
+  depth 800 下 **debug 与 release 均通过**（远超实际 `MAX_PLUGIN_DEPTH = 256` 限制的加载
+  链）；加载深度上限不变。修复 R1 卸载栈回归的根因
+  （ownership effect 在 drain 中再次递归 dispose 子 fiber），并修复 c16/rt21/r5_05–r5_07/
+  executor 相关回归用例。
+- **R3-A3 / C4 `when_idle()` 在自身注册帧内自锁**：`ctx.plugin` 的「注册→激活」窗口计入
+  in-flight（FIX-11b）后，从 `internal/plugin` create hook 内调用 `when_idle()` 会等待自己的
+  注册（0.4.2 的可观察变化）。改为在 Registry 上按**创建线程**记录 in-flight 注册计数
+  （跨 `.await`/executor 迁移安全），`when_idle()` 只排除调用线程**自己的**注册：hook 内
+  4 ms 级返回，外部 waiter 的 FIX-11b 语义不变；`is_idle()` 保持严格（对该窗口对其它线程
+  仍非 idle）。跨线程环形注册依赖（A 注册等 B、B 注册等 A）仍可能互等——文档保留该边界。
+- **F1/F4/F5：取消的 async 级联自动、可重试地恢复 parked `Unloading` 帧**：取消
+  `dispose_async`/`refresh_async` 时非根 cascade 帧可能短暂停在 `Unloading`。
+  - **F1 恢复语义**：`when_idle()`、`refresh_async()`、`dispose_all()` 以及根 fiber 的
+    `dispose()`/`dispose_async()` 重试都会自动恢复这些帧到**原级联目标**（依赖方
+    `Pending`、ownership 子 `Disposed`），未启动的 deferred async cleanup 在恢复时
+    **恰好执行一次**；恢复幂等、去重、有界（按并发 parked 帧数），取消 unwind 中或另一
+    unload 进行中时延迟到下一次根操作。若取消恰好发生在某个 async cleanup 正在执行时，
+    该在飞 future 不可恢复（A-9 既有边界），但**不会留下永久 `Unloading`**；恢复前
+    `is_idle()` 仍为 `false`（严格）。
+  - **F4 恢复状态安全**：单恢复者闩锁改为 **RAII guard**（`RecoveryGuard`，取消/panic 都
+    不会让闩锁残留、后续恢复永远跳过）；恢复批量取帧用 **`ReparkGuard`/`RecoveryBatch`**，
+    恢复在批量中途被取消/失败时把未处理或在飞帧**重新 park**，不丢帧。
+  - **F5 等待期持续恢复**：`when_idle()` 在 **`Context::when_idle()` 与裸
+    `Registry::when_idle()` 公共 API 两侧**都是 recovery-aware 的等待循环——等待期间会
+    持续重试恢复（被 idle 或 parked-recoverable 唤醒，有界并带兜底），不会因等待中才出现
+    的 parked 帧永久挂起。**同步 `refresh()` 不恢复 parked 帧**（避免在调用线程同步 drain
+    reactor-backed cleanup 而死锁）；恢复只由 async/可等待入口（`when_idle()`、
+    `refresh_async()`、`dispose_all()`）以及根 dispose 重试承担。
+  回归：`regression_core::f1_retried_root_dispose_async_recovers_parked_cascade`、
+  `f1_dispose_all_recovers_parked_cascade`、`f1_refresh_async_recovers_parked_cascade`、
+  `f4_cancelled_recovery_releases_the_latch_for_the_next_when_idle`、
+  `f4_cancelled_refresh_recovery_is_retried_by_when_idle`、
+  `f5_when_idle_recovers_parked_frames_that_appear_while_waiting`、
+  `f5_repeated_cancel_then_when_idle_does_not_hang`、
+  `f5_raw_registry_when_idle_recovers_parked_cascade`、
+  `f5_when_idle_sees_parked_frames_parked_after_entry`；
+  以及 `regression_semantics::f1_when_idle_recovers_parked_cascade_after_cancel`、
+  `f4_cancelled_recovery_does_not_latch_the_next_when_idle`、
+  `f5_when_idle_waits_for_active_unload_then_recovers_parked_frames`、
+  `f5_when_idle_recovers_parked_frames_that_appear_while_waiting`、
+  `f5_twenty_cancel_and_when_idle_rounds_do_not_hang`。
+- **S1 supervision 配额按活资源记账**：`max_effects` 被已释放的 effect 死条目长期占用；
+  listener 配额只在用户 disposer 释放（`once` 自动移除、并发 dispose、fiber 卸载会漏槽或
+  双扣）；child 只数 fiber 列表长度。改为：`push_effect` 时清理 dead 条目（配额只计活
+  effects）；listener 用一次性 `ListenerSlot`（用户 disposer、`once` 自动移除、fiber 卸载
+  三路**恰好一次**释放，`OnceListenerRelease` 在调用结束后兜底）；child 配额按 live 弱引用
+  统计。释放后立即归还配额槽，不再需要超配。
+- **C2 Plugin 元数据回调 panic 遏制**：`Plugin::{name,key,inject,config_schema}`（及
+  `AsyncPlugin` 对应方法）是 embedder 代码，内核在创建/替换/重启/诊断/依赖解析时调用；
+  panic 原会穿出 `Result` API 或毒化内核锁。现在各自 `catch_unwind` 并**确定性降级**：
+  `name()` → `"<panicked plugin>"`、`key()` → `PluginKey::Named("<panicked plugin>")`
+  （所有坏 key 共享一个 runtime）、`inject()` → `&[]`（无依赖门控）、`config_schema()` →
+  `None`（接受原配置、不校验），均以 `error!` 记录；不再外泄 panic。
+- **C3 嵌套 effect 元数据 ghost 清理**：用户提前 dispose 的嵌套 effect 会永久残留在父 effect
+  的 `EffectMeta.children` 中（`get_effects()` 树不 prune）。树快照改为按 fiber 的 live 节点
+  集过滤，已 dispose 的嵌套 effect 不再出现在诊断树里。
+- **S2 logger 非法 level 值 fail-open**：`{"level": 99}` 等未知数字被 `from_u8` 映射到最 verbose
+  的 `Debug`，反而放大敏感记录。改为未知数字 **clamp 到 `Error`**（字符串级别行为不变）。
+- **S3 accessor setter 拒绝缺少独立错误**：计算 accessor 的 setter 返回 `false`（owner 检视
+  新值后拒绝）原报 `ServiceWriteForbidden`（被误读为所有权错误）。新增
+  `CordisError::AccessorWriteRejected(name)`，与 `ServiceWriteForbidden`（别的 fiber 拥有）、
+  `AccessorReadOnly`（accessor 只读）区分；`ctx.set`/`set_any` 都返回新变体。
+- **C4 注册归属表**：见 R3-A3——per-thread `registration_owners` 计数，guard 跨线程 drop 仍
+  回收正确归属；`when_idle` 只减自身计数。
+- **C5 错误变体**：`CordisError::AccessorWriteRejected` 补齐 `Display` 与文档；`non_exhaustive`
+  保证下游已有 `match` 无需改动。
+- **R1 卸载栈回归根因**：ownership effect 在父 fiber drain 时会再次递归 dispose 子 fiber，
+  使深层/深链卸载栈持续增长；两阶段迭代级联 + 子自 dispose 时 detach ownership 后不再递归。
+
+### Changed
+
+- `Registry::when_idle()` 的等待判据改为「全局 in-flight 注册 − 调用线程自身注册」，`is_idle()`
+  仍严格（不排除任何注册）。
+- 卸载级联改为两阶段迭代实现：栈 O(1)，drain 顺序仍为 dependents-before-provider；级联轮数
+  有 `fiber_count + 2` 的固定点上界，超限的剩余依赖方保持 Active 并可被 retry/refresh 拾取。
+- supervision 配额按**活资源**计数（effects/listeners/child fibers 释放即归还槽）；`once`
+  监听器的槽在自动移除时释放。
+- `Plugin` 元数据回调 panic 一律 contained 降级（见 Fixed C2），不再从公共 API 外泄。
+- `CordisError::AccessorWriteRejected(String)` 为新增变体（`#[non_exhaustive]`）。
+- 取消级联的 parked `Unloading` 帧由 recovery-aware 入口自动恢复（F1/F4/F5）：
+  `when_idle()`（Context 与裸 Registry API 均为等待期持续恢复）、`refresh_async()`、
+  `dispose_all()`、根 `dispose()`/`dispose_async()` 重试；**同步 `refresh()` 不恢复**
+  （避免同步 drain reactor cleanup 死锁）。恢复目标是原级联目标、deferred async cleanup
+  恰好一次；单恢复者闩锁为 RAII、批量取帧用 ReparkGuard 保证中途取消不丢帧。
+- **工程/流水线**：`Cargo.lock` 入库（从 `.gitignore` 移除）且 CI/发布命令统一 `--locked`；
+  CI 新增独立 **MSRV 1.85 作业**（仅 test/doc，不带 clippy）、examples 构建 + 冒烟运行、
+  真实 `cargo package` verify；release workflow 要求从 tag 触发并校验 **tag 版本 ==
+  `Cargo.toml` version**，依次 `cargo package --locked` → `cargo publish --dry-run` →
+  `cargo publish`，发布成功后把 `.crate` 的 SHA-256 上传到 GitHub Release。
+
+### Compatibility
+
+- **深依赖链卸载限制移除**：数百~数千层的依赖链现在可以正常卸载（迭代级联，栈 O(1)）。
+  0.4.3 在 2 MiB 线程 depth 800 下 **debug 与 release 均通过**；0.4.2 对照为 debug 约 480
+  层即 abort、release 约 2200 层才 abort。`MAX_PLUGIN_DEPTH = 256` 仍只限制**插件加载深度**，
+  与卸载深度无关。此前文档中的「极深依赖链 dispose 会递归爆栈（0.4.1 同型）」限制不再成立。
+- **`when_idle()` 在自身注册帧内不再死锁**：0.4.1 在该窗口立即返回全部 idle（语义过宽）、
+  0.4.2 会等待自己而死锁；0.4.3 排除**调用线程自身**的 in-flight 注册后正常返回，外部
+  waiter 仍按 FIX-11b 等待整个注册/激活窗口。`is_idle()` 语义不变（严格）。跨线程环形注册
+  依赖仍可能死锁（文档注明）。
+- **Plugin 元数据 panic 从「外泄/毒化锁」变为「contained 降级」**：坏插件的行为变为可观测的
+  占位名/空依赖/无 schema，而不是 panic 穿出 `ctx.plugin` 或锁中毒；这是 Rust 内核契约的
+  明确化（TS 参考会抛异常），受影响插件本身仍是坏的，建议修复其回调。
+- **supervision 配额语义修正**：配额现在按活资源计数——卸载/`once` 自动移除/并发释放后
+  不再占槽，因此超限判定的可触发点与 0.4.2 不同（同等上限下现在允许更多历史累积注册）。
+- **logger 非法数字 level 改为 clamp 到 `Error`**：依赖 `{"level": 99}` 放大日志的配置现在
+  会被收紧到 Error（fail-closed）。
+- **`CordisError::AccessorWriteRejected`**：新增变体（`non_exhaustive`，不影响既有 `match`）；
+  依赖旧 `ServiceWriteForbidden` 判别 accessor 拒绝的代码需改为匹配新变体。
+- **Cargo.lock / `--locked`**：仓库与 CI 现在使用锁文件构建；crates.io 下游不受影响，但从
+  git 依赖本仓库时需要提交/接受其 lockfile 约束。
+
+### Docs
+
+- `README.md`：版本/安装/测试数字更新（0.4.3；404/415）；已知限制删除深依赖链栈溢出；
+  `when_idle`/quota 语义更新；质量章节保留 CI/MSRV/`--locked`/release 流程描述。
+- `docs/KERNEL-ISOLATION.md`：深依赖链限制改写为迭代级联 + 2 MiB/depth-800 的 debug+release
+  对照（0.4.2 debug≈480 层 abort）；`when_idle` 新语义与
+  跨线程环依赖边界；panic 矩阵新增 Plugin metadata callbacks（contained）行；quota 活资源语义。
+- `docs/CORDIS-RUST.md`：新增 0.4.3 加固条目（R3-A4/R3-A1/R3-A3、S1、C2/C3、S2/S3、C4/C5、
+  R1）与 TS 对照说明；§4 边界更新（移除深链、更新 when_idle、补 AccessorWriteRejected/quota/
+  logger）。
+- `spec/CORDIS-CORE.md`：状态升 v0.4.3；§2.3/§2.6/§2.7 与 §6 补 0.4.3 语义；CORE-047/049/
+  005/006/041 等行补新回归测试名（不新增 CORE ID）。
+- `docs/GUIDE.md`：`when_idle` 新语义、quota 活资源、metadata panic 契约、深链支持。
+- `CONTRIBUTING.md`：CI/发布流程与 `Cargo.lock` 策略（0.4.3 起）；版本冻结线更新。
+
+### Known limitations
+
+- **跨线程环形注册依赖**：`when_idle()` 只排除调用线程自身的 in-flight 注册；若两个线程互相
+  等待对方的注册窗口，仍可能互等（内核不检测环依赖）——宿主需避免同步环依赖。
+- **C2 降级 key 的定位限制**：所有 `Plugin::key()` panic 的插件会共享同一个
+  `PluginKey::Named("<panicked plugin>")` runtime，因此 `keys`/`replace`/`delete` 只把它们
+  当作一个条目、**无法单独定位**其中某个坏插件。这是对已损坏插件的最佳努力隔离（非受支持
+  配置），宿主应修复其 `key()`。
+- **性能 backlog（0.4.3 已知回归）**：5000 fiber fanout 场景下 create / `dispose_all` 比
+  0.4.2 慢约 **25–35%**（1k fiber 更快或持平，RSS 与正确性无回归）。计划在 0.4.4 以反向
+  依赖索引优化；在此之前超大 fanout 的宿主应评估批量操作的耗时。
+- **取消 recovery 时少数 restored cleanup 延后（0.4.3 已知边界，P2）**：当一次 recovery
+  正在处理 parked 帧、且在某个作为级联根的 fiber 上被取消时，该 fiber 完成到 `Pending` 后，
+  其 `CancelSafeDrain` 恢复的剩余 async cleanup 可能被留在 `deferred_async`，直到下一次显式
+  `dispose`/`dispose_all` 才执行（不会重复执行，也不会永久 `Unloading`/挂起；`when_idle`
+  可能先行报 idle）。计划在 0.4.4 让恢复路径把这些 deferred cleanup 重新纳入可恢复集合。
+- 其余进程内不可遏制边界不变：插件自身递归导致的栈溢出、`panic="abort"`、OOM/allocator
+  abort、`unsafe` UB、`process::abort/exit`、死循环/死锁、外部 kill（见
+  `docs/KERNEL-ISOLATION.md`）。
+- Plugin 元数据 panic 的降级是 best-effort 隔离：坏插件会以占位名/无依赖/无 schema 运行，
+  语义上仍是坏的，请修复其回调。
+
 ## [0.4.2] - 2026-10-28
 
 **修复/加固补丁**：不新增语义能力，也不新增/重命名任何 CORE 用例；修复独立复核确认的
@@ -194,6 +366,12 @@
   （调用方传入值或 hook 校验通过的 replacement），与 TS 参考一致。新增 additive 入口
   `Fiber::update_with_no_save` / `update_async_with_no_save`（仅新增方法，现有
   `update`/`update_async` 行为不变）。
+- **取消级联恢复语义（F1/F4/F5，可观察变化）**：取消 `dispose_async`/`refresh_async` 后
+  不再可能永久滞留 `Unloading`——`when_idle()`（含裸 `Registry::when_idle()` 公共 API）
+  在等待期会持续重试恢复，`refresh_async()`/`dispose_all()`/根 dispose 重试也会恢复；
+  恢复中途取消/panic 不会残留闩锁或丢帧（RAII + ReparkGuard）。**同步 `refresh()` 不做
+  恢复**（这是刻意设计：它可能在 reactor 线程上被调用，同步 drain async cleanup 会死锁）。
+  取消撞在飞 async cleanup 时该 future 仍不可恢复（A-9）。
 - **`AsyncDisposer::dispose_blocking` 现在真正 join**：若另一个调用者正在 drain，它会阻塞到
   该 teardown 完成（0.4.1 会立即返回）；同步关闭路径可能因此耗时更长。它还会**重试被取消
   teardown 恢复的未启动 cleanup**（S-1；0.4.1 的 `dispose_blocking` 会误早退并永久丢失）；
@@ -344,7 +522,8 @@
   fiber 状态机、effect 逆序清理、事件（emit/bail/parallel/serial/waterfall）、
   插件 registry 与配置 schema、日志服务。
 
-[Unreleased]: https://github.com/zeokeel/zeokeel-cordis/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/zeokeel/zeokeel-cordis/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.4.3
 [0.4.2]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.4.2
 [0.4.1]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.4.1
 [0.4.0]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.4.0

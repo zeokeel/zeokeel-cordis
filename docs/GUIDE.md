@@ -3,7 +3,7 @@
 从零开始：安装、写插件、注册服务、处理依赖、管理生命周期、做测试。本文所有示例都对应
 [`examples/`](../examples/) 下的可运行代码，建议边读边跑。
 
-- 版本：v0.4.2（Rust 1.85+，edition 2021）
+- 版本：v0.4.3（Rust 1.85+，edition 2021）
 - 规范：[`spec/CORDIS-CORE.md`](../spec/CORDIS-CORE.md)（英文，编号用例）
 - 设计：[`DESIGN.md`](DESIGN.md)；API 速查：`cargo doc --open`
 
@@ -41,13 +41,13 @@ cargo add zeokeel-cordis
 
 ```toml
 [dependencies]
-zeokeel-cordis = "0.4.2"
+zeokeel-cordis = "0.4.3"
 serde_json = "1"   # 插件配置用 serde_json::Value
 ```
 
 > crates.io 包名 `zeokeel-cordis` 与库目标名 `zeokeel_cordis` 一致：代码里统一 `use zeokeel_cordis::...`；
 > 需要跟仓库最新代码时可用 git 依赖：
-> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.4.2" }`。
+> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.4.3" }`。
 
 - MSRV：Rust **1.85+**
 - 同步宿主不需要异步运行时；异步宿主可选 tokio，但内核本身不依赖 tokio
@@ -570,10 +570,10 @@ root.dispose_all()?; // 逐个 dispose 所有 fiber + 根 fiber，收集首个�
   `Err`，**panic 优先**：错误只记日志、首个 panic 重抛（v0.4.2）；
 - 关闭后 registry 为空、`is_idle()` 为 true；
 - **未 dispose 的 fiber 会保留整棵图**，宿主退出时务必调用 `dispose_all`；
-- **极深依赖链请分层/分批 dispose**：依赖链 unload 走递归（栈深度≈链层数），2 MiB worker
-  栈上 debug 约 480 层 / release 约 2200 层就会栈溢出 abort（不可捕获；0.4.1 同型，
-  0.4.2 未修）。数百~数千层的依赖图请拆成多棵浅树或逐批 `dispose()`，不要依赖单次顶层
-  `dispose_all` 完成全部回收。
+- **深依赖链卸载已支持（v0.4.3）**：卸载改为两阶段保序迭代级联（栈 O(1)），2 MiB 线程
+  depth 800 在 **debug 与 release 均通过**（0.4.2 对照：debug 约 480 层即 abort、release
+  约 2200 层才 abort），清理顺序仍是 dependents-before-provider；`MAX_PLUGIN_DEPTH = 256`
+  仍只限制插件**加载**深度，不再需要为深依赖图手动分层 dispose。
 
 ### 12.2 静默检测
 
@@ -585,14 +585,33 @@ let idle: bool = root.registry().is_idle();
 root.when_idle().await; // 配合 `block_on` 用于同步代码
 ```
 
-适合：关闭前等待、测试断言、supervisor 的健康检查。v0.4.2 起 `ctx.plugin*` 的
-**注册→激活窗口**（含 `internal/plugin` create hook 到激活完成）都计入 in-flight，
-`is_idle()`/`when_idle` 不会在插件还在创建/激活时提前返回。
+适合：关闭前等待、测试断言、supervisor 的健康检查。`ctx.plugin*` 的**注册→激活窗口**
+（含 `internal/plugin` create hook 到激活完成）都计入 in-flight，因此 `is_idle()`/`when_idle`
+不会在插件还在创建/激活时提前返回。
 
-> **注意（v0.4.2 可观察变化）**：不要在该注册窗口（典型是 `internal/plugin` create hook）
-> 内**同步等待** `when_idle()`——guard 由发起注册的调用者持有，同步等待会**自我死锁**；
-> 0.4.1 在该窗口会立即返回。同理 create hook 内 `fiber.await_settled()` 会立即 `Ok(())`
-> （fiber 仍是 `Pending`），`stalled_fibers()` 也看不到该窗口。需要等待请从 hook 外部进行。
+- `is_idle()` 严格：注册窗口对任何观察者都不是 idle；
+- `when_idle()`（v0.4.3 起）**只排除调用线程自身的 in-flight 注册**——在 create hook 内
+  `await when_idle()` 不会等自己（回归测试 4 ms 级返回），外部 waiter 仍等待整个窗口；
+- **边界**：跨线程环形注册依赖（两个线程互相等待对方的注册窗口）仍可能互等，宿主需避免；
+- 其它注册窗口边界不变：create hook 内 `fiber.await_settled()` 立即 `Ok(())`（fiber 仍是
+  `Pending`），`stalled_fibers()` 看不到该窗口——需要等待请用 `when_idle()`。
+
+**取消级联的自动恢复（v0.4.3，F1/F4/F5）**：取消 `dispose_async`/`refresh_async` 可能把
+非根 dependent 短暂 park 在 `Unloading`。
+
+- **恢复入口（F1）**：`when_idle()`、`refresh_async()`、`dispose_all()`、以及根 fiber 的
+  `dispose()`/`dispose_async()` 重试都会恢复这些帧到原级联目标（依赖方 `Pending`、
+  ownership 子 `Disposed`），未启动的 deferred async cleanup 恢复时恰好执行一次。
+  **注意：同步 `refresh()` 刻意不恢复**（可能在 reactor 线程调用，同步 drain async cleanup
+  会死锁；它只跳过 `Unloading` 帧）。
+- **等待期持续恢复（F5）**：`when_idle()` 在 `Context::when_idle()` 与裸
+  `Registry::when_idle()` 公共 API 两侧都是 recovery-aware——等待期间持续重试恢复（被 idle
+  或 parked-recoverable 唤醒，有界兜底），等待中才出现的 parked 帧也不会挂死。
+- **恢复状态安全（F4）**：单恢复者闩锁是 RAII guard（取消/panic 不残留），批量取帧用
+  `ReparkGuard`——恢复中途被取消会把未处理/在飞帧重新 park，不丢帧。
+- 恢复幂等、去重、有界（按并发 parked 帧数），取消 unwind 中或另一 unload 进行中时延迟到
+  下一次根操作。若取消恰好撞上正在执行的 async cleanup，该在飞 future 不可恢复（A-9），
+  但不会留下永久 `Unloading`；恢复前 `is_idle()` 仍为 `false`（严格）。
 
 ---
 
@@ -693,12 +712,16 @@ for fiber in root.registry().fibers() {
 内部钩子是「中间件式」的 typed 通道（不是字符串事件），适合宿主集成：审计、每插件限流、
 配置来源注入、加载拦截等。
 
-> **v0.4.2 注意（注册窗口）**：`ctx.plugin*` 的注册→激活窗口计入 in-flight，而
-> `internal/plugin` create hook 正是在该窗口内执行。**不要在 create hook 内同步等待**
-> `when_idle()`：guard 由发起注册的调用者持有，会自我死锁（0.4.1 会立即返回）；
-> `is_idle()` 不阻塞，但在该窗口只返回 `false`。
+> **注册窗口（v0.4.3）**：`ctx.plugin*` 的注册→激活窗口计入 in-flight，而
+> `internal/plugin` create hook 正是在该窗口内执行。v0.4.3 起 `when_idle()` **只排除调用
+> 线程自身的注册**：在 create hook 内等待 `when_idle()` 不会自锁（外部 waiter 语义不变）；
+> `is_idle()` 仍严格，在该窗口返回 `false`。跨线程环形注册依赖仍可能互等（文档边界）。
 > 同理，create hook 里拿到的 fiber 仍是 `Pending`：`fiber.await_settled()` 立即返回
-> `Ok(())`，`stalled_fibers()` 也看不到该窗口；需要等待请从注册调用之外进行。
+> `Ok(())`，`stalled_fibers()` 也看不到该窗口。
+>
+> **Plugin 元数据 panic（v0.4.3）**：`Plugin::{name,key,inject,config_schema}` 的 panic 会
+> 被遏制并降级（`name`→`"<panicked plugin>"`、`inject`→`&[]`、`schema`→`None`），不再从
+> `ctx.plugin` 外泄；坏插件本身仍需修复。
 
 ---
 
@@ -735,7 +758,8 @@ fn plugin_activation_and_cleanup() {
 | `Validation(err)` | 配置 schema 校验失败 | 修正配置或 schema |
 | `ServiceWriteForbidden(name)` | 试图 `set` 别人提供的服务 | 通过提供者 API 修改 |
 | `ServiceTypeMismatch(name)` | `set`/`set_any` 写入的值类型与已注册服务不一致（v0.4.2）| 用正确类型写入；要换类型需先撤销旧服务 |
-| `AccessorReadOnly(name)` | 对只读计算访问器调 `set` | 改用可写 key |
+| `AccessorReadOnly(name)` | 对只读计算访问器调 `set`（无 setter） | 改用可写 key |
+| `AccessorWriteRejected(name)` | 计算 accessor 的 setter 检视新值后返回 `false`（v0.4.3，S3）| 按 accessor owner 的规则提供合法值 |
 | `AsyncPluginNeedsAsync(name)` | 对异步插件用了同步生命周期 API | 改用 `*_async` |
 | `Cancelled` | 协作 checkpoint 观察到取消 | 正常退出/清理 |
 | `LifecycleBusy` | 同 fiber 生命周期操作被其他线程占用 | 重试或串行化 |
@@ -811,6 +835,12 @@ for stalled in root.stalled_fibers(Duration::from_secs(5)) {
 要点：
 
 - 配额在**注册时**检查，超限走正常失败/回滚路径，不会留下半注册资源；
+- **配额按活资源计数（v0.4.3）**：effects/listeners/child fibers 释放后立即归还配额槽
+  （effects 死条目会被清理；listener 槽在用户 disposer / `once` 自动移除 / fiber 卸载
+  任一路径恰好释放一次；child 按 live 弱引用统计）；
+- **`max_effects` 建议 ≥2**：内核自身占用内部 effect（root 的 logger provide effect、
+  每个动态加载子 fiber 的 ownership effect），配额统计的是含内部 ownership effect 的
+  live effects；`max_effects = 1` 会让内核自身无法加载插件；
 - 心跳是**协作式**的：插件不调用 `heartbeat` 也不会被内核打断，只会被 supervisor 观察到；
 - watchdog 只报告「有 in-flight 操作且静默」的 fiber（含根 fiber），不做任何强制动作；
 - 需要"杀进程/杀线程/超时中断"时，用 L3 进程隔离 / L4 WASM，见 `KERNEL-ISOLATION.md`。

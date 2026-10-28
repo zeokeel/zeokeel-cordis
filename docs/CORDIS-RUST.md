@@ -3,8 +3,8 @@
 Companion to `spec/CORDIS-CORE.md`. This file records how the Rust port relates to
 the JavaScript Cordis reference, what the Rust-only extensions add, which failures
 the kernel contains, and what the crate deliberately does not support. It is
-descriptive; the specification stays normative. Baseline: crate version `0.4.2`
-(tag `v0.4.2`).
+descriptive; the specification stays normative. Baseline: crate version `0.4.3`
+(tag `v0.4.3`).
 
 ## 1. Deliberate differences from the TypeScript reference
 
@@ -23,7 +23,10 @@ language-driven and permanent unless the spec says otherwise:
   lifecycle broadcast today is `internal/plugin` on **create** — there is no
   dispose-time broadcast yet.
 - **Logger severity is numeric order** (`Error=0 … Debug=3`), the same ordering used
-  for thresholds; the facade exposes `error`/`warn`/`info`/`debug`.
+  for thresholds; the facade exposes `error`/`warn`/`info`/`debug`. Since v0.4.3 an
+  **invalid numeric level** in config (e.g. `{"level": 99}`) is clamped to the
+  safe end (`Error`) instead of failing open to the most verbose `Debug` (S2;
+  string levels are unchanged).
 - **Two listener lanes.** A Rust closure has one fixed return type, so sync
   listeners (`on`/`on_with`/`once`) are dispatched by `emit`/`bail`/`waterfall`
   and async listeners (`on_async`/`on_async_with`) by `parallel_async` /
@@ -101,7 +104,11 @@ language-driven and permanent unless the spec says otherwise:
   the write leaves the store untouched. `set`/`set_any` must match the registered
   entry's type (the terminal write re-checks as defence in depth), otherwise
   `CordisError::ServiceTypeMismatch(name)` is returned and the store is unchanged;
-  an `internal/set` hook can veto a write but cannot substitute a value.
+  an `internal/set` hook can veto a write but cannot substitute a value. A
+  **computed accessor's setter returning `false`** (the owner inspected the value
+  and rejected it) reports the dedicated `CordisError::AccessorWriteRejected(name)`
+  since v0.4.3 (S3), distinct from `ServiceWriteForbidden` (another fiber owns the
+  service) and `AccessorReadOnly` (no setter at all).
 - **Async-disposer joining (CORE-043).** A second concurrent async disposal joins
   the in-flight cleanup instead of racing it.
 - **Lifecycle exclusivity and "disposed is final" (CORE-044, CORE-045).**
@@ -142,19 +149,20 @@ language-driven and permanent unless the spec says otherwise:
 - **Quiescence (CORE-049).** `Registry::is_idle` reports whether any lifecycle
   operation is in flight (no `Loading`/`Unloading` fiber, `pending_ops == 0`), and
   `Registry::when_idle` / `Context::when_idle` resolve once the tree is quiescent.
-  v0.4.2 counts the whole registration→activation window of `ctx.plugin*`
-  (including the `internal/plugin` create hook) as in-flight, so `when_idle`
-  does not report idle while a plugin is being created or activated — and a
-  create hook that blocks synchronously on it self-deadlocks (§2.3).
+  The whole registration→activation window of `ctx.plugin*` (including the
+  `internal/plugin` create hook) counts as in-flight. Since **v0.4.3** `when_idle`
+  excludes the calling thread's **own** in-flight registrations (R3-A3), so a
+  create hook can wait for the rest of the tree without deadlocking; `is_idle`
+  stays strict and other threads' waiters keep the FIX-11b guarantee (§2.3).
 - **Cooperative cancellation (CORE-050).** `Fiber::cancel` sets a flag and
   `Context::checkpoint` returns `Err(CordisError::Cancelled)` once set, letting
   plugin work unwind through the normal failure/rollback path. The kernel never
   forcibly interrupts plugin code.
 
-### 2.3 Patched in v0.4.2 (no new CORE cases)
+### 2.3 Patched in v0.4.2 / v0.4.3 (no new CORE cases)
 
-v0.4.2 is a hardening release: it fixes the implementation against existing
-contracts and makes the previously unstated edges below explicit. See
+v0.4.2 and v0.4.3 are hardening releases: they fix the implementation against
+existing contracts and make the previously unstated edges below explicit. See
 `CHANGELOG.md` for the compatibility notes.
 
 - **Refresh latch is RAII-guarded.** A panic that escapes one `refresh` pass can
@@ -207,22 +215,69 @@ contracts and makes the previously unstated edges below explicit. See
   payload is re-raised after every fiber was attempted.
 - **Event owner is released on drop.** A `FiberData` dropped without an explicit
   dispose removes its event owner entry as a last resort.
-- **`is_idle`/`when_idle` cover the registration→activation window.** A registry
-  level registration guard spans the whole `ctx.plugin*` call — through the
-  `internal/plugin` create hook and the activation that follows — so the tree is
-  not idle while a plugin is being created/activated. **Observable change:** in
-  0.4.1 `when_idle()` returned immediately in that window; now a create hook
-  that blocks synchronously on `Registry::when_idle()`/`Context::when_idle()`
-  waits on its own registration and **self-deadlocks** (see CORE-049 above and
-  `docs/KERNEL-ISOLATION.md`).
+- **`is_idle`/`when_idle` cover the registration→activation window (R3-A3/C4).**
+  A registry-level registration guard spans the whole `ctx.plugin*` call — through
+  the `internal/plugin` create hook and the activation that follows — so the tree
+  is not idle while a plugin is being created/activated (`is_idle()` is strict:
+  it excludes nothing, v0.4.2 behavior kept). Since v0.4.3 `when_idle()` records
+  which **thread created** each in-flight registration and subtracts the caller's
+  own registrations: a hook can `await when_idle()` without waiting for its own
+  registration (returns in ~4 ms in the regression test), while external waiters
+  keep the FIX-11b guarantee. **Remaining boundary:** two threads whose
+  registrations mutually await each other's window can still deadlock — the
+  kernel does not detect cyclic registration dependencies. This thread-exclusion
+  rule is a Rust-side design choice (the TS reference has no equivalent
+  registration guard); `is_idle()` stays strict for supervisors.
+- **Plugin metadata callbacks are contained (C2, v0.4.3).** `Plugin::name` /
+  `::key` / `::inject` / `::config_schema` (and `AsyncPlugin` counterparts) are
+  embedder code called during creation, replacement, restart, diagnostics and
+  dependency resolution. A panic no longer escapes `ctx.plugin`/replace or poisons
+  kernel locks: it is logged and degrades deterministically — `name()` →
+  `"<panicked plugin>"`, `key()` → `Named("<panicked plugin>")` (such plugins
+  share one runtime), `inject()` → `&[]` (no dependency gating),
+  `config_schema()` → `None` (raw config accepted, no validation). This is a
+  Rust kernel contract: the TS reference would propagate the exception.
 - **Companion boundaries of the registration window.** Inside the
   `internal/plugin` create hook the new fiber is still `Pending` and has no
   in-flight fiber-level operation, so `fiber.await_settled()` resolves
   immediately (`Ok(())`), and `Registry::stalled_fibers()`/`Context::stalled_fibers()`
   do not report the registration window (they inspect fiber-level `pending_ops`
-  and `Loading`/`Unloading` states only). Use `when_idle()` from outside the
-  create hook when you need to wait for registration/activation; do not block on
-  it from within the hook.
+  and `Loading`/`Unloading` states only). `when_idle()` is the right primitive
+  there (v0.4.3 excludes the caller's own registration, see above).
+- **Deep dependency chains unload iteratively (R3-A1, v0.4.3).** Unloading no
+  longer recurses through `take_effects → retire_unready → unload`: a two-phase,
+  order-preserving cascade *begins* every transitively-unready fiber
+  provider-before-dependent (marks `Unloading`, withdraws services, takes
+  effects) and then drains the frames in reverse order (an equivalent
+  dependents-before-provider cleanup order). Ownership descendants are collected
+  with an explicit DFS stack, so the call stack is O(1) in the chain depth: on a
+  2 MiB thread depth 800 passes in **both debug and release** builds in 0.4.3
+  (0.4.2 comparison: debug aborted at ≈480 levels, release at ≈2200; the actual
+  `MAX_PLUGIN_DEPTH = 256` load limit is far below either). The cascade has a
+  `fiber_count + 2` fixed-point bound; leftovers
+  stay `Active` and can be retried by a later dispose/refresh. This removes the
+  former "deep dependency-chain teardown can overflow the stack" limitation.
+- **Dynamic child bookkeeping is bounded (R3-A4, v0.4.3).** A child fiber
+  disposing itself detaches its `ctx.plugin` ownership effect from the parent's
+  effect list (and its effect-node/weak-list entries), and a parent effect list
+  that grows past a threshold amortizes away disposed ownership effects. A 60k
+  churn used to accumulate 60001 effects / +54.7 MB on the parent; 10k churn now
+  peaks at one ownership effect and RSS stays essentially flat (+≈1 MB measured,
+  +996 KB at 10k churn).
+- **Nested effect metadata is filtered (C3, v0.4.3).** `Fiber::get_effects()`
+  snapshots the live tree: a nested effect disposed by the user no longer leaves
+  a ghost node under its parent's `EffectMeta`.
+- **Supervision quotas count live resources (S1, v0.4.3).** With the
+  `supervision` feature the per-fiber `FiberQuota` counts *live* effects (dead
+  entries are pruned when pushing), listeners (one-shot `ListenerSlot` released
+  exactly once by whichever path comes first: user disposer, `once`
+  auto-removal, or fiber unload), and child fibers (live weak handles). Released
+  slots are reusable immediately; exceeding a limit returns
+  `CordisError::QuotaExceeded` and rolls the activation back. The kernel itself
+  holds internal effects (the root logger provide effect, plus one ownership
+  effect per dynamically loaded child fiber), and the quota counts them:
+  **`max_effects` should be ≥2** — a quota of `1` starves the kernel itself and
+  no plugin can load.
 - **Strict injection gate.** `inject` and `ctx.service_available` require the
   provider to be `Active`; `ctx.get`/`get_named`/`get_any` stay non-strict (TS
   property-read semantics). Accessors and `internal/get` virtual services only
@@ -248,6 +303,31 @@ contracts and makes the previously unstated edges below explicit. See
   dispose/drain, `finish_unload` reaches the target state (`Pending`/`Disposed`),
   and the event owner is removed plus quiescence notified. The in-flight
   cleanup future itself is still lost (Rust has no cancel-safe await).
+- **Cancelled cascades are recovered by recovery-aware entry points (F1/F4/F5,
+  v0.4.3).** Cancelling an async unload cascade (`dispose_async`/`refresh_async`
+  future dropped) can temporarily park non-root dependents in `Unloading`.
+  - **F1:** `when_idle()`, `refresh_async()`, `dispose_all()` and a retried root
+    `dispose()`/`dispose_async()` recover parked frames to the **original
+    cascade target** (`Pending` for dependency dependents, `Disposed` for
+    ownership children), with unstarted deferred async cleanups running exactly
+    once. A cancel that lands while an async cleanup is already executing still
+    loses that in-flight future (the A-9 boundary) but never leaves a permanent
+    `Unloading`; `is_idle()` stays strict (`false`) until recovery runs.
+  - **F4:** the single-recoverer latch is an **RAII guard** (cancel/panic cannot
+    leave it set and disable later recovery), and the batch of taken frames is
+    owned by a **`ReparkGuard`/`RecoveryBatch`**: a recovery cancelled mid-batch
+    re-parks every unprocessed/failed frame instead of losing it.
+  - **F5:** `when_idle()` is recovery-aware in **both** `Context::when_idle()`
+    and the raw public `Registry::when_idle()`: the wait loop retries recovery
+    whenever parked frames are recoverable (woken on idle or parked-recoverable,
+    bounded with a fallback), so frames parked *while waiting* cannot hang it.
+    **Sync `refresh()` does not recover parked frames** — it can be called from
+    a reactor thread and draining reactor-backed cleanups synchronously would
+    deadlock; recovery belongs to the awaitable/blocking entries above.
+  - Recovery is idempotent, deduplicated and bounded (by concurrently parked
+    frames), and deferred to the next root operation while a cancellation unwind
+    or another unload is in progress. This is the Rust-side completion contract
+    for a cancelled cascade; the TS reference has no equivalent parking state.
 - **Async waterfall panics re-raise.** `waterfall_async` no longer swallows a
   middleware panic into `Value::Null`; both lanes abort the chain, log, and
   re-raise (fail-closed).
@@ -313,6 +393,7 @@ v0.4.2).
 | Cleanup panic while a **refresh/retire path** unloads dependents | contained and logged (v0.4.2); the drained fiber still reaches its target state so a provider cannot stick in `Unloading`. A direct `dispose` still re-raises |
 | Child sweep panic while a parent unloads | per-child `catch_unwind` (v0.4.2); the sweep continues with the remaining children, and the first payload is re-raised only after the parent reached its target state |
 | Reload panic during `Registry::replace` / `Fiber::replace_plugin` | contained (v0.4.2): converted to `Err(CordisError::PluginFailed("<op>: reload panicked: …"))` with a full rollback; only a failing rollback returns `Rollback`. The `Result` APIs never unwind |
+| Plugin metadata callbacks (`name` / `key` / `inject` / `config_schema`, sync + async) | contained and degraded (v0.4.3, C2): `name` → `"<panicked plugin>"`, `key` → `Named("<panicked plugin>")`, `inject` → `&[]`, `config_schema` → `None`; logged, never escapes `ctx.plugin`/replace |
 | `dispose_all` with both an error and a panic | the panic wins (v0.4.2): the error is logged and the first payload is re-raised after every fiber was attempted (CORE-051) |
 | Sync event listener panics | contained, treated as `EventResult::Continue`; dispatch continues (CORE-031) |
 | Async listener panic (future construction or poll) | contained and logged; dispatch continues |
@@ -364,13 +445,54 @@ still waits for the teardown.
   cross-call snapshots as **diagnostics**, not a transactional view; call
   `is_idle()`/`when_idle()` first when you need a consistent picture (e.g. in
   tests or shutdown code).
-- **Deep dependency-chain teardown is recursive.** Unloading a provider retires
-  its dependents (`take_effects` → `retire_unready` → unload), so the unload call
-  stack grows with the dependency-chain depth. On a 2 MiB worker stack this
-  overflows at roughly 480 levels (debug) / 2200 levels (release) and aborts
-  (stack overflow is not catchable). This is a pre-existing boundary (same in
-  0.4.1, not introduced by 0.4.2): dispose very deep chains in layers/batches;
-  see `docs/KERNEL-ISOLATION.md`.
+- **Deep dependency-chain teardown is iterative (v0.4.3).** The unload cascade is
+  a two-phase, order-preserving iteration (begin provider-before-dependent, drain
+  in reverse), so the call stack is O(1) in the chain depth; on a 2 MiB thread
+  depth 800 passes in 0.4.3 debug **and** release builds (0.4.2 comparison: debug
+  aborted at ≈480 levels, release at ≈2200), while `MAX_PLUGIN_DEPTH = 256` still
+  bounds plugin **loading** only. The former "dispose very deep chains in
+  layers/batches" limitation no longer applies.
+- **Cyclic registration waits are not detected.** `when_idle()` excludes only the
+  caller's own in-flight registrations (R3-A3). If two threads each wait for the
+  other's registration/activation window, they can still wait forever — avoid
+  synchronous registration cycles in hosts.
+- **Supervision quotas count live resources (v0.4.3).** `FiberQuota` limits apply
+  to live effects/listeners/children; released slots (unload, `once` auto-removal,
+  concurrent dispose) are reusable immediately, so the trigger point differs from
+  0.4.2's historical-accumulation behavior. Internal effects count too (root
+  logger provide + one ownership effect per dynamic child), so
+  **`max_effects` should be ≥2**.
+
+- **Cancelled-cascade recovery (F1/F4/F5, v0.4.3).** A cancelled async cascade
+  can park non-root dependents in `Unloading`; recovery happens through
+  `when_idle()` (both `Context` and the raw `Registry` API), `refresh_async()`,
+  `dispose_all()` and retried root `dispose()`/`dispose_async()`, to the
+  original target with deferred async cleanups running exactly once. The
+  recovery latch is RAII (no stuck latch after cancel/panic) and taken frames
+  are re-parked if recovery is cancelled mid-batch. **Sync `refresh()` does not
+  recover** (it may run on a reactor thread; a synchronous drain would
+  deadlock) — it simply skips `Unloading` frames. Recovery is
+  idempotent/deduped/bounded and may be deferred; an async cleanup already in
+  flight at cancellation time stays unrecoverable (A-9), while `is_idle()`
+  remains strictly `false` until recovery runs.
+- **Deferred cleanups can outlive a cancelled recovery (v0.4.3, P2).** If a
+  recovery pass is cancelled while it is finishing the *root* frame of a
+  cascade, the remaining `CancelSafeDrain`-restored async cleanups of that
+  fiber can stay in `deferred_async` until the next explicit
+  `dispose`/`dispose_all`; they are not run twice, and the fiber does not stay
+  `Unloading`, but `when_idle()` may report idle before they run. Scheduled for
+  0.4.4 (re-add them to the recoverable set).
+- **Performance backlog (v0.4.3).** On a 5000-fiber fanout, create /
+  `dispose_all` are about **25–35% slower** than 0.4.2 (1k fibers are faster or
+  on par; RSS and correctness show no regression). A reverse-dependency index is
+  planned for **0.4.4**; until then very large fanouts should evaluate batch
+  timing.
+- **Degraded plugin keys are not individually addressable (C2).** Every plugin
+  whose `Plugin::key()` panics shares one
+  `PluginKey::Named("<panicked plugin>")` runtime, so `keys`/`replace`/`delete`
+  see a single entry and cannot target one such plugin. This is best-effort
+  isolation for already-broken plugins — not a supported configuration; fix the
+  plugin's `key()` instead.
 
 ## 5. Support boundary
 

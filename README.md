@@ -63,14 +63,14 @@ cargo add zeokeel-cordis
 
 ```toml
 [dependencies]
-zeokeel-cordis = "0.4.2"
+zeokeel-cordis = "0.4.3"
 serde_json = "1"   # 插件配置是 serde_json::Value
 ```
 
 > crates.io 包名 `zeokeel-cordis` 与库目标名 `zeokeel_cordis` 一致：代码里统一
 > `use zeokeel_cordis::...`。
 > 需要跟仓库最新未发布代码时，可换成 git 依赖：
-> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.4.2" }`。
+> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.4.3" }`。
 
 最小插件（完整可运行版本：[`examples/hello.rs`](examples/hello.rs)）：
 
@@ -135,7 +135,7 @@ fn main() -> Result<()> {
 观测），**默认关闭**——核心内核不含任何监督策略：
 
 ```toml
-zeokeel-cordis = { version = "0.4.2", features = ["supervision"] }
+zeokeel-cordis = { version = "0.4.3", features = ["supervision"] }
 ```
 
 详见 [`docs/KERNEL-ISOLATION.md`](docs/KERNEL-ISOLATION.md)。
@@ -151,26 +151,43 @@ zeokeel-cordis = { version = "0.4.2", features = ["supervision"] }
 | [`docs/KERNEL-ISOLATION.md`](docs/KERNEL-ISOLATION.md) | 故障边界、L1–L4 隔离模型、编译期强制、L2 API |
 | [`spec/CORDIS-CORE.md`](spec/CORDIS-CORE.md) | 规范性语义与编号用例（CORE-001…CORE-051，`tests/` 一一对应）|
 | [`docs/CORDIS-RUST.md`](docs/CORDIS-RUST.md) | Rust 移植笔记（与 TS 实现的差异、panic 策略）|
-| [`docs/dev/HARDENING-LOG.md`](docs/dev/HARDENING-LOG.md) | 开发记录：缺陷清单、逐轮修复与对抗测试日志（非用户文档）|
+| [`docs/dev/HARDENING-LOG.md`](docs/dev/HARDENING-LOG.md) | 历史开发记录（v0.3 时代）：缺陷清单与逐轮加固日志；历史快照，非当前行为（取消语义见 0.4.2 A-9）|
 
 ---
 
 ## 质量与严格构建
 
 - **全量测试**：`cargo test`（默认构建）与 `cargo test --features supervision` 两套都必须全绿；
-  0.4.2 实测：默认构建 **365 passed / 0 failed**、`--features supervision` **371 passed / 0 failed**
-  （均含 7 个 doc-tests；0.4.1 基线为 311 / 317；本版新增 `tests/regression_core.rs`（24 例）与
-  `tests/regression_semantics.rs`（26 例）两套回归用例，并更新了 `redteam*`/`concurrency` 的
-  取消/回滚语义断言）
-- **0.4.2 加固**：21 项生命周期/语义缺陷修复——refresh 闩锁、卸载/清场 panic 遏制、
-  早退路径 finalize、provider-ACTIVE 注入门、`ctx.set` 类型校验、异步 waterfall fail-closed、
-  `dispose_blocking` join 等，逐条见 [CHANGELOG](CHANGELOG.md) 与
-  [`spec/CORDIS-CORE.md`](spec/CORDIS-CORE.md) §6
-- `cargo fmt --check && cargo clippy --all-targets -- -D warnings`（两种 feature 组合都跑）
-- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`
+  0.4.3 实测：默认构建 **404 passed / 0 failed**（含 7 个 doc-tests）、
+  `--features supervision` **415 passed / 0 failed**（0.4.2 为 365 / 371，0.4.1 基线
+  311 / 317）。本版扩展了
+  `tests/regression_core.rs` / `tests/regression_semantics.rs` 与 R3-A1/R3-A4/C1–C5/S1–S3/R1
+  审计回归用例（深链迭代卸载、动态卸载记账、when_idle 注册帧、配额活资源等）
+- **0.4.3 加固**：R3-A4 动态卸载父 fiber 记账无界泄漏（60k churn 60001 effects → 10k churn
+  峰值 1，RSS 基本持平（实测 +≈1 MB））、R3-A1 深依赖链迭代卸载（栈 O(1)；2 MiB 线程
+  depth 800 在 **0.4.3 debug+release 均通过**，0.4.2 对照 debug 约 480 层即 abort、release
+  约 2200 层才 abort）、R3-A3 注册帧内
+  `when_idle` 自锁修复、S1 supervision 配额按活资源记账、C2 Plugin 元数据 panic 遏制、C3 嵌套
+  effect 元数据 ghost、S2 logger 非法 level clamp、S3 `AccessorWriteRejected` 等；0.4.2 的
+  21 项修复见 [CHANGELOG](CHANGELOG.md)
+- `cargo fmt --check`、两种 feature 配置的 `cargo clippy --all-targets -- -D warnings`、
+  `cargo test`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`（默认与 `--all-features`）
 - 编译器强制 `panic = "unwind"`（`panic=abort` 直接编译失败，CI 反证）；
   release 开启 `overflow-checks`、`codegen-units=1`、thin LTO
-- CI：`rust` 作业（fmt/clippy/test/doc/release build/panic=abort 反证）+ `cargo audit`（RustSec）
+- **CI 实际行为**（`.github/workflows/ci.yml`）：
+  - `rust` 作业（stable）：fmt、clippy ×2、test ×2、doc ×2、examples 构建 + 冒烟运行、
+    真实 `cargo package` verify、release 构建、`panic=abort` 反证；
+  - `msrv` 作业（**Rust 1.85.0**）：test ×2 与 `doc --all-features`（**不跑 clippy**——
+    lint 集合随 stable 漂移，MSRV 只需 build/test/doc 通过）；
+  - `cargo audit`（RustSec）供应链漏洞门禁；
+  - build/test/clippy/doc/package/publish 类 cargo 命令统一带 **`--locked`**。
+- **可复现构建**：0.4.3 起仓库提交 `Cargo.lock`（已从 `.gitignore` 移除，随 0.4.3 提交），
+  CI 与发布流水线统一 `--locked`；库下游使用自己的 lockfile，不受影响。
+- **发布**（`.github/workflows/release.yml`）：tag 驱动；校验 **tag 版本 == `Cargo.toml`
+  version** 后重跑 fmt / clippy / test / doc / examples 门禁，再 `cargo package` →
+  `cargo publish --dry-run` → `cargo publish`；发布成功后把 `.crate` 的 SHA-256 附到对应
+  GitHub Release（该步失败不影响 crates.io 发布结果）。本地等价命令与完整流程见
+  [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ---
 
@@ -189,8 +206,14 @@ zeokeel-cordis = { version = "0.4.2", features = ["supervision"] }
 - **无 ABI / 动态加载**：插件是静态链接的 `Arc<dyn Plugin>`；动态插件需宿主进程/WASM 隔离。
 - **进程内不可遏制**：`panic=abort` 构建已被编译期拒绝；栈溢出、OOM、依赖中的 UB、死循环、
   外部 kill 只能靠 L3/L4 隔离（见隔离文档）。
-- **极深依赖链 dispose 会递归爆栈**（既有边界，0.4.1 同型）：栈深≈依赖链层数，2 MiB 栈
-  debug≈480 层 / release≈2200 层 abort；数百~数千层的依赖链请分层/分批 dispose。
+- **`when_idle()` 只排除调用线程自身的注册帧（0.4.3）**：`internal/plugin` create hook 内
+  调用不再自锁，外部 waiter 仍等待整个注册/激活窗口；`is_idle()` 仍严格。跨线程环形注册
+  依赖（互相等待对方注册窗口）仍可能互等，宿主需避免。
+- **supervision 配额按活资源计数（0.4.3）**：effects/listeners/child fibers 释放（含 `once`
+  自动移除、并发/卸载路径）后立即归还配额槽，超限判定基于活资源而非历史累计。
+- **深依赖链卸载已支持（0.4.3）**：迭代级联、栈 O(1)。2 MiB 线程 depth 800 在 0.4.3
+  **debug 与 release 均通过**；0.4.2 对照为 debug 约 480 层即 abort、release 约 2200 层才
+  abort。`MAX_PLUGIN_DEPTH = 256` 仍只限制插件**加载**深度。
 - **事件作用域过滤 = isolate 映射相等**（非子树）；无类型化事件表。
 - **无抢占**：watchdog/取消是协作式的；内核不会强杀插件线程。
 
@@ -218,8 +241,8 @@ GitHub topics —
 
 ## 状态与许可证
 
-- 当前版本 **v0.4.2**（CORE-001…CORE-051；0.4.2 为修复/加固补丁，未新增 CORE 用例）；
-  v0.4.x 为语义冻结线。
+- 当前版本 **v0.4.3**（CORE-001…CORE-051；0.4.2/0.4.3 均为修复/加固补丁，未新增 CORE
+  用例）；v0.4.x 为语义冻结线。
 - MIT，见 [LICENSE](LICENSE)；论文版权归原作者。
 
 维护仓库：<https://github.com/zeokeel/zeokeel-cordis>（提交作者 `zeokeel-dev`）。
