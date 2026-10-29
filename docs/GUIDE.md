@@ -206,6 +206,10 @@ impl Plugin for ClockPlugin {
 | `ctx.get_any/require_any/…` | trait object 服务（`ServiceKey<dyn Trait>`） |
 | `ctx.set_any(KEY, Arc<T>)` | 类型化地修改**自己提供的**服务；别人的服务返回 `ServiceWriteForbidden` |
 | `ctx.set(name, ServiceValue)` / `ctx.set_revertible(name, value)` | 按名字修改/可逆写入（返回 `Disposer`，可直接挂成 effect） |
+
+> **`ctx.set` 的成本（XT-07）**：每次成功写入都会给提供者 fiber 追加一个逆 effect（这正是
+> 可逆性的实现），因此高频 `set` 会线性增长 effect 列表（内存与卸载耗时 O(n)）；高频更新
+> 建议直接改服务对象，`set` 留给配置式变更，`set_revertible` 用来折叠逆操作历史。
 | `ctx.provide_checked` / `provide_gated` | 带可用性检查的服务（见 §5.3） |
 
 ### 4.3 trait object 服务

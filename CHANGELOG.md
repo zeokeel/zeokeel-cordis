@@ -32,6 +32,8 @@
   只有 lifecycle 拒绝（`LifecycleBusy`）或 validation 错误才走完整回滚。
 - `spec/CORDIS-CORE.md` / `docs/CORDIS-RUST.md` 记录 `on_async*` 绕过 `internal/listener`
   hook、async lane 无 `once`/`global` 的设计边界（XT-06）。
+- `spec/CORDIS-CORE.md` / `docs/GUIDE.md` 记录 `ctx.set` 每次写留一个逆 effect 的线性成本
+  （XT-07：高频写入建议原地修改服务，`set` 留给配置式变更）。
 
 ## [0.5.0] - 2026-10-29
 

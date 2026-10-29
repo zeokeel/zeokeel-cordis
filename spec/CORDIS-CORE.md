@@ -105,6 +105,12 @@ concerns built on top of the core.
   defence in depth, so a store entry can never change its concrete type. An
   `internal/set` hook can only veto the write, it cannot substitute a value.
   A wrong-typed overwrite can no longer silently replace a service.
+  **Cost (XT-07):** every successful `set`/`set_any` registers one inverse effect
+  on the providing fiber (that is what makes it revertible), so a hot loop of
+  `set` grows that fiber's effect list linearly — O(n) memory and O(n) unload
+  work. Prefer mutating the service value in place for high-frequency updates,
+  reserve `set` for configuration-style changes, and use `set_revertible` when
+  the caller wants to collapse the inverse history.
   **Accessor write rejection (v0.4.3)**: when a computed accessor has a setter and
   that setter returns `false` (the owner inspected the value and rejected it), the
   write returns `CordisError::AccessorWriteRejected(name)` — distinct from
