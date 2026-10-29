@@ -3,7 +3,7 @@
 从零开始：安装、写插件、注册服务、处理依赖、管理生命周期、做测试。本文所有示例都对应
 [`examples/`](../examples/) 下的可运行代码，建议边读边跑。
 
-- 版本：v0.5.0（Rust 1.85+，edition 2021）
+- 版本：v0.6.0（Rust 1.85+，edition 2021）
 - 规范：[`spec/CORDIS-CORE.md`](../spec/CORDIS-CORE.md)（英文，编号用例）
 - 设计：[`DESIGN.md`](DESIGN.md)；API 速查：`cargo doc --open`
 
@@ -30,7 +30,7 @@
 17. [错误速查](#17-错误速查)
 18. [FAQ 与常见坑](#18-faq-与常见坑)
 19. [可选 L2 防线（supervision）](#19-可选-l2-防线supervision-feature配额心跳能力自省)
-20. [v0.5.0 扩展点：时钟、生命周期广播、结构化错误](#20-v050-扩展点时钟生命周期广播结构化错误)
+20. [扩展点（v0.5.0 引入，v0.6.0 迁移/补充）](#20-扩展点v050-引入v060-迁移补充)
 
 ---
 
@@ -42,13 +42,13 @@ cargo add zeokeel-cordis
 
 ```toml
 [dependencies]
-zeokeel-cordis = "0.5.0"
+zeokeel-cordis = "0.6.0"
 serde_json = "1"   # 插件配置用 serde_json::Value
 ```
 
 > crates.io 包名 `zeokeel-cordis` 与库目标名 `zeokeel_cordis` 一致：代码里统一 `use zeokeel_cordis::...`；
 > 需要跟仓库最新代码时可用 git 依赖：
-> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.5.0" }`。
+> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.6.0" }`。
 
 - MSRV：Rust **1.85+**
 - 同步宿主不需要异步运行时；异步宿主可选 tokio，但内核本身不依赖 tokio
@@ -548,7 +548,16 @@ let fibers = root.registry().replace(
   **结构化错误保留在 `fiber.error_detail()`**（兼容字符串在 `fiber.error()`）。请用
   `state()`/`error_detail()` 判断结果，而不是只看返回值；
 - 生命周期操作互斥，跨线程并发会得到 `LifecycleBusy`；`Fiber::replace_plugin` 也占用同一把
-  生命周期槽（v0.4.2）；
+  生命周期槽（v0.4.2）。**0.6.0 起互斥基于操作级 token**（异步任务经 executor 迁移后行为
+  一致）：同线程重入（cleanup 内 dispose 自己的 fiber 等）仍允许，跨线程并发仍返回
+  `LifecycleBusy`；
+- **refresh 卸载占用 lifecycle 槽（0.6.0）**：refresh 触发的卸载进行中，外部
+  `restart`/`dispose`/`dispose_all` 返回 `LifecycleBusy`（不再是 `InactiveEffect` 或被
+  接受），请在其结束后重试；`fiber.await_settled()` 会等到该卸载结束才返回；
+- **同线程 async 操作挂起期间也 Busy（0.6.0）**：async lifecycle 操作（`dispose_async`/
+  `restart_async`/`update_async`/`replace_plugin_async`）挂起时，**同线程**的 sync
+  `dispose`/`restart`/`update` 也返回 `LifecycleBusy`（它不属于该 async 操作 token，
+  不会被误判为 reentrant），需在操作结束后重试；
 - `update` 的顺序是：`internal/config` → schema 校验 → `internal/update`，只有 waterfall
   终端才会保存新 raw config 并重启（v0.4.2）：
   - 校验失败返回 `Validation`，不重启、不改 raw config；
@@ -577,7 +586,9 @@ root.dispose_all()?; // 逐个 dispose 所有 fiber + 根 fiber，收集首个�
 
 - 即使某个清理 panic，也会尝试完所有 fiber 再抛出（CORE-051）；若同时还有其它 fiber 返回
   `Err`，**panic 优先**：错误只记日志、首个 panic 重抛（v0.4.2）；
-- 关闭后 registry 为空、`is_idle()` 为 true；
+- 关闭后 registry 为空、`is_idle()` 为 true；**若某 fiber 的 lifecycle 操作正忙**
+  （例如并发 refresh 卸载中），`dispose_all` 会对该 fiber 返回 `Err(LifecycleBusy)` 且可能
+  留下未清理 fiber——请在其操作结束后重试（XT-10）；
 - **未 dispose 的 fiber 会保留整棵图**，宿主退出时务必调用 `dispose_all`；
 - **深依赖链卸载已支持（v0.4.3）**：卸载改为两阶段保序迭代级联（栈 O(1)），2 MiB 线程
   depth 800 在 **debug 与 release 均通过**（0.4.2 对照：debug 约 480 层即 abort、release
@@ -742,6 +753,12 @@ let sub = root.on_lifecycle(Arc::new(|event: &LifecycleEvent| {
 // ... 进程退出前 sub.dispose();
 ```
 
+> **构造/匹配（0.6.0）**：`LifecycleEvent` 是 `#[non_exhaustive]`，外部构造必须用
+> `LifecycleEvent::new(fiber_id, name, from, to, seq)`；模式匹配需带 `..`；字段读取不受影响。
+> `on_lifecycle` 使用**独立的 lifecycle 总线**（锁内快照 + seq），不是 raw `internal/status`
+> 的别名——raw status hook 可能在 hook 运行时观察到更晚状态，需要一致迁移链请用
+> `on_lifecycle`。
+
 > **`InternalBus` 所有权（v0.5.0 明确）**：`Events::internal()`/`InternalBus` 是 advanced
 > surface——注册的回调由**调用者**拥有，**不随 fiber 卸载移除**，需显式 `Disposer`；
 > 常规插件请用 fiber-owned 的 `Context::on_internal_*`。`Context::on_lifecycle` 与
@@ -885,7 +902,7 @@ for stalled in root.stalled_fibers(Duration::from_secs(5)) {
 - watchdog 只报告「有 in-flight 操作且静默」的 fiber（含根 fiber），不做任何强制动作；
 - 需要"杀进程/杀线程/超时中断"时，用 L3 进程隔离 / L4 WASM，见 `KERNEL-ISOLATION.md`。
 
-## 20. v0.5.0 扩展点：时钟、生命周期广播、结构化错误
+## 20. 扩展点（v0.5.0 引入，v0.6.0 迁移/补充）
 
 ### 20.1 可注入时钟（确定性时间）
 
@@ -943,6 +960,47 @@ let error = CordisError::plugin("my-plugin", "network", "upstream timeout");
   的公开方法；插件匹配请直接对 `Plugin`/`AsyncPlugin` trait 编程；
 - `FiberQuota::max_effects` 只统计用户 effect（Q11），`max_effects(1)` 可正常加载插件；
 - 完整迁移清单见 [CHANGELOG](../CHANGELOG.md) 0.5.0。
+
+### 20.5 0.5.x → 0.6.0 迁移（三步）
+
+`LifecycleEvent` 在 0.6.0 加 `#[non_exhaustive]` 并提供构造函数：
+
+1. **literal → `new`**：把 0.5.0 的 4 字段 literal 或 0.5.1 的 5 字段 literal 改成
+   `LifecycleEvent::new(fiber_id, name, from, to, seq)`（0.5.0 代码需补 `seq` 来源；
+   回调里通常直接使用收到的 `event` 字段）；
+2. **穷尽 match 加 `..`**：`LifecycleEvent { fiber_id, name, from, to, seq }` 模式末尾补 `..`；
+3. **只读字段/已用 `..` 的代码无需修改**。
+
+背景：0.5.1 是 patch，但新增 `pub seq` 破坏了 0.5.0 的 4 字段 literal 与无 `..` 的穷尽
+match——这是 **0.5.1 patch 的兼容性缺陷**；0.6.0 用 `#[non_exhaustive]` + 构造函数正式收口，
+后续新增字段不再 breaking。
+
+### 20.6 Drop 与 orphan async cleanup 回收（0.6.0）
+
+未显式 dispose 且未安装 `BlockingExecutor`（或正在 panicking）时，Drop 只执行同步 cleanup；
+被跳过的异步/deferred cleanup 进入**进程级 orphan 队列**（容量 **256**），不再静默丢弃。
+`ctx.plugin` 的**子 fiber ownership effect 也是 async effect**：父 fiber 被 drop 时它同样进入
+orphan 队列，因此子 fiber 会**延迟到 drain** 才释放（安装 executor 时则在 Drop 内排空）。
+
+```rust
+// 队列 gauge：当前等待 drain 的 orphan 数（采样值，可并发变化）
+let pending = zeokeel_cordis::orphan_async_cleanups_pending();
+// 累计被迫泄漏数（队列容量 256 满 / 锁中毒；健康进程为 0）
+let leaked = zeokeel_cordis::orphan_async_cleanup_count();
+// 累计 drain 失败数（cleanup panic；非 0 说明 drain 环境不合适或 cleanup 本身坏了）
+let failed = zeokeel_cordis::orphan_async_cleanup_failure_count();
+// 在非 reactor 的阻塞线程上回收；返回处理数（失败仍计为 processed）
+let processed = zeokeel_cordis::drain_orphan_async_cleanups();
+```
+
+- **drain 的执行器要求**：`dispose_blocking` 在没有安装 executor 时退化为 thread-park
+  `block_on`，**不能驱动 reactor-bound future**——这类 cleanup 可能失败（panic 被遏制并计入
+  `orphan_async_cleanup_failure_count()`）；drain 前应 `exec::set_blocking_executor`，或从
+  能驱动这些 future 的线程/运行时调用。
+- **幂等/去重**：drain 先把当前队列整体取走（gauge 先归零）再执行，并发 hand-off 或第二次
+  drain 不会重复运行同一 effect；`orphan_async_cleanups_pending()` 的采样值可能短暂滞后。
+- 安装 embedder `BlockingExecutor` 时仍按旧语义在 Drop 中排空；panicking 期间始终跳过 async。
+  长宿主仍建议显式 `dispose`/`dispose_async`，不要把 Drop 当作清理路径。
 
 ---
 

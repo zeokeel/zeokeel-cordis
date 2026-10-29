@@ -1,6 +1,6 @@
 # 内核边界：内核 vs 插件层 vs 宿主
 
-> 适用版本：**v0.5.0**（v0.4.x 为语义基线）。本文是工程约束文档，不是语义规范；
+> 适用版本：**v0.6.0**（v0.5.x 为语义基线）。本文是工程约束文档，不是语义规范；
 > 语义以 [`spec/CORDIS-CORE.md`](../spec/CORDIS-CORE.md) 为准（本文不新增 CORE 用例）。
 >
 > 配套护栏：`tests/kernel_boundary.rs`（v3：**11 个测试**——4 个真实断言 + 7 个防绕过自测）
@@ -259,10 +259,15 @@ fiber、effect、events、registry、config schema、exec 桥、logger 设施、
    清单（CHANGELOG `Changed` + 迁移说明）与文档更新。优先 deprecate 一个版本；0.5.0 直接
    移除的那批类型在 0.4.x 已声明「`pub(crate)` helpers 与私有字段不属于契约」，属于未承诺
    公共面的收敛。
-4. **扩展点优先**：能通过 `Plugin`/effect、`internal/*` hooks、`events`/waterfall、
+4. **可扩展公共 struct 用 `#[non_exhaustive]` + 构造函数**：预期未来会加字段的公共数据
+   struct 必须 `#[non_exhaustive]` 并提供 `new(...)`（0.6.0 的 `LifecycleEvent` 是范例）；
+   字段仍可读、模式匹配需 `..`，后续新增字段不再 breaking。不要用「先发布 pub 字段、以后
+   再加」的方式演化——0.5.1 在 patch 里新增 `seq` 造成 struct literal/穷尽 match 破坏，
+   就是没有先做这一步的代价（0.6.0 已正式收口）。
+5. **扩展点优先**：能通过 `Plugin`/effect、`internal/*` hooks、`events`/waterfall、
    L2 supervision、`Clock`、`LifecycleListener`、`LogExporter`、`BlockingExecutor`
    实现的能力，**不新增内核 API**。
-5. **对照建议（可选）**：涉及公共 API 的 PR 建议对比 `cargo public-api diff`（或
+6. **对照建议（可选）**：涉及公共 API 的 PR 建议对比 `cargo public-api diff`（或
    `cargo semver-checks`）；CI 以 `kernel_boundary` 的 cap 与 `tests/api_surface.rs`
    契约用例兜底。
 

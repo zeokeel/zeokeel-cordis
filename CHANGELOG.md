@@ -5,12 +5,123 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-29
+
+**Lifecycle 契约收口 + XT P2 修复（breaking minor）**：`LifecycleEvent` 改为
+`#[non_exhaustive]` 并提供构造函数，正式收口 0.5.1 patch 因新增 `seq` 造成的兼容性缺陷；
+同时修复 XT-01/XT-02 的 P2 边界（lifecycle 操作级 token、activation epoch 精确回滚、
+`await_settled` 覆盖 refresh 卸载、Drop 跳过的 async cleanup 可回收），并纳入 `de075d0`
+的测试去 flake。CORE-001…CORE-051 不变（51 个用例，不新增/重命名）。门禁：默认
+**466 passed / 0 failed / 0 ignored**、`--features supervision` **481 passed / 0 failed /
+0 ignored**（doctests 10/10；0.5.1 基线 451/466）。
+
+### Breaking
+
+- **`LifecycleEvent` 加 `#[non_exhaustive]`，构造改走 `LifecycleEvent::new(fiber_id, name, from, to, seq)`**。
+  字段仍可读取（`fiber_id`/`name`/`from`/`to`/`seq`），但外部 **struct literal 不再允许**，
+  模式匹配必须带 `..`。
+  **Migration（0.5.x → 0.6.0 三步）**：
+  1. **literal → `new`**：0.5.0 的 4 字段 literal 与 0.5.1 的 5 字段 literal 都改为
+     `LifecycleEvent::new(fiber_id, name, from, to, seq)`（0.5.0 代码需补 `seq` 来源，
+     只读场景可用事件提供的值）；
+  2. **穷尽 match 加 `..`**：`LifecycleEvent { fiber_id, name, from, to, seq }` 模式改为在末尾
+     加 `..`；
+  3. **只读字段或已用 `..` 的代码无需修改**。
+  背景：0.5.1 是 **patch** 版本，但新增 `pub seq` 破坏了 0.5.0 下游的 4 字段 struct literal
+  与不带 `..` 的穷尽 match——这是 **0.5.1 patch 的兼容性缺陷**，不是「0.y 允许的破坏性变化」。
+  0.6.0 用 `#[non_exhaustive]` + 构造函数正式收口，后续新增字段不再 breaking
+  （见 `spec/CORDIS-CORE.md` §3）。回归：
+  `api_surface::api_lifecycle_event_new_snapshots_fields_and_supports_ordering`。
+
+### Fixed
+
+- **lifecycle 操作级 token（async 迁移）**：lifecycle 互斥改为**操作级 token** 而非线程身份
+  判断；异步任务经 executor 迁移后，cleanup 内重入 dispose 的行为与同线程一致（同线程重入仍
+  允许，跨线程仍返回 `LifecycleBusy`）。回归：
+  `regression_core::p2a_migrated_cleanup_reentrant_dispose_matches_same_thread`。
+- **同线程 `LifecycleBusy`（async 挂起期间）**：async lifecycle 操作
+  （`dispose_async`/`restart_async`/`update_async`/`replace_plugin_async`）挂起时，**同线程**的
+  sync `dispose`/`restart`/`update` 也返回 `LifecycleBusy`（不携带该 async 操作 token，不会被
+  误判为 reentrant），需在操作结束后重试。
+- **LifecycleGuard 异常路径日志**：guard 在释放时发现 token 不匹配（非 owner）不再静默，记录
+  `tracing::error!`（含 token/owner），便于定位异常/重入路径；正常释放不受影响。
+- **refresh 卸载期间的外部操作**：refresh 触发的卸载持有 per-fiber lifecycle 槽；外部
+  `restart`/`dispose`/`dispose_all` 正确返回 `LifecycleBusy`（不再是 `InactiveEffect` 或
+  被静默接受），调用者需在该操作结束后重试。回归：
+  `regression_core::p2a_inflight_async_unload_reports_lifecycle_busy`。
+- **`await_settled()` 可见 refresh 卸载**：refresh 触发的卸载计入 in-flight，`await_settled()`
+  不再在卸载进行中提前返回 `Ok(())`。回归：
+  `regression_core::awaiting_settled_observes_refresh_unload`。
+- **XT-02：activation 回滚的 epoch 精确复核（原子 check-and-store）**：回滚在丢弃 effects 前后
+  复核 activation epoch，并用 `transition_if_epoch` 在**同一次状态锁**内校验 `(state, epoch)`
+  后才 `transition(Pending)`；并发 restart 的新 activation 不会被旧 attempt 的回滚覆盖。
+  回归：`regression_core::xt02_activation_dependency_lost_rolls_back_to_pending`、
+  `regression_core::xt02_rollback_releases_child_ownership_and_listeners`。
+- **XT-01：被 Drop 跳过的 async cleanup 可回收且可观测**：`FiberData::drop` 在无
+  `BlockingExecutor` 或正在 panicking 时仍不阻塞，但不再静默丢弃 async cleanup——它们进入
+  **进程级 orphan 队列**（容量 256）。可观测：`orphan_async_cleanups_pending()`（队列 gauge）、
+  `orphan_async_cleanup_count()`（累计被迫泄漏，队列满/锁中毒时才增长，健康进程 0）、
+  `orphan_async_cleanup_failure_count()`（累计 drain 失败，cleanup panic 被遏制并计数）；
+  `drain_orphan_async_cleanups()` 在非 reactor 的阻塞线程上回收（内部走 `dispose_blocking`，
+  返回处理数，幂等/先取走队列避免重复执行）。**drain 前应安装 `BlockingExecutor`**：无
+  executor 时退化为 thread-park `block_on`，reactor-bound cleanup 可能失败（计入 failure
+  count）。`ctx.plugin` 的子 fiber ownership 也是 async effect：父 fiber drop 时子 fiber 会
+  **延迟到 drain** 才释放。长宿主仍建议显式 dispose 或安装 `BlockingExecutor`。回归：
+  `api_surface::api_orphan_cleanup_recovery_observability_api_is_exported`、
+  `regression_core::p2a_migrated_cleanup_reentrant_dispose_matches_same_thread`。
+- **0.5.1 发布 flake 修复**：0.5.1 已发布 crate 含一个 flaky 测试
+  （`api_surface::api_logger_facade_snapshots_the_clock`，约 1.3% 概率失败），0.6.0 纳入
+  `de075d0` 的纯测试修复；**未发布 0.5.2**，lib 行为与 0.5.1 一致。
+
+### Changed
+
+- **Drop 的 async cleanup 策略**：未显式 dispose 且未安装执行器（或正在 panicking）时，Drop 只
+  执行同步 cleanup，异步 cleanup 进入 orphan 队列（cap 256）并记录；安装 `BlockingExecutor` 时
+  按旧语义排空；panicking 期间始终跳过 async（避免 double panic abort）。子 fiber ownership
+  同样进入 orphan 队列，因此子 fiber 可能延迟到 drain 才释放——宿主应显式 dispose 父/子 fiber
+  或安装 executor 并 drain。
+- **`on_lifecycle` 与 raw `internal/status` 的边界**：`Context::on_lifecycle` 使用独立的
+  lifecycle 总线（锁内 `(from, to, seq)` 快照）；raw `internal/status` hook 不保证快照，仍可能
+  在 hook 运行时观察到更晚的 fiber 状态——需要一致迁移链请用 `on_lifecycle`，并按
+  `(fiber_id, seq)` 排序。
+- **seq 投递可能交错、同线程 reentrant**：跨线程投递不保证顺序，按 `(fiber_id, seq)` 排序
+  还原迁移链；同线程重入 lifecycle（cleanup 内 dispose 自己的 fiber 等）保持允许，跨线程并发
+  返回 `LifecycleBusy`；`dispose_all` 遇到 busy fiber 返回 `Err(LifecycleBusy)` 且可能留下
+  未清理 fiber，调用者需重试（XT-10）。
+- **API 扩展策略**：可扩展的公共 struct 采用 `#[non_exhaustive]` + 构造函数（0.6.0 的
+  `LifecycleEvent` 即范例），新增字段不再 breaking；详见 `docs/KERNEL-BOUNDARY.md` §8。
+- **0.5.1 CHANGELOG 更正**：见 `[0.5.1]` 段——`seq` 的破坏性被明确为 **patch 兼容性缺陷**，
+  并补 XT-04/XT-10/XT-12 说明与发布 flake 记录。
+
+### Docs
+
+- 版本头全量升到 **v0.6.0**（README/GUIDE/KERNEL-ISOLATION/KERNEL-BOUNDARY/CORDIS-RUST/spec）。
+- `docs/GUIDE.md` 新增 **0.5.x → 0.6.0 迁移**小节（literal→new、穷尽 match 加 `..`、只读者
+  无需改）与 Drop/orphan cleanup 回收说明；`docs/KERNEL-ISOLATION.md` 记录 async 迁移/
+  reentrant/lifecycle token 与 Drop orphan 边界；`docs/KERNEL-BOUNDARY.md` §8 补
+  `#[non_exhaustive]` + 构造函数规则；`docs/CORDIS-RUST.md` 更新 lifecycle 事件、refresh
+  卸载期间的 `LifecycleBusy`、`await_settled` 可见性与 orphan API；`spec/CORDIS-CORE.md`
+  更新 §2.3/§2.6/§3/§6（不新增 CORE ID）。
+
+### Verification
+
+- 门禁实测：默认 **466 passed / 0 failed / 0 ignored**、`--features supervision` **481 passed /
+  0 failed / 0 ignored**；doctests **10/10**、`kernel_boundary` **11/11**（4 真实断言 + 7 自测）、
+  `api_surface` **21/21**、`property` 1、`miri_leaks` 1、lib 单测 **34**（Miri lib **34/34**）。
+  CI 的 cross-platform / coverage 85.5 / Miri / cargo-deny / actionlint / SBOM 与 0.5.1 相同。
+
 ## [0.5.1] - 2026-10-29
 
 **交叉测试修复与边界澄清（patch）**：修复多 Agent 交叉测试确认的 4 项缺陷（Fiber Drop 阻塞、
 refresh 生命周期竞态、lifecycle 事件快照、logger 级别 clamp），其余 findings 以文档边界澄清；
 新增 `LifecycleEvent.seq`。门禁：默认 **451 passed / 0 failed**、`--features supervision`
 **466 passed / 0 failed**（fmt / clippy / doc --all-features / kernel boundary 同绿）。
+
+> **发布后更正（0.6.0）**：`LifecycleEvent.seq` 的加入发生在 **patch** 版本，破坏了 0.5.0
+> 下游的 4 字段 struct literal 与不带 `..` 的穷尽 match——这是本 patch 的**兼容性缺陷**，
+> 不是「0.y 允许的破坏性变化」。0.6.0 以 `#[non_exhaustive]` + `LifecycleEvent::new(...)`
+> 正式收口并提供迁移（见 [0.6.0] Breaking）。另外：0.5.1 已发布 crate 含一个 flaky 测试
+> （约 1.3%），未发布 0.5.2，修复随 0.6.0 的 `de075d0` 纳入。
 
 ### Fixed
 
@@ -46,7 +157,9 @@ refresh 生命周期竞态、lifecycle 事件快照、logger 级别 clamp），�
 - **激活结束前重新校验 `inject` 依赖（XT-02）**：依赖在 `apply` 期间被撤销时回滚到 `Pending`，
   不再发布缺依赖的 `Active`。
 - **`LifecycleEvent` 新增 `seq: u64`（XT-03/XT-08）**：`from`/`to` 改为状态锁内快照；显式
-  构造该结构体的下游代码需要补字段（0.y 允许的破坏性变化；不构造它的用户不受影响）。
+  构造该结构体的下游代码需要补字段。**更正**：这是 **0.5.1 patch 的兼容性缺陷**（patch 不应
+  破坏 0.5.0 的 4 字段 literal/穷尽 match），不是「0.y 允许的破坏性变化」；0.6.0 已用
+  `#[non_exhaustive]` + `LifecycleEvent::new(...)` 收口并提供迁移。
 - **`LogLevel::from_u8(>3)` 改为 clamp 到 `Error`（XT-09）**：与配置路径的 fail-closed 策略一致。
 
 ### Docs
@@ -61,6 +174,11 @@ refresh 生命周期竞态、lifecycle 事件快照、logger 级别 clamp），�
   （XT-07：高频写入建议原地修改服务，`set` 留给配置式变更）。
 - `spec/CORDIS-CORE.md` 补充 `MAX_PLUGIN_DEPTH` 的实测含义（XT-11：超深依赖链在加载期被截断，
   如 300 层链只有 255 层 cleanup 运行）。
+- `spec/CORDIS-CORE.md` 记录 **XT-04**：`when_idle()` 的注册帧豁免只覆盖 `internal/plugin`
+  create hook；在 `apply`/`apply_async` 内同步等待 `when_idle()` 会等待自己，外部 waiter 不受影响。
+- `spec/CORDIS-CORE.md` 记录 **XT-10**：`dispose_all()` 遇到 busy fiber 返回
+  `Err(LifecycleBusy)`，该 fiber 可能留在 registry，调用者需在其 lifecycle 操作结束后重试。
+- **XT-12**：复核确认为不可达死代码，无行为变化（no-op）。
 
 ## [0.5.0] - 2026-10-29
 

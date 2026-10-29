@@ -5,7 +5,7 @@
 > 下面 L2–L4 只是写给 embedder 的**建议方案**（在 crate 之外实现），不是本 crate 的
 > 实现范围。内核自身只承诺 §3 所列的 in-process fault containment。
 
-> 适用版本：v0.5.0（v0.2.0 基线 + v0.3.0 加固 + v0.4.2–v0.4.4 的遏制与语义修正 + v0.5.0 的 API/时钟扩展）。
+> 适用版本：v0.6.0（v0.2.0 基线 + v0.3.0 加固 + v0.4.2–v0.4.4 的遏制与语义修正 + v0.5.x 的 API/时钟扩展 + v0.6.0 的 lifecycle 契约收口与 P2 修复）。
 > 本文回答一个问题：**"插件崩溃会不会拖垮内核？"** 答案分两半——**可捕获的 panic
 > 不会；Rust 进程内不可恢复的故障会**。本文给出实测证据、我们据此作出的承诺，以及
 > 要做到"Linux 内核级"所必需的外层隔离方案。
@@ -105,7 +105,7 @@ Cordis 在进程内提供的是 **unwinding panic 的故障遏制（fault contai
 | listener / internal hook / exporter / accessor / schema / availability check | 记录后遏制，各自回退（继续 dispatch、跳过、视为 absent/unavailable 等） |
 | waterfall 中间件 panic | **中止整条链并重抛**（fail-closed，唯一例外；两 lane 一致） |
 | `dispose_all` 同时有 Err 与 panic | panic 优先：记录 error 后重抛首个 payload（0.4.2） |
-| `Drop` 中的 cleanup panic | 记录/尽力清理；unwind 期间的双 panic 会 abort（见下） |
+| `Drop` 中的 cleanup panic | 记录/尽力清理；unwind 期间的双 panic 会 abort（见下）。Drop 在无 `BlockingExecutor` 或 panicking 时只跑同步 cleanup，跳过的 async cleanup 进入 orphan 队列（v0.6.0 XT-01：cap 256，`orphan_async_cleanups_pending`/`orphan_async_cleanup_failure_count` 观测，crate 根 `drain_orphan_async_cleanups()` 回收，drain 需合适执行器）|
 
 **设计边界（物理/语言层，进程内不可消除）**：
 
@@ -170,6 +170,29 @@ Cordis 在进程内提供的是 **unwinding panic 的故障遏制（fault contai
 - **结构化插件错误原样传播（v0.5.0）**：`CordisError::Plugin{plugin,kind,message}` 会穿过
   激活、`await_settled`、restart/update 与 replace；`Fiber::error_detail()` 保留结构化错误
   （`Fiber::error()` 仍返回展示字符串）。
+- **lifecycle 互斥是操作级 token（v0.6.0）**：per-fiber lifecycle 槽不再依赖线程身份，
+  异步任务经 executor 迁移后 cleanup 重入 dispose 的行为与同线程一致（同线程重入仍允许，
+  跨线程仍 `LifecycleBusy`）。refresh 触发的卸载同样持有该槽：期间外部 `restart`/`dispose`/
+  `dispose_all` 返回 `LifecycleBusy`（`dispose_all` 可能留下未清理 fiber，需重试），
+  `Fiber::await_settled()` 把该卸载视为 in-flight 并等待结束。**同线程**的 sync 调用在 async
+  lifecycle 操作挂起期间同样返回 `LifecycleBusy`（不属于该 async token，不会误判为
+  reentrant），需在操作结束后重试。
+- **生命周期事件是快照（v0.5.1/0.6.0）**：`Context::on_lifecycle` 使用独立 lifecycle 总线，
+  在状态锁内捕获 `(from, to, seq)`；`LifecycleEvent` 是 `#[non_exhaustive]`，构造用
+  `LifecycleEvent::new(fiber_id, name, from, to, seq)`、模式匹配加 `..`。跨线程投递可能交错，
+  按 `(fiber_id, seq)` 排序还原迁移链。raw `internal/status` hook **不保证快照**，可能在 hook
+  运行时观察到更晚的 fiber 状态——需要一致迁移链请用 `on_lifecycle`。
+- **Drop 跳过 async cleanup 的可回收路径（v0.6.0）**：未显式 dispose 且未安装
+  `BlockingExecutor`（或正在 panicking）时，`FiberData::drop` 只执行同步 cleanup；被跳过的
+  异步/deferred cleanup 进入**进程级 orphan 队列**（容量 256），不再静默丢弃。观测/回收：
+  `orphan_async_cleanups_pending()`（队列 gauge）、`orphan_async_cleanup_count()`（累计被迫
+  泄漏，健康进程 0）、`orphan_async_cleanup_failure_count()`（累计 drain 失败，cleanup panic
+  被遏制并计数）、`drain_orphan_async_cleanups()`（非 reactor 阻塞线程回收，返回处理数，
+  幂等/先取走队列避免重复执行）。**drain 前应安装 `BlockingExecutor`**：无 executor 时
+  `dispose_blocking` 退化为 thread-park `block_on`，reactor-bound cleanup 可能失败（计入
+  failure count）；安装 executor 时 Drop 内仍排空。`ctx.plugin` 的子 fiber ownership 也是
+  async effect，父 fiber drop 时子 fiber 会延迟到 drain 才释放；panicking 期间始终跳过 async
+  （避免 double panic abort）。
 - **注册窗口的其它边界（v0.4.2/0.4.3 不变）**：create hook 内新 fiber 仍是 `Pending` 且没有 fiber 级
   in-flight 操作，因此 `fiber.await_settled()` 会**立即返回 `Ok(())`**；
   `Registry::stalled_fibers()`/`Context::stalled_fibers()` 也**看不到**注册窗口（只检查
@@ -284,12 +307,12 @@ CI 另加 `cargo audit`（RustSec）作业，对依赖做供应链漏洞门禁�
   supervision + kernel boundary）、`msrv-clippy`（Rust 1.85 clippy，允许
   `mutex_integer`/`needless_lifetimes` 两种版本级 lint 差异）、`coverage`
   （`cargo llvm-cov --all-features`，fail-under-lines **85.5**，实测基线 86.57%）、
-  `miri`（lib 28/28 UB-clean + `miri_leaks` 1/1 leak-clean）、`deny`
+  `miri`（lib 34/34 UB-clean + `miri_leaks` 1/1 leak-clean）、`deny`
   （`cargo deny check`）、`actionlint`（pinned image `1.7.12`）、`cargo audit`；
   发布流水线还执行 `cargo deny`、unfinished-markers 检查与**可复现 SBOM** 双次生成比对，
   并把 CycloneDX 1.5 SBOM 作为 GitHub Release 资产。
 - 结论复跑：`cargo test`（默认构建）与 `cargo test --features supervision`
-  （启用 L2 API 的全部用例）；两套都应全绿（v0.5.0：446 / 461）。
+  （启用 L2 API 的全部用例）；两套都应全绿（v0.6.0：466 / 481，doctests 10/10；0.5.1 为 451 / 466）。
 
 ## 8. 与 Linux 内核类比（为什么这个答案是诚实的）
 

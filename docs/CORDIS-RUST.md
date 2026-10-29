@@ -3,8 +3,8 @@
 Companion to `spec/CORDIS-CORE.md`. This file records how the Rust port relates to
 the JavaScript Cordis reference, what the Rust-only extensions add, which failures
 the kernel contains, and what the crate deliberately does not support. It is
-descriptive; the specification stays normative. Baseline: crate version `0.5.0`
-(tag `v0.5.0`).
+descriptive; the specification stays normative. Baseline: crate version `0.6.0`
+(tag `v0.6.0`).
 
 ## 1. Deliberate differences from the TypeScript reference
 
@@ -123,8 +123,18 @@ language-driven and permanent unless the spec says otherwise:
   `dispose`/`restart`/`update` (sync and async) claim a per-fiber slot; another
   thread gets `CordisError::LifecycleBusy`, while a reentrant call on the owning
   thread (a cleanup disposing its own fiber, `update` calling `restart`) is
-  allowed. A disposed fiber cannot be restarted or resurrected; a reentrant
-  dispose during activation rolls the activation back.
+  allowed. **Since v0.6.0 the slot is tracked by an operation-level token** (not
+  thread identity), so the behavior is identical after an async task migrates
+  between executor workers. Refresh-triggered unloads also claim the slot:
+  a concurrent `restart`/`dispose`/`dispose_all` gets `LifecycleBusy` (not
+  `InactiveEffect` and not silently accepted), and `Fiber::await_settled()` sees
+  the unload as in-flight instead of returning early. `dispose_all()` returns
+  `Err(LifecycleBusy)` for a busy fiber and may leave it uncleaned — retry after
+  its lifecycle operation finishes (XT-10). A **same-thread sync call made while
+  an async lifecycle operation is suspended** also gets `LifecycleBusy` (it does
+  not carry that operation's token, so it is not reentrant) — retry after the
+  async operation completes. A disposed fiber cannot be restarted or resurrected;
+  a reentrant dispose during activation rolls the activation back.
 - **Cancel-safe disposal (CORE-046), two granularities.** Dropping an
   `AsyncDisposer::dispose` future mid-await restores the cleanups that had not
   started; the next `dispose()`/`dispose_blocking()` retries them in the same
@@ -193,7 +203,11 @@ existing contracts and make the previously unstated edges below explicit. See
 - **Activation epochs are exact.** Effects are tagged with the epoch of the
   activation attempt that registered them (thread-local frame; carried across
   executor migration for async activation), so a concurrent restart discards
-  exactly the stale attempt's tail.
+  exactly the stale attempt's tail. Since v0.6.0 the rollback re-checks the
+  attempt epoch after discarding effects and performs an atomic `(state, epoch)`
+  check-and-store (`transition_if_epoch`) before transitioning to `Pending`; only
+  the attempt that still owns the fiber may land it (XT-02), so an old attempt
+  cannot clobber a newer activation.
 - **`restart` emits status events.** `restart`/`restart_async` transition through
   the normal helper, so `internal/status` sees `Active → Unloading` (no raw state
   write, no sourceless `Unloading → Pending`).
@@ -413,14 +427,20 @@ existing contracts and make the previously unstated edges below explicit. See
   re-acquire the facade after changing it. The raw `LoggerService` API always
   timestamps with `SystemClock`; L2 activity/`idle_for` (**`supervision` feature**
   only) use the tree clock.
-- **Lifecycle broadcast.** `LifecycleEvent { fiber_id, name, from, to }`,
-  `LifecycleListener`, `Context::on_lifecycle` (thin wrapper over the
-  `internal/status` hook): one event per state transition, multiple subscribers,
-  listener panics contained. The subscription is **not fiber-owned**; the
-  returned `Disposer` is its single owner — **dropping the `Disposer`
-  unsubscribes just like `dispose`** (safety net). To keep observing across the
-  lifetime of the installing fiber, store the `Disposer` and dispose it
-  explicitly when done. Designed for embedder metrics/shutdown coordination.
+- **Lifecycle broadcast.** `LifecycleEvent` (fields `fiber_id`, `name`, `from`,
+  `to`, `seq`; `#[non_exhaustive]` since v0.6.0, construct with
+  `LifecycleEvent::new(fiber_id, name, from, to, seq)` and pattern-match with
+  `..`), `LifecycleListener`, `Context::on_lifecycle`: one event per state
+  transition, multiple subscribers, listener panics contained. `on_lifecycle`
+  runs on a **dedicated lifecycle bus** that snapshots `(from, to, seq)` under
+  the state lock — it is not a raw `internal/status` alias (the raw hook may
+  observe a later state while it runs; sort a fiber's events by `seq` to
+  reconstruct the chain, since cross-thread delivery may interleave). The
+  subscription is **not fiber-owned**; the returned `Disposer` is its single
+  owner — **dropping the `Disposer` unsubscribes just like `dispose`** (safety
+  net). To keep observing across the lifetime of the installing fiber, store the
+  `Disposer` and dispose it explicitly when done. Designed for embedder
+  metrics/shutdown coordination.
 - **Structured plugin errors.** `CordisError::Plugin { plugin, kind, message }`
   (+ `CordisError::plugin(...)`) lets plugins return classified failures
   (`"config"`/`"network"`/…); propagated unchanged through activation,
@@ -443,6 +463,40 @@ existing contracts and make the previously unstated edges below explicit. See
   retained in `Fiber::error_detail()` (`Fiber::error()` keeps the display
   string). Check `Fiber::state()`/`error_detail()` rather than only the return
   value. Validation/veto/lifecycle errors still return `Err`.
+
+### 2.5 Changed in v0.6.0 (breaking lifecycle event + P2 fixes)
+
+- **Breaking: `LifecycleEvent` is `#[non_exhaustive]` with a constructor.** Use
+  `LifecycleEvent::new(fiber_id, name, from, to, seq)`; fields stay readable;
+  exhaustive patterns need `..`. This closes the 0.5.1 patch compatibility
+  defect (adding `seq` broke 4-field literals and non-`..` matches) and makes
+  future field additions non-breaking. Migration: 0.5.0 4-field literal / 0.5.1
+  5-field literal → `new`; exhaustive match → add `..`; read-only users need no
+  change.
+- **Operation-level lifecycle token.** The per-fiber lifecycle slot no longer
+  depends on thread identity, so cleanup re-entrant `dispose` behaves the same
+  after an async task migrates; refresh-triggered unloads claim the slot, making
+  external `restart`/`dispose`/`dispose_all` return `LifecycleBusy` (retry after
+  the unload) and making `await_settled()` wait for the unload.
+- **XT-02 precise activation rollback.** Rollback re-checks the activation epoch
+  after discarding effects and only lands on `Pending` while the fiber still
+  belongs to that attempt's `Loading`.
+- **XT-01 orphan cleanup queue.** Async cleanups skipped by `Drop` (no
+  `BlockingExecutor`, or panicking) are queued instead of forgotten and can be
+  reclaimed via the crate-root `orphan_async_cleanup_count()` / `drain_orphan_async_cleanups()`
+  (re-exported from `async_effects`).
+- **Lifecycle vs raw status boundary.** `on_lifecycle` events are lock-time
+  snapshots with a per-fiber monotonic `seq`; raw `internal/status` hooks may
+  observe a later state while running. Cross-thread delivery may interleave —
+  sort by `(fiber_id, seq)`.
+- **Same-thread `LifecycleBusy` while an async operation is suspended.** The
+  token belongs to the async operation, so a sync `dispose`/`restart`/`update`
+  issued from the same thread while it is suspended is busy and must be retried.
+- **Orphan drain observability.** `orphan_async_cleanups_pending()` is the queue
+  gauge, `orphan_async_cleanup_count()` counts capacity-bound leaks,
+  `orphan_async_cleanup_failure_count()` counts drained cleanups that panicked
+  (usually a drain-environment problem); the drain is idempotent and needs a
+  suitable executor/thread for reactor-bound cleanups.
 
 ## 3. Panic and isolation policy (v0.4.2)
 
@@ -482,15 +536,27 @@ sandbox for untrusted plugins; that layer is embedder guidance, not a crate feat
 cleanup panic re-raised from `Drop` aborts the process when it happens during an
 unwind, and `AsyncDisposer::drop` can block; prefer explicit `dispose` /
 `dispose_async` (never dispose from `Drop` on an async worker thread).
-**`Fiber` drop does not block on async cleanups (XT-01)**: dropping the last
-`Fiber` handle without an explicit disposal runs the sync cleanups, but async
-cleanups (including a deferred tail left by a cancelled `dispose_async`) are
-**skipped** with a `tracing::error!` unless the embedder installed a
-`BlockingExecutor` with `exec::set_blocking_executor`. This trades a possible
-resource leak for not deadlocking the caller's thread: the default thread-park
-`block_on` cannot drive a reactor, so draining a reactor-backed cleanup from
-`Drop` on a `current_thread` runtime would hang forever. Dispose fibers
-explicitly (`dispose` / `dispose_async`) on async worker threads.
+**`Fiber` drop does not block on async cleanups (XT-01, reclaimable since
+v0.6.0)**: dropping the last `Fiber` handle without an explicit disposal runs the
+sync cleanups; async cleanups (including a deferred tail left by a cancelled
+`dispose_async`) are **not run inline** unless the embedder installed a
+`BlockingExecutor` with `exec::set_blocking_executor`. Since v0.6.0 they are no
+longer silently forgotten: they go to a bounded process-wide **orphan queue**
+(capacity 256) that the host can inspect with `orphan_async_cleanups_pending()`
+(gauge) / `orphan_async_cleanup_count()` (cumulative leaks — healthy process is
+0) and reclaim with `drain_orphan_async_cleanups()` from a blocking non-reactor
+thread (runs the remaining cleanups via `dispose_blocking`, returns the processed
+count; idempotent because the queue is taken before running). Without an installed
+`BlockingExecutor` the drain falls back to the thread-park `block_on`, which
+cannot drive reactor-bound futures: such cleanups may fail and are counted in
+`orphan_async_cleanup_failure_count()` — install an executor or drain from a
+thread/runtime that can drive them. The `ctx.plugin` child-ownership effect is an
+async effect too, so dropping a parent fiber without an executor defers the child's
+release until the drain. While panicking, async cleanups are always skipped
+(avoiding a double-panic abort).
+Draining from `Drop` is still a trade-off, not a substitute for explicit
+`dispose`/`dispose_async` on async worker threads: the default thread-park
+`block_on` cannot drive a reactor.
 Cancellation semantics depend on the granularity (CORE-046): an
 `AsyncDisposer` restores only the cleanups that had not started and the next
 explicit `dispose()` / `dispose_blocking()` retries them (S-1), while a cancelled
@@ -511,7 +577,11 @@ still waits for the teardown.
   are `Send + Sync`.
 - Lifecycle calls on one fiber are exclusive, not queued: concurrent calls from
   other threads return `LifecycleBusy` and hosts must retry or serialize
-  themselves. There is no preemption, forced thread kill, watchdog or timeout.
+  themselves. Since v0.6.0 exclusivity is an **operation-level token** (stable
+  across async task migration) and refresh-triggered unloads hold it too, so
+  `dispose`/`dispose_all` may also observe `LifecycleBusy` while a refresh unload
+  is running; `await_settled()` waits for such an unload. There is no preemption,
+  forced thread kill, watchdog or timeout.
 - Undisposed fibers keep their context/plugin graph alive (the links stay strong
   until unload). Dispose fibers on shutdown; v0.3.0 reclaims a disposed fiber's
   graph.

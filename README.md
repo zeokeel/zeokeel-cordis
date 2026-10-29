@@ -15,7 +15,7 @@
 
 - Rust **1.85+**（edition 2021）· MIT · 零 `unsafe`（`#![forbid(unsafe_code)]`）
 - 通用、无产品逻辑、静态链接、无 ABI/FFI/动态加载
-- **v0.5.1**：交叉测试修复（Fiber Drop 不阻塞、refresh 生命周期串行化、lifecycle 事件快照 + `seq`、logger clamp）+ 边界文档澄清；见 [CHANGELOG](CHANGELOG.md) 0.5.1
+- **v0.6.0**：breaking minor——`LifecycleEvent` 加 `#[non_exhaustive]` 并提供 `LifecycleEvent::new(fiber_id, name, from, to, seq)`，收口 0.5.1 patch 的兼容性缺陷（迁移：构造改 `new`、穷尽 match 加 `..`、只读字段者无需改）；修复 XT-01/XT-02 P2（lifecycle 操作级 token、activation epoch 精确回滚、`await_settled` 覆盖 refresh 卸载、被 Drop 跳过的 async cleanup 进入 orphan 队列并可回收）。见 [CHANGELOG](CHANGELOG.md) 0.6.0
 
 ---
 
@@ -63,14 +63,14 @@ cargo add zeokeel-cordis
 
 ```toml
 [dependencies]
-zeokeel-cordis = "0.5.1"
+zeokeel-cordis = "0.6.0"
 serde_json = "1"   # 插件配置是 serde_json::Value
 ```
 
 > crates.io 包名 `zeokeel-cordis` 与库目标名 `zeokeel_cordis` 一致：代码里统一
 > `use zeokeel_cordis::...`。
 > 需要跟仓库最新未发布代码时，可换成 git 依赖：
-> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.5.1" }`。
+> `zeokeel-cordis = { git = "https://github.com/zeokeel/zeokeel-cordis", tag = "v0.6.0" }`。
 
 最小插件（完整可运行版本：[`examples/hello.rs`](examples/hello.rs)）：
 
@@ -156,7 +156,7 @@ fn main() -> Result<()> {
 观测），**默认关闭**——核心内核不含任何监督策略：
 
 ```toml
-zeokeel-cordis = { version = "0.5.1", features = ["supervision"] }
+zeokeel-cordis = { version = "0.6.0", features = ["supervision"] }
 ```
 
 详见 [`docs/KERNEL-ISOLATION.md`](docs/KERNEL-ISOLATION.md)。
@@ -180,11 +180,20 @@ zeokeel-cordis = { version = "0.5.1", features = ["supervision"] }
 ## 质量与严格构建
 
 - **全量测试**：`cargo test`（默认构建）与 `cargo test --features supervision` 两套都必须全绿；
-  0.5.0 实测：默认构建 **446 passed / 0 failed / 0 ignored**、
-  `--features supervision` **461 passed / 0 failed / 0 ignored**（0.4.4 为 415 / 426，
-  0.4.3 为 404 / 415；0.4.1 基线 311 / 317）。本版新增 `tests/api_surface.rs`（19 个
-  公共 API 契约用例）、`tests/property.rs`（确定性状态机随机测试）、`tests/miri_leaks.rs`
-  泄漏场景，并保留 `kernel_boundary` 的 11 个架构测试与 0.4.3 起的审计回归套件
+  **0.6.0 实测：默认构建 466 passed / 0 failed / 0 ignored、`--features supervision`
+  481 passed / 0 failed / 0 ignored；doctests 10/10**（0.5.1 为 451 / 466，0.5.0 为
+  446 / 461，0.4.4 为 415 / 426，0.4.3 为 404 / 415，0.4.1 基线 311 / 317）。保留
+  `tests/api_surface.rs`（21 个公共 API 契约用例）、`tests/property.rs`（1 个确定性状态机
+  随机测试）、`tests/miri_leaks.rs`（1 个泄漏场景）、`kernel_boundary`（11 个架构测试 =
+  4 真实断言 + 7 自测）与 0.4.3 起的审计回归套件
+- **0.6.0 变更（breaking minor）**：`LifecycleEvent` 加 `#[non_exhaustive]` 并改走
+  `LifecycleEvent::new(fiber_id, name, from, to, seq)`，正式收口 0.5.1 patch 的兼容性缺陷
+  （迁移：literal→`new`、穷尽 match 加 `..`、只读者无需改）；修复 XT-01/XT-02 P2——
+  lifecycle 操作级 token（async 迁移后 cleanup 重入行为一致）、refresh 卸载期间外部
+  `restart`/`dispose`/`dispose_all` 正确返回 `LifecycleBusy`、`await_settled()` 可见 refresh
+  卸载、activation 回滚 epoch 精确复核、Drop 跳过的 async cleanup 进入 **orphan 队列**并可经
+  crate 根 `orphan_async_cleanup_count()` / `drain_orphan_async_cleanups()` 回收；0.5.1 发布
+  flake 修复随本版 `de075d0` 纳入。见 [CHANGELOG](CHANGELOG.md) 0.6.0。
 - **0.5.0 变更**：反向依赖索引 S1–S4（纯内部实现，无公共 API/语义变化）——5000-fiber
   fanout `create+dispose` −54%、`dispose` −74%，1500 层深链 cascade −97%、`dispose` −90%，
   1000-fiber fanout `create+dispose` −50%；**破坏性公共 API 收敛**（`FiberRef`/`FiberData`/
@@ -223,7 +232,7 @@ zeokeel-cordis = { version = "0.5.1", features = ["supervision"] }
     `mutex_integer`、`needless_lifetimes` 以 `-A` 显式放行）；
   - `coverage` 作业：`cargo llvm-cov --all-features`，**fail-under-lines 85.5**（实测基线
     86.57% 行覆盖）；
-  - `miri` 作业：`cargo miri test --lib` **28/28 UB-clean**（`-Zmiri-ignore-leaks`）+
+  - `miri` 作业：`cargo miri test --lib` **34/34 UB-clean**（`-Zmiri-ignore-leaks`）+
     `cargo miri test --test miri_leaks` **1/1 leak-clean**；
   - `deny` 作业：`cargo deny check`（`deny.toml`：advisories/licenses/bans/sources）；
   - `actionlint` 作业：GitHub Actions workflow 静态检查（pinned docker image `1.7.12`）；
@@ -244,10 +253,26 @@ zeokeel-cordis = { version = "0.5.1", features = ["supervision"] }
 ## 已知限制（精简版）
 
 - **未 dispose 的 fiber 会保留其图**：退出时调用 `dispose_all()`（dispose+drop 路径实测 0 泄漏）。
-- **Drop 最后一个 `Fiber` 句柄不再阻塞 async cleanup（XT-01）**：若未显式 dispose 且未安装
-  `BlockingExecutor`，`FiberData::drop` 只执行同步 cleanup；deferred/异步 cleanup 会被跳过并记录
-  `tracing::error!`（资源可能泄漏，但不会在 tokio `current_thread` 等单线程 runtime 上死锁）。
-  安装了 embedder `BlockingExecutor` 时仍用该执行器排空异步 cleanup。
+- **Drop 最后一个 `Fiber` 句柄不阻塞 async cleanup（XT-01，0.6.0 起可回收）**：若未显式
+  dispose 且未安装 `BlockingExecutor`（或正在 panicking），`FiberData::drop` 只执行同步
+  cleanup；deferred/异步 cleanup 不再静默丢弃，而是进入**进程级 orphan 队列**（容量 256）。
+  观测/回收 API：`orphan_async_cleanups_pending()`（队列 gauge）、
+  `orphan_async_cleanup_count()`（累计被迫泄漏数，健康进程为 0）、
+  `orphan_async_cleanup_failure_count()`（累计 drain 失败数）、
+  `drain_orphan_async_cleanups()`（非 reactor 阻塞线程上回收，返回处理数）。drain 未安装
+  executor 时退化为 thread-park `block_on`，reactor-bound cleanup 可能失败并计入 failure
+  count——drain 前应安装 `exec::set_blocking_executor` 或从能驱动它们的线程调用；drain 幂等
+  （先取走队列，不会重复运行）。`ctx.plugin` 的子 fiber ownership 也是 async effect：
+  父 fiber drop 时子 fiber 会**延迟到 drain** 才释放。安装 embedder `BlockingExecutor` 时仍在
+  Drop 内排空；panicking 期间始终跳过 async（避免 double panic abort）。
+- **`LifecycleEvent` 契约（0.6.0）**：`#[non_exhaustive]` + `LifecycleEvent::new(fiber_id, name,
+  from, to, seq)`；字段可读、模式匹配需 `..`。`on_lifecycle` 使用独立 lifecycle 总线并在状态锁内
+  捕获 `(from, to, seq)`；跨线程投递可能交错，按 `(fiber_id, seq)` 排序还原迁移链。raw
+  `internal/status` hook 不保证快照，可能在 hook 运行时看到更晚状态。
+- **refresh 卸载期间的 `LifecycleBusy`（0.6.0）**：refresh 触发的卸载持有 per-fiber lifecycle
+  槽，期间外部（含**同线程 sync 调用**）`restart`/`dispose`/`dispose_all` 返回
+  `LifecycleBusy`，`fiber.await_settled()` 会等到卸载结束才返回；`dispose_all` 遇 busy fiber
+  会返回 `Err(LifecycleBusy)` 且可能留下未清理 fiber，需在其操作结束后重试。
 - **默认不安装日志导出器**：根上下文只有 `Logger` 服务和 1000 条 ring buffer；不调用
   `ctx.log_exporter(Arc::new(TracingExporter))?` 时 `ctx.logger().info(..)` 这类记录不会
   打印到终端、也不会进入 `tracing`（内核自身的 `tracing` 诊断日志是另一条独立通道）。
@@ -297,8 +322,9 @@ GitHub topics —
 
 ## 状态与许可证
 
-- 当前版本 **v0.5.1**（CORE-001…CORE-051 仍为 51 个用例；0.5.0 为 minor：破坏性公共
-  API 收敛 + 新扩展点 + 性能闭环，未新增/重命名 CORE 用例）。
+- 当前版本 **v0.6.0**（CORE-001…CORE-051 仍为 51 个用例；0.6.0 为 minor：`LifecycleEvent`
+  以 `#[non_exhaustive]` + 构造函数收口 0.5.1 的 patch 兼容性缺陷，并修复 XT-01/XT-02 的 P2
+  边界；未新增/重命名 CORE 用例）。
 - MIT，见 [LICENSE](LICENSE)；论文版权归原作者。
 
 维护仓库：<https://github.com/zeokeel/zeokeel-cordis>（提交作者 `zeokeel-dev`）。
