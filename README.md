@@ -244,6 +244,10 @@ zeokeel-cordis = { version = "0.5.0", features = ["supervision"] }
 ## 已知限制（精简版）
 
 - **未 dispose 的 fiber 会保留其图**：退出时调用 `dispose_all()`（dispose+drop 路径实测 0 泄漏）。
+- **Drop 最后一个 `Fiber` 句柄不再阻塞 async cleanup（XT-01）**：若未显式 dispose 且未安装
+  `BlockingExecutor`，`FiberData::drop` 只执行同步 cleanup；deferred/异步 cleanup 会被跳过并记录
+  `tracing::error!`（资源可能泄漏，但不会在 tokio `current_thread` 等单线程 runtime 上死锁）。
+  安装了 embedder `BlockingExecutor` 时仍用该执行器排空异步 cleanup。
 - **默认不安装日志导出器**：根上下文只有 `Logger` 服务和 1000 条 ring buffer；不调用
   `ctx.log_exporter(Arc::new(TracingExporter))?` 时 `ctx.logger().info(..)` 这类记录不会
   打印到终端、也不会进入 `tracing`（内核自身的 `tracing` 诊断日志是另一条独立通道）。

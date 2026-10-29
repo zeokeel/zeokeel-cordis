@@ -5,6 +5,19 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **XT-01：`FiberData::drop` 不再用默认 thread-park `block_on` 排空 async cleanup**。此前在
+  tokio `current_thread` 等单线程 runtime 上，取消 `dispose_async()` 后 drop 最后一个 `Fiber`
+  句柄会死等 reactor 上的 deferred cleanup（永久挂起）。现在 Drop 只执行同步 cleanup；只有在
+  embedder 通过 `exec::set_blocking_executor` 显式安装执行器时才排空异步 cleanup，否则跳过并记录
+  `tracing::error!`（资源可能泄漏，但不会挂死线程）。回归：
+  `regression_core::xt01_dropping_a_fiber_with_deferred_reactor_cleanups_does_not_hang`。
+
+### Docs
+
+- `README.md` / `docs/CORDIS-RUST.md` 记录 Fiber Drop 的 XT-01 语义与 trade-off。
+
 ## [0.5.0] - 2026-10-29
 
 **内核 API 收敛 + 新扩展点 + 性能闭环（minor）**：本版按 SemVer 的 `0.y` 规则做了一次

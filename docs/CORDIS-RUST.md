@@ -480,6 +480,15 @@ sandbox for untrusted plugins; that layer is embedder guidance, not a crate feat
 cleanup panic re-raised from `Drop` aborts the process when it happens during an
 unwind, and `AsyncDisposer::drop` can block; prefer explicit `dispose` /
 `dispose_async` (never dispose from `Drop` on an async worker thread).
+**`Fiber` drop does not block on async cleanups (XT-01)**: dropping the last
+`Fiber` handle without an explicit disposal runs the sync cleanups, but async
+cleanups (including a deferred tail left by a cancelled `dispose_async`) are
+**skipped** with a `tracing::error!` unless the embedder installed a
+`BlockingExecutor` with `exec::set_blocking_executor`. This trades a possible
+resource leak for not deadlocking the caller's thread: the default thread-park
+`block_on` cannot drive a reactor, so draining a reactor-backed cleanup from
+`Drop` on a `current_thread` runtime would hang forever. Dispose fibers
+explicitly (`dispose` / `dispose_async`) on async worker threads.
 Cancellation semantics depend on the granularity (CORE-046): an
 `AsyncDisposer` restores only the cleanups that had not started and the next
 explicit `dispose()` / `dispose_blocking()` retries them (S-1), while a cancelled

@@ -246,24 +246,63 @@ impl Drop for FiberData {
         // A fiber dropped without an explicit dispose must not leak its
         // registrations. Cleanups are arbitrary embedder code: never unwind
         // from Drop and never block while the thread is unwinding.
+        //
+        // XT-01: async cleanups must not be drained through the default
+        // thread-park `block_on` from `Drop`. A reactor-backed cleanup cannot
+        // make progress while that thread is parked (e.g. tokio
+        // `current_thread`), so a cancelled disposal followed by dropping the
+        // last handle would deadlock. Only an explicitly installed
+        // `BlockingExecutor` (the embedder opted into blocking disposal) may
+        // run async cleanups here; otherwise they are skipped with a loud
+        // error. This deliberately trades a resource leak for not hanging the
+        // caller's thread.
         let effects = std::mem::take(&mut self.effects);
         let deferred = std::mem::take(&mut self.deferred_async);
         let panicking = std::thread::panicking();
+        let allow_blocking = !panicking && crate::exec::has_blocking_executor();
+        let mut skipped_async = 0usize;
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            if panicking {
-                for effect in effects.into_iter().rev() {
-                    if let EffectKind::Sync(disposer) = effect.kind {
+            for effect in effects.into_iter().rev() {
+                match effect.kind {
+                    EffectKind::Sync(disposer) => {
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             disposer.dispose()
                         }));
                     }
+                    EffectKind::Async(disposer) => {
+                        if allow_blocking {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                disposer.dispose_blocking()
+                            }));
+                        } else {
+                            // Leak intentionally: dropping the disposer here would
+                            // run its own blocking `Drop` safety net and deadlock
+                            // again (XT-01).
+                            skipped_async += 1;
+                            std::mem::forget(disposer);
+                        }
+                    }
                 }
+            }
+            for disposer in deferred {
+                if allow_blocking {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        disposer.dispose_blocking()
+                    }));
+                } else {
+                    skipped_async += 1;
+                    std::mem::forget(disposer);
+                }
+            }
+            if skipped_async > 0 {
                 tracing::error!(
                     target: "zeokeel_cordis::fiber",
-                    "fiber dropped during unwinding; async cleanups were not run"
+                    skipped_async,
+                    panicking,
+                    "fiber dropped without an explicit dispose: {skipped_async} async cleanup(s) were skipped \
+                     to avoid blocking the thread; install exec::set_blocking_executor, or call \
+                     dispose()/dispose_async() explicitly"
                 );
-            } else {
-                let _ = drain_effects_blocking(effects, deferred);
             }
         }));
     }

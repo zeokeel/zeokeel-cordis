@@ -3744,3 +3744,87 @@ fn s7_cancelled_recovery_drains_root_deferred_cleanup() {
         assert!(root.registry().keys().is_empty());
     });
 }
+
+/// XT-01 regression: dropping the last `Fiber` handle after a cancelled
+/// `dispose_async` must not block on (or deadlock behind) reactor-backed
+/// deferred cleanups. Async cleanups are skipped unless the embedder installed
+/// a `BlockingExecutor`; sync cleanups still run.
+#[test]
+fn xt01_dropping_a_fiber_with_deferred_reactor_cleanups_does_not_hang() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context as TaskContext, Poll};
+    use std::time::Duration;
+
+    struct TwoAsync {
+        completed: Arc<AtomicUsize>,
+    }
+    impl zeokeel_cordis::AsyncPlugin for TwoAsync {
+        fn name(&self) -> &'static str {
+            "xt01-two-async"
+        }
+        fn apply_async<'a>(
+            &'a self,
+            ctx: zeokeel_cordis::Context,
+            _config: serde_json::Value,
+        ) -> zeokeel_cordis::BoxFuture<'a, zeokeel_cordis::Result<()>> {
+            let completed = self.completed.clone();
+            Box::pin(async move {
+                let first = completed.clone();
+                ctx.effect_async(move || {
+                    vec![zeokeel_cordis::cleanup_async(move || {
+                        let first = first.clone();
+                        async move {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            first.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })]
+                })?;
+                ctx.effect_async(move || {
+                    vec![zeokeel_cordis::cleanup_async(move || async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    })]
+                })?;
+                Ok(())
+            })
+        }
+    }
+
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        let waker = futures_util::task::noop_waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        future.poll(&mut cx)
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let root = zeokeel_cordis::Context::root();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let fiber = root
+            .plugin_async(
+                Arc::new(TwoAsync {
+                    completed: completed.clone(),
+                }),
+                serde_json::Value::Null,
+            )
+            .await
+            .unwrap();
+        let mut disposal = Box::pin(fiber.dispose_async());
+        assert!(poll_once(disposal.as_mut()).is_pending());
+        drop(disposal); // cancel while the first cleanup is in flight
+                         // The last handle is dropped here; without the fix this blocks forever
+                         // on the deferred reactor cleanup.
+        drop(fiber);
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            0,
+            "no BlockingExecutor is installed, so async cleanups are skipped (documented XT-01 trade-off)"
+        );
+        root.dispose_all().unwrap();
+    });
+}
