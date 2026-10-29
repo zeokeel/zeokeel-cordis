@@ -151,6 +151,14 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   (CORE-005, CORE-006, CORE-016). The gate is the **strict** query of §2.2: a
   provider that exists but is not `Active` yet (v0.4.2) and a read-lane-only
   accessor do not satisfy it.
+- **Activation dependency revalidation (XT-02)**: an activation is published as
+  `Active` only if its `inject` services are still available when `apply` /
+  `apply_async` returns. If a provider withdraws a dependency while the
+  activation body runs, the attempt is rolled back (effects/listeners/children)
+  and the fiber returns to `Pending`; the next refresh can reactivate it against
+  a live provider. Refresh-driven unloads claim the per-fiber lifecycle slot, so
+  a busy fiber is skipped for that refresh pass and retried later instead of
+  racing a user lifecycle operation.
 - **Failure semantics (v0.2.0)**: when `apply` returns `Err` **or panics**, the
   activation is failed: every effect registered during the failed activation is
   rolled back (sync cleanups immediately and async cleanups through the blocking executor

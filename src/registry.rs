@@ -2190,8 +2190,7 @@ impl Registry {
                     (PluginKind::Sync(_), FiberState::Active)
                         if !dependencies_satisfied(&ctx, deps, &recorded) =>
                     {
-                        let _ = unload_contained(&fiber.data, FiberState::Pending);
-                        progressed = true;
+                        progressed |= unload_contained(&fiber.data, FiberState::Pending);
                     }
                     // Async fibers are re-evaluated by `refresh_all_async`; a sync
                     // refresh cannot await their activation/cleanup.
@@ -2344,8 +2343,8 @@ impl Registry {
                         progressed = true;
                     }
                     (_, FiberState::Active) if !dependencies_satisfied(&ctx, deps, &recorded) => {
-                        let _ = unload_contained_async(&fiber.data, FiberState::Pending).await;
-                        progressed = true;
+                        progressed |=
+                            unload_contained_async(&fiber.data, FiberState::Pending).await;
                     }
                     _ => {}
                 }

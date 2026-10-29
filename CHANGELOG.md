@@ -13,6 +13,12 @@
   embedder 通过 `exec::set_blocking_executor` 显式安装执行器时才排空异步 cleanup，否则跳过并记录
   `tracing::error!`（资源可能泄漏，但不会挂死线程）。回归：
   `regression_core::xt01_dropping_a_fiber_with_deferred_reactor_cleanups_does_not_hang`。
+- **XT-02：refresh 卸载与生命周期操作串行化；激活结束前重新校验 `inject` 依赖**。
+  此前 refresh 触发的卸载不占 per-fiber lifecycle 槽，与用户 `restart`/`update` 竞争时
+  consumer 可能在注入服务缺失时被激活、`restart` 返回 `InactiveEffect` 而非
+  `LifecycleBusy`。现在 `unload_contained(_async)` claim lifecycle 槽（busy 则跳过并留待
+  下次 refresh），且 `apply`/`apply_async` 返回后若依赖已消失则回滚本次激活并回到
+  `Pending`。回归：`regression_semantics::xt02_activation_rolls_back_when_injection_is_withdrawn_mid_apply`。
 - **XT-03/XT-08：`on_lifecycle` 事件改为锁内迁移快照 + 每 fiber 单调 `seq`**。此前
   `LifecycleEvent.to` 在 hook 执行时现读 `fiber.state()`，并发/重入迁移下会出现
   `from == to`、`Pending -> Disposed` 之类的不自洽事件。现在 `transition()` 在状态锁内

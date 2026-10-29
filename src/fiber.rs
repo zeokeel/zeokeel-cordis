@@ -2027,6 +2027,16 @@ pub(crate) fn activate_fiber(
                 discard_activation_effects(data, ctx);
                 return Ok(());
             }
+            // XT-02: a provider may unload while `apply` runs. Do not publish
+            // `Active` for a fiber whose injected services disappeared mid
+            // activation; roll this attempt back and stay `Pending` so the
+            // next refresh can reactivate against a live provider.
+            if !dependencies_ready(ctx, plugin.inject()) {
+                discard_activation_effects(data, ctx);
+                transition(data, FiberState::Pending);
+                ctx.refresh_dependents();
+                return Ok(());
+            }
             record_dep_versions(data, ctx, plugin.inject());
             transition(data, FiberState::Active);
             ctx.refresh_dependents();
@@ -2149,6 +2159,14 @@ pub(crate) async fn activate_fiber_async(
             }
             if activation_invalidated(data) {
                 discard_activation_effects_async(data, ctx).await;
+                return Ok(());
+            }
+            // XT-02: see the synchronous path — never publish `Active` when an
+            // injected service disappeared while `apply_async` ran.
+            if !dependencies_ready(ctx, plugin.inject()) {
+                discard_activation_effects_async(data, ctx).await;
+                transition(data, FiberState::Pending);
+                ctx.refresh_dependents();
                 return Ok(());
             }
             record_dep_versions(data, ctx, plugin.inject());
@@ -3288,18 +3306,22 @@ pub(crate) async fn unload_fiber_async(data: &FiberRef, target: FiberState) -> R
 /// stuck in `Unloading` and `when_idle` blocked forever). The panic is logged
 /// and returned so the caller can re-raise it at a point where the fiber state
 /// is already final.
-pub(crate) fn unload_contained(
-    data: &FiberRef,
-    target: FiberState,
-) -> Option<crate::exec::PanicPayload> {
+pub(crate) fn unload_contained(data: &FiberRef, target: FiberState) -> bool {
+    // XT-02: refresh-driven unloads must serialize with user lifecycle
+    // operations. Without the slot, a refresh unload could race a concurrent
+    // restart/update and leave the fiber's state machine in a torn phase (a
+    // user restart then observed `InactiveEffect` instead of `LifecycleBusy`).
+    // If the fiber is busy, skip it this round; a later refresh retries.
+    let Ok(_lifecycle) = begin_lifecycle(data) else {
+        return false;
+    };
     match catch_unwind(AssertUnwindSafe(|| unload_fiber(data, target))) {
-        Ok(Ok(())) => None,
+        Ok(Ok(())) => {}
         Ok(Err(error)) => {
             tracing::error!(
                 target: "zeokeel_cordis::fiber",
                 "contained unload failed: {error}"
             );
-            None
         }
         Err(payload) => {
             tracing::error!(
@@ -3307,26 +3329,28 @@ pub(crate) fn unload_contained(
                 "cleanup panicked during contained unload: {}",
                 panic_message(payload.as_ref())
             );
-            Some(payload)
         }
     }
+    true
 }
 
 /// Awaiting counterpart of [`unload_contained`] for the async refresh path.
-pub(crate) async fn unload_contained_async(
-    data: &FiberRef,
-    target: FiberState,
-) -> Option<crate::exec::PanicPayload> {
+pub(crate) async fn unload_contained_async(data: &FiberRef, target: FiberState) -> bool {
+    // XT-02: same lifecycle serialization as the synchronous path. The guard
+    // is held across the await so a concurrent user lifecycle call observes
+    // `LifecycleBusy` instead of racing the unload.
+    let Ok(_lifecycle) = begin_lifecycle(data) else {
+        return false;
+    };
     match futures_util::FutureExt::catch_unwind(AssertUnwindSafe(unload_fiber_async(data, target)))
         .await
     {
-        Ok(Ok(())) => None,
+        Ok(Ok(())) => {}
         Ok(Err(error)) => {
             tracing::error!(
                 target: "zeokeel_cordis::fiber",
                 "contained async unload failed: {error}"
             );
-            None
         }
         Err(payload) => {
             tracing::error!(
@@ -3334,9 +3358,9 @@ pub(crate) async fn unload_contained_async(
                 "cleanup panicked during contained async unload: {}",
                 panic_message(payload.as_ref())
             );
-            Some(payload)
         }
     }
+    true
 }
 
 /// Completes the teardown when the unload future is dropped mid-await (A-2/A-9).
