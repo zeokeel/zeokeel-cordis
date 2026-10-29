@@ -141,6 +141,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
           toolchain: 1.85.0
+          components: clippy
       - name: test (MSRV)
         run: cargo test --locked
       - name: test (MSRV, supervision feature)
