@@ -244,3 +244,17 @@ fn invalid_numeric_logger_level_clamps_to_error() {
         .debug("debug visible at level 3", Value::Null);
     assert_eq!(exporter.count(), 2);
 }
+
+/// XT-09 regression: unknown numeric levels must clamp to the *strictest*
+/// level (`Error`), exactly like the configuration path; they must not widen
+/// the threshold to `Debug`.
+#[test]
+fn xt09_from_u8_clamps_unknown_levels_to_error() {
+    use zeokeel_cordis::LogLevel;
+    assert_eq!(LogLevel::from_u8(0), LogLevel::Error);
+    assert_eq!(LogLevel::from_u8(1), LogLevel::Warn);
+    assert_eq!(LogLevel::from_u8(2), LogLevel::Info);
+    assert_eq!(LogLevel::from_u8(3), LogLevel::Debug);
+    assert_eq!(LogLevel::from_u8(4), LogLevel::Error);
+    assert_eq!(LogLevel::from_u8(255), LogLevel::Error);
+}

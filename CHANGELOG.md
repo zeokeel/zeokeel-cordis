@@ -20,6 +20,9 @@
   `(fiber_id, seq)` 排序即可还原迁移链。回归：
   `regression_core::xt03_lifecycle_event_carries_the_transition_snapshot` /
   `xt03_lifecycle_events_sorted_by_seq_form_a_valid_chain`。
+- **XT-09：`LogLevel::from_u8` 对 >3 的值 clamp 到 `Error`**（此前映射到最宽的
+  `Debug`，与配置路径 `{"level":99}` 的 fail-closed clamp 相反）。回归：
+  `logger::xt09_from_u8_clamps_unknown_levels_to_error`。
 
 ### Docs
 

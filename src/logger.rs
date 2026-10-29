@@ -59,13 +59,18 @@ impl LogLevel {
         }
     }
 
-    /// Build from the numeric code of this port (`0..=3`).
+    /// Build from the numeric code of this port (`Error=0` … `Debug=3`).
+    ///
+    /// Values above `3` are **clamped to `Error`** (fail-closed), matching the
+    /// configuration path (`{"level": 99}` → `Error`); they never widen the
+    /// threshold to the most verbose level (XT-09).
     pub fn from_u8(code: u8) -> Self {
         match code {
             0 => Self::Error,
             1 => Self::Warn,
             2 => Self::Info,
-            _ => Self::Debug,
+            3 => Self::Debug,
+            _ => Self::Error,
         }
     }
 
