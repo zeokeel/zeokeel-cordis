@@ -222,16 +222,23 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   any leftover dependent stays `Active` and can be retried by a later
   dispose/refresh. This supersedes the former "deep chain dispose can overflow
   the stack" limitation.
-- **Lifecycle broadcasts (v0.5.0)**: `Context::on_lifecycle(listener)` subscribes a
-  **non-fiber-bound** listener (`LifecycleListener`) that receives one
-  `LifecycleEvent { fiber_id, name, from, to }` per fiber state transition.
+- **Lifecycle broadcasts (v0.5.0, event snapshot in v0.5.1/XT-03)**: `Context::on_lifecycle(listener)`
+  subscribes a **non-fiber-bound** listener (`LifecycleListener`) that receives one
+  `LifecycleEvent { fiber_id, name, from, to, seq }` per fiber state transition.
+  `from`/`to` are captured **under the state lock** at transition time (never
+  re-read from the live fiber when the listener runs), so a reentrant or
+  concurrent transition cannot make an event claim an impossible
+  `from`/`to` pair. `seq` is a per-fiber monotonic counter assigned in the same
+  critical section: delivery order across threads is not guaranteed, but sorting
+  a fiber's events by `seq` reconstructs the exact transition chain.
   Multiple subscribers run independently and listener panics are contained and
   logged. The subscription is **not fiber-owned**: the returned `Disposer` is its
   single owner — dropping the `Disposer` unsubscribes exactly like `dispose`
   (single-owner safety net); to keep observing across the installing fiber's
-  lifetime, store the `Disposer` and dispose it explicitly when done. It is a
-  thin wrapper over the `internal/status` hook (CORE-021) and does not alter the
-  state-machine guarantees of CORE-044/045/047.
+  lifetime, store the `Disposer` and dispose it explicitly when done. It fires
+  at the same point as the `internal/status` hook (CORE-021) from a dedicated
+  internal slot and does not alter the state-machine guarantees of
+  CORE-044/045/047.
 - **Pending-dispose finalisation (v0.4.2)**: when a parent unload flags a busy
   child for disposal, every lifecycle entry point (`restart`, `restart_async`,
   `update`, `update_async`) finalises the pending dispose on **all** exit paths —
@@ -623,7 +630,8 @@ pub struct Logger;                // named facade
 pub trait Clock;                  // now_unix_ms() / now_monotonic_ms()
 pub struct SystemClock;           // default Clock (wall time + process-monotonic)
 pub struct LifecycleEvent { pub fiber_id: u64, pub name: String,
-                            pub from: FiberState, pub to: FiberState }
+                            pub from: FiberState, pub to: FiberState,
+                            pub seq: u64 }
 pub type LifecycleListener = Arc<dyn Fn(&LifecycleEvent) + Send + Sync>;
 pub struct IdleWait<'a>;          // `Registry::when_idle()` future, re-exported at the crate root
 pub struct ServiceKey<T: ?Sized + Send + Sync + 'static>;

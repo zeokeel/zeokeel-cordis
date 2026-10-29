@@ -204,6 +204,10 @@ pub(crate) struct FiberData {
     /// Generation counter of activation attempts; a stale attempt must not
     /// transition or roll back a newer one.
     pub(crate) activation_epoch: AtomicU64,
+    /// Monotonic per-fiber sequence of state transitions (XT-03): lifecycle
+    /// broadcasts carry it so observers can order events per fiber even when
+    /// delivery is interleaved by concurrent threads.
+    pub(crate) status_seq: AtomicU64,
     /// Token of the thread currently running a lifecycle operation (0 = idle).
     pub(crate) lifecycle_owner: AtomicU64,
     /// Reentrancy depth of the owning thread.
@@ -1073,7 +1077,7 @@ pub(crate) fn dependencies_satisfied(
 ///
 /// No-op when the state does not change (Cordis only emits on transitions).
 pub(crate) fn transition(data: &FiberRef, next: FiberState) {
-    let (old, ctx) = match data.lock() {
+    let (old, ctx, seq) = match data.lock() {
         Ok(mut fiber) => {
             if fiber.state == next {
                 return;
@@ -1085,14 +1089,23 @@ pub(crate) fn transition(data: &FiberRef, next: FiberState) {
                 return;
             }
             let old = fiber.state;
+            let seq = fiber.status_seq.fetch_add(1, Ordering::SeqCst);
             fiber.state = next;
-            (old, fiber.ctx_ref())
+            (old, fiber.ctx_ref(), seq)
         }
         Err(_) => return,
     };
     if let Some(ctx) = ctx {
         let fiber = Fiber { data: data.clone() };
         ctx.events().internal().emit_status(&fiber, old);
+        // XT-03/XT-08: deliver the lifecycle broadcast with the transition
+        // snapshot captured under the state lock, so `from`/`to` can never
+        // disagree with the actual transition even if a nested/reentrant
+        // transition (or another thread) moves the fiber further before the
+        // listener runs.
+        ctx.events()
+            .internal()
+            .emit_lifecycle(&fiber, old, next, seq);
     }
     // Notify through the stored registry: a disposed fiber has no context link
     // left, but quiescence must still observe the transition.
@@ -3677,6 +3690,7 @@ mod regression_tests {
             clock: Arc::new(crate::clock::SystemClock),
             last_activity_ms: AtomicU64::new(0),
             activation_epoch: AtomicU64::new(0),
+            status_seq: AtomicU64::new(0),
             lifecycle_owner: AtomicU64::new(0),
             lifecycle_depth: AtomicUsize::new(0),
             pending_ops: AtomicUsize::new(0),

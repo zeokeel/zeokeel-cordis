@@ -13,6 +13,13 @@
   embedder 通过 `exec::set_blocking_executor` 显式安装执行器时才排空异步 cleanup，否则跳过并记录
   `tracing::error!`（资源可能泄漏，但不会挂死线程）。回归：
   `regression_core::xt01_dropping_a_fiber_with_deferred_reactor_cleanups_does_not_hang`。
+- **XT-03/XT-08：`on_lifecycle` 事件改为锁内迁移快照 + 每 fiber 单调 `seq`**。此前
+  `LifecycleEvent.to` 在 hook 执行时现读 `fiber.state()`，并发/重入迁移下会出现
+  `from == to`、`Pending -> Disposed` 之类的不自洽事件。现在 `transition()` 在状态锁内
+  捕获 `(from, to, seq)`，`LifecycleEvent` 新增 `seq: u64`；并发投递仍可能交错，按
+  `(fiber_id, seq)` 排序即可还原迁移链。回归：
+  `regression_core::xt03_lifecycle_event_carries_the_transition_snapshot` /
+  `xt03_lifecycle_events_sorted_by_seq_form_a_valid_chain`。
 
 ### Docs
 

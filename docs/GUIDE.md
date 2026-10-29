@@ -730,15 +730,19 @@ for fiber in root.registry().fibers() {
 // 每次 fiber 状态迁移触发一次；Disposer 是唯一所有者：drop 即退订
 // （要跨安装它的 fiber 的生命周期继续监听，请保存 Disposer，在需要时显式 dispose）
 let sub = root.on_lifecycle(Arc::new(|event: &LifecycleEvent| {
-    println!("#{} {} {:?} -> {:?}", event.fiber_id, event.name, event.from, event.to);
+    // from/to 是状态锁内的迁移快照；seq 是每 fiber 单调序号
+    // （并发投递可能交错，按 (fiber_id, seq) 排序即可还原迁移链）
+    println!("#{}#{} {} {:?} -> {:?}",
+        event.fiber_id, event.seq, event.name, event.from, event.to);
 }))?;
 // ... 进程退出前 sub.dispose();
 ```
 
 > **`InternalBus` 所有权（v0.5.0 明确）**：`Events::internal()`/`InternalBus` 是 advanced
 > surface——注册的回调由**调用者**拥有，**不随 fiber 卸载移除**，需显式 `Disposer`；
-> 常规插件请用 fiber-owned 的 `Context::on_internal_*`。`Context::on_lifecycle` 是建立在
-> `internal/status` raw hook 上的非 fiber 绑定封装。
+> 常规插件请用 fiber-owned 的 `Context::on_internal_*`。`Context::on_lifecycle` 与
+> `internal/status` 同点触发的**独立 hook 槽**（非 fiber 绑定），事件携带锁内
+> `from`/`to` 快照与每 fiber 单调 `seq`。
 
 > **注册窗口（v0.4.3）**：`ctx.plugin*` 的注册→激活窗口计入 in-flight，而
 > `internal/plugin` create hook 正是在该窗口内执行。v0.4.3 起 `when_idle()` **只排除调用

@@ -204,8 +204,13 @@ pub struct LifecycleEvent {
     pub name: String,
     /// State before the transition.
     pub from: FiberState,
-    /// State after the transition (as observed when the hook runs).
+    /// State after the transition (snapshot taken under the state lock at
+    /// transition time, XT-03; never re-read from the fiber when the hook runs).
     pub to: FiberState,
+    /// Monotonic per-fiber transition sequence (XT-03). Delivery across
+    /// threads may interleave; sort by `seq` per `fiber_id` to recover the
+    /// exact transition order.
+    pub seq: u64,
 }
 
 /// A lifecycle subscriber (see [`crate::Context::on_lifecycle`]).
@@ -427,6 +432,7 @@ impl<T: ?Sized + Send + Sync + 'static> Hooks<T> {
 // struct fields stay readable and clippy::type_complexity is satisfied).
 type PluginHookDyn = dyn Fn(&Fiber) + Send + Sync;
 type StatusHookDyn = dyn Fn(&Fiber, FiberState) + Send + Sync;
+pub(crate) type LifecycleHookDyn = dyn Fn(&Fiber, FiberState, FiberState, u64) + Send + Sync;
 type ServiceHookDyn = dyn Fn(&Context, &str, Option<&ServiceValue>) + Send + Sync;
 type ConfigHookDyn = dyn for<'a> Fn(&Fiber, Value, &ConfigNext<'a>) -> Value + Send + Sync;
 type UpdateHookDyn = dyn for<'a> Fn(&Fiber, Value, bool, &UpdateNext<'a>) + Send + Sync;
@@ -442,6 +448,7 @@ type DispatchHookDyn = dyn Fn(&DispatchInfo) + Send + Sync;
 pub struct InternalBus {
     plugin: Arc<Hooks<PluginHookDyn>>,
     status: Arc<Hooks<StatusHookDyn>>,
+    lifecycle: Arc<Hooks<LifecycleHookDyn>>,
     service: Arc<Hooks<ServiceHookDyn>>,
     config: Arc<Hooks<ConfigHookDyn>>,
     update: Arc<Hooks<UpdateHookDyn>>,
@@ -508,6 +515,7 @@ impl InternalBus {
     pub fn is_empty(&self) -> bool {
         self.plugin.is_empty()
             && self.status.is_empty()
+            && self.lifecycle.is_empty()
             && self.service.is_empty()
             && self.config.is_empty()
             && self.update.is_empty()
@@ -530,6 +538,26 @@ impl InternalBus {
             contained("zeokeel_cordis::internal", "internal/status", (), || {
                 hook(fiber, old)
             });
+        }
+    }
+
+    /// Register a lifecycle-broadcast hook (used by `Context::on_lifecycle`).
+    ///
+    /// Unlike [`InternalBus::on_status`], the hook receives the transition
+    /// snapshot `(from, to, seq)` captured under the state lock.
+    pub(crate) fn on_lifecycle_hook(self: &Arc<Self>, hook: Arc<LifecycleHookDyn>) -> Disposer {
+        self.lifecycle.register(hook)
+    }
+
+    /// Emit one lifecycle broadcast with the pre-captured transition snapshot.
+    pub(crate) fn emit_lifecycle(&self, fiber: &Fiber, from: FiberState, to: FiberState, seq: u64) {
+        for hook in self.lifecycle.snapshot() {
+            contained(
+                "zeokeel_cordis::internal",
+                "lifecycle broadcast",
+                (),
+                || hook(fiber, from, to, seq),
+            );
         }
     }
 

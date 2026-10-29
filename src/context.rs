@@ -154,6 +154,7 @@ impl Context {
             clock: Arc::new(crate::clock::SystemClock),
             last_activity_ms: std::sync::atomic::AtomicU64::new(0),
             activation_epoch: std::sync::atomic::AtomicU64::new(0),
+            status_seq: std::sync::atomic::AtomicU64::new(0),
             lifecycle_owner: std::sync::atomic::AtomicU64::new(0),
             lifecycle_depth: std::sync::atomic::AtomicUsize::new(0),
             pending_ops: std::sync::atomic::AtomicUsize::new(0),
@@ -1304,6 +1305,7 @@ impl Context {
             clock: tree_clock,
             last_activity_ms: std::sync::atomic::AtomicU64::new(started_ms),
             activation_epoch: std::sync::atomic::AtomicU64::new(0),
+            status_seq: std::sync::atomic::AtomicU64::new(0),
             lifecycle_owner: std::sync::atomic::AtomicU64::new(0),
             lifecycle_depth: std::sync::atomic::AtomicUsize::new(0),
             pending_ops: std::sync::atomic::AtomicUsize::new(0),
@@ -2233,20 +2235,26 @@ impl Context {
     /// none of the fiber-bound lifecycle semantics, see
     /// [`Context::on_internal_status`] for the raw hook.
     pub fn on_lifecycle(&self, listener: crate::internal::LifecycleListener) -> Result<Disposer> {
-        let hook: StatusHook = Arc::new(move |fiber: &Fiber, old: FiberState| {
-            let event = crate::internal::LifecycleEvent {
-                fiber_id: fiber.id(),
-                name: fiber.name(),
-                from: old,
-                to: fiber.state(),
-            };
-            crate::internal::contained("zeokeel_cordis::context", "lifecycle listener", (), || {
-                listener(&event)
-            });
-        });
+        let hook: Arc<crate::internal::LifecycleHookDyn> = Arc::new(
+            move |fiber: &Fiber, from: FiberState, to: FiberState, seq: u64| {
+                let event = crate::internal::LifecycleEvent {
+                    fiber_id: fiber.id(),
+                    name: fiber.name(),
+                    from,
+                    to,
+                    seq,
+                };
+                crate::internal::contained(
+                    "zeokeel_cordis::context",
+                    "lifecycle listener",
+                    (),
+                    || listener(&event),
+                );
+            },
+        );
         // Deliberately NOT registered as a fiber effect: the subscription must
         // survive the installing fiber (see the doc comment).
-        Ok(self.inner.events.internal().on_status(hook))
+        Ok(self.inner.events.internal().on_lifecycle_hook(hook))
     }
 
     /// Register an `internal/status` hook owned by the current fiber.
