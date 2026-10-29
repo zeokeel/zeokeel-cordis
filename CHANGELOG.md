@@ -5,6 +5,13 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-29
+
+**交叉测试修复与边界澄清（patch）**：修复多 Agent 交叉测试确认的 4 项缺陷（Fiber Drop 阻塞、
+refresh 生命周期竞态、lifecycle 事件快照、logger 级别 clamp），其余 findings 以文档边界澄清；
+新增 `LifecycleEvent.seq`。门禁：默认 **451 passed / 0 failed**、`--features supervision`
+**466 passed / 0 failed**（fmt / clippy / doc --all-features / kernel boundary 同绿）。
+
 ### Fixed
 
 - **XT-01：`FiberData::drop` 不再用默认 thread-park `block_on` 排空 async cleanup**。此前在
@@ -29,6 +36,18 @@
 - **XT-09：`LogLevel::from_u8` 对 >3 的值 clamp 到 `Error`**（此前映射到最宽的
   `Debug`，与配置路径 `{"level":99}` 的 fail-closed clamp 相反）。回归：
   `logger::xt09_from_u8_clamps_unknown_levels_to_error`。
+
+### Changed
+
+- **`FiberData::drop` 不再在无 `BlockingExecutor` 时排空 async cleanup（XT-01）**：改为只跑
+  同步 cleanup，异步 cleanup 跳过并记录 `tracing::error!`；安装执行器的宿主行为不变。
+- **refresh 触发的卸载占用 per-fiber lifecycle 槽（XT-02）**：刷新期间 busy 的 fiber 会被跳过
+  并在后续 refresh 重试；用户 `restart`/`update` 在刷新卸载期间可能收到 `LifecycleBusy`。
+- **激活结束前重新校验 `inject` 依赖（XT-02）**：依赖在 `apply` 期间被撤销时回滚到 `Pending`，
+  不再发布缺依赖的 `Active`。
+- **`LifecycleEvent` 新增 `seq: u64`（XT-03/XT-08）**：`from`/`to` 改为状态锁内快照；显式
+  构造该结构体的下游代码需要补字段（0.y 允许的破坏性变化；不构造它的用户不受影响）。
+- **`LogLevel::from_u8(>3)` 改为 clamp 到 `Error`（XT-09）**：与配置路径的 fail-closed 策略一致。
 
 ### Docs
 
@@ -725,7 +744,8 @@ recovery 时级联根帧的 deferred cleanup 可能延后到显式 dispose 的 P
   fiber 状态机、effect 逆序清理、事件（emit/bail/parallel/serial/waterfall）、
   插件 registry 与配置 schema、日志服务。
 
-[Unreleased]: https://github.com/zeokeel/zeokeel-cordis/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/zeokeel/zeokeel-cordis/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.5.1
 [0.5.0]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.5.0
 [0.4.4]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.4.4
 [0.4.3]: https://github.com/zeokeel/zeokeel-cordis/releases/tag/v0.4.3

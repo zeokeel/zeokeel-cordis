@@ -1,10 +1,12 @@
 # Cordis Core — normative specification
 
-Status: **v0.5.0**. The Rust crate (repository root) is the reference implementation of
+Status: **v0.5.1**. The Rust crate (repository root) is the reference implementation of
 this document. A behavior that is not written here is not part of the contract.
 
-Editorial revision v0.5.0: the prose and the API surface below were re-checked against
-the `v0.5.0` crate. No CORE case is added, renumbered or removed — **all 51 cases
+Editorial revision v0.5.1 (patch, cross-test fixes): the prose and the API surface below
+were re-checked against the `v0.5.1` crate; v0.5.1 adds no CORE case and changes no case
+identifier/order (the lifecycle snapshot and XT-02 activation revalidation tighten behavior
+described in §2.3/§2.5; `LifecycleEvent.seq` is listed in §3). No CORE case is added, renumbered or removed — **all 51 cases
 (CORE-001…CORE-051) remain the contract**. v0.5.0 is a **minor release**: it converges
 the public API (internal state types leave the public contract; `Fiber::last_activity`
 becomes `last_activity_ms`, Q11 clarifies that `FiberQuota::max_effects` counts user
