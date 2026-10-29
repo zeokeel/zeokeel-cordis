@@ -388,15 +388,24 @@ pub fn orphan_async_cleanups_pending() -> usize {
 /// second drain cannot double-run them; the queue capacity (256) and the
 /// cumulative leak accounting are unchanged.
 pub fn drain_orphan_async_cleanups() -> usize {
+    // The gauge is updated while the queue lock is held, together with the
+    // take, so a concurrent hand-off can never be counted twice and no
+    // read-modify-write loop (`fetch_update`, deprecated on newer toolchains)
+    // is needed: pending is exactly the queue length at every lock boundary.
     let taken: Vec<AsyncDisposer> = match ORPHANS.lock() {
-        Ok(mut orphans) => std::mem::take(&mut *orphans),
+        Ok(mut orphans) => {
+            let taken = std::mem::take(&mut *orphans);
+            ORPHAN_PENDING.fetch_sub(taken.len(), Ordering::SeqCst);
+            taken
+        }
         // Poisoned queue: recover what is there (better than leaking it).
-        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        Err(poisoned) => {
+            let mut orphans = poisoned.into_inner();
+            let taken = std::mem::take(&mut *orphans);
+            ORPHAN_PENDING.fetch_sub(taken.len(), Ordering::SeqCst);
+            taken
+        }
     };
-    // Saturating: the gauge is advisory and the queue is drained concurrently.
-    let _ = ORPHAN_PENDING.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
-        Some(pending.saturating_sub(taken.len()))
-    });
     let count = taken.len();
     for disposer in taken {
         match catch_unwind(AssertUnwindSafe(|| disposer.dispose_blocking())) {

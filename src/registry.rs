@@ -2443,7 +2443,7 @@ mod registration_window_tests {
         release_tx.send(()).expect("release");
         holder.join().expect("holder");
         assert!(registry.is_idle());
-        let mut ready = Box::pin(registry.when_idle());
+        let mut ready = std::pin::pin!(registry.when_idle());
         assert!(poll_once(ready.as_mut()).is_ready());
     }
 

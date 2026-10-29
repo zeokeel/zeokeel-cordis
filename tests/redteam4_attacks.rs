@@ -1121,7 +1121,7 @@ fn r5_02_repeated_direct_disposer_cancels_are_safe() {
             3,
             "each cancelled attempt starts exactly its one in-flight cleanup (no duplicates)"
         );
-        let mut final_future = Box::pin(disposer.dispose());
+        let mut final_future = std::pin::pin!(disposer.dispose());
         assert!(
             matches!(poll_once(final_future.as_mut()), Poll::Ready(())),
             "the disposer must be settled after the cancellations (only in-flight cleanups were lost)"

@@ -4072,7 +4072,7 @@ fn p2a_migrated_cleanup_reentrant_dispose_matches_same_thread() {
     watchdog("p2a-migrated", Duration::from_secs(60), || {
         // ---- control: the whole refresh future is polled on one thread ----
         let (root, consumer, latch, logs, runs) = p2a_fixture();
-        let mut refresh = Box::pin({
+        let mut refresh = std::pin::pin!({
             let root = root.clone();
             async move { root.refresh_async().await }
         });
@@ -4183,7 +4183,7 @@ fn awaiting_settled_observes_refresh_unload() {
         });
         assert!(poll_once_pin(refresh.as_mut()).is_pending());
 
-        let mut settled = Box::pin(consumer.settled());
+        let mut settled = std::pin::pin!(consumer.settled());
         assert!(
             poll_once_pin(settled.as_mut()).is_pending(),
             "settled() must observe the in-flight refresh unload"

@@ -982,7 +982,7 @@ fn fix15_cancelled_teardown_is_retried_by_dispose_blocking() {
     // Poll the dispose future once (starts the pending cleanup), then drop it:
     // the unstarted cleanup is put back and the state marked cancelled.
     block_on(std::future::poll_fn(|cx| {
-        let mut future = Box::pin(disposer.dispose());
+        let mut future = std::pin::pin!(disposer.dispose());
         let _ = future.as_mut().poll(cx);
         std::task::Poll::Ready(())
     }));
@@ -1058,7 +1058,7 @@ fn fix15_cancelled_dispose_async_is_retried_by_fiber_dispose() {
         )
         .expect("plugin");
     block_on(std::future::poll_fn(|cx| {
-        let mut future = Box::pin(fiber.dispose_async());
+        let mut future = std::pin::pin!(fiber.dispose_async());
         let _ = future.as_mut().poll(cx);
         std::task::Poll::Ready(())
     }));
@@ -1557,7 +1557,7 @@ impl F1Cascade {
     fn cancel(&mut self) {
         let parent = self.parent.clone();
         block_on(std::future::poll_fn(|cx| {
-            let mut future = Box::pin(parent.dispose_async());
+            let mut future = std::pin::pin!(parent.dispose_async());
             let _ = future.as_mut().poll(cx);
             std::task::Poll::Ready(())
         }));
