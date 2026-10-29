@@ -208,7 +208,9 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   nested `ctx.plugin` inside `apply` adds one level — so roughly 254 nested
   loads below a root-level plugin are accepted and the next one fails.
   Context-only nesting (`extend`/`intercept`/`extend_meta`, e.g. 300 levels)
-  consumes no budget at all.
+  consumes no budget at all. A dependency chain longer than the bound cannot be
+  constructed through `ctx.plugin`: e.g. a 300-level chain is truncated at 255
+  loaded levels, so only 255 cleanups run (XT-11).
   **Dynamic child bookkeeping is bounded (v0.4.3, R3-A4)**: a child fiber that
   disposes itself detaches its ownership effect from the parent's effect list
   (and its effect-node / weak-child-list entries), and a parent effect list that

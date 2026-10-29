@@ -34,6 +34,8 @@
   hook、async lane 无 `once`/`global` 的设计边界（XT-06）。
 - `spec/CORDIS-CORE.md` / `docs/GUIDE.md` 记录 `ctx.set` 每次写留一个逆 effect 的线性成本
   （XT-07：高频写入建议原地修改服务，`set` 留给配置式变更）。
+- `spec/CORDIS-CORE.md` 补充 `MAX_PLUGIN_DEPTH` 的实测含义（XT-11：超深依赖链在加载期被截断，
+  如 300 层链只有 255 层 cleanup 运行）。
 
 ## [0.5.0] - 2026-10-29
 
