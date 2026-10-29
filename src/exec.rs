@@ -214,6 +214,16 @@ pub fn set_blocking_executor(executor: Arc<dyn BlockingExecutor>) -> bool {
     BLOCKING_EXECUTOR.set(executor).is_ok()
 }
 
+/// Whether the embedder installed a [`BlockingExecutor`].
+///
+/// The synchronous disposal edges use this to decide whether they may safely
+/// block; `FiberData::drop` uses it to avoid the default thread-park
+/// [`block_on`] on an async worker thread (which cannot drive a reactor and
+/// would deadlock).
+pub(crate) fn has_blocking_executor() -> bool {
+    BLOCKING_EXECUTOR.get().is_some()
+}
+
 /// Run a unit future on the embedder-provided executor, or on the default
 /// thread-park [`block_on`] when none was installed.
 pub(crate) fn block_on_unit(future: BoxFuture<'static, ()>) {

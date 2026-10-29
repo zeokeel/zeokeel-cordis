@@ -33,7 +33,9 @@ language-driven and permanent unless the spec says otherwise:
   `serial_async` / `waterfall_async`. Sync dispatch never polls async listeners.
   Listeners return `EventResult` instead of raising exceptions, and events carry
   `serde_json::Value` payloads — there is no typed event map and no
-  `AggregateError` channel.
+  `AggregateError` channel. Async registrations (`on_async*`) bypass the
+  `internal/listener` hook that sync registrations pass through, and the async
+  lane has no `once`/`global` options (XT-06).
 - **`inject` is a name list** (`&'static [&'static str]`), not a name → intercept
   config map.
 - **Event scope filtering is isolate-map equality**, not a subtree walk: a listener
@@ -480,6 +482,15 @@ sandbox for untrusted plugins; that layer is embedder guidance, not a crate feat
 cleanup panic re-raised from `Drop` aborts the process when it happens during an
 unwind, and `AsyncDisposer::drop` can block; prefer explicit `dispose` /
 `dispose_async` (never dispose from `Drop` on an async worker thread).
+**`Fiber` drop does not block on async cleanups (XT-01)**: dropping the last
+`Fiber` handle without an explicit disposal runs the sync cleanups, but async
+cleanups (including a deferred tail left by a cancelled `dispose_async`) are
+**skipped** with a `tracing::error!` unless the embedder installed a
+`BlockingExecutor` with `exec::set_blocking_executor`. This trades a possible
+resource leak for not deadlocking the caller's thread: the default thread-park
+`block_on` cannot drive a reactor, so draining a reactor-backed cleanup from
+`Drop` on a `current_thread` runtime would hang forever. Dispose fibers
+explicitly (`dispose` / `dispose_async`) on async worker threads.
 Cancellation semantics depend on the granularity (CORE-046): an
 `AsyncDisposer` restores only the cleanups that had not started and the next
 explicit `dispose()` / `dispose_blocking()` retries them (S-1), while a cancelled

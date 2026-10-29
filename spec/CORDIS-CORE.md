@@ -105,6 +105,12 @@ concerns built on top of the core.
   defence in depth, so a store entry can never change its concrete type. An
   `internal/set` hook can only veto the write, it cannot substitute a value.
   A wrong-typed overwrite can no longer silently replace a service.
+  **Cost (XT-07):** every successful `set`/`set_any` registers one inverse effect
+  on the providing fiber (that is what makes it revertible), so a hot loop of
+  `set` grows that fiber's effect list linearly — O(n) memory and O(n) unload
+  work. Prefer mutating the service value in place for high-frequency updates,
+  reserve `set` for configuration-style changes, and use `set_revertible` when
+  the caller wants to collapse the inverse history.
   **Accessor write rejection (v0.4.3)**: when a computed accessor has a setter and
   that setter returns `false` (the owner inspected the value and rejected it), the
   write returns `CordisError::AccessorWriteRejected(name)` — distinct from
@@ -145,6 +151,14 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   (CORE-005, CORE-006, CORE-016). The gate is the **strict** query of §2.2: a
   provider that exists but is not `Active` yet (v0.4.2) and a read-lane-only
   accessor do not satisfy it.
+- **Activation dependency revalidation (XT-02)**: an activation is published as
+  `Active` only if its `inject` services are still available when `apply` /
+  `apply_async` returns. If a provider withdraws a dependency while the
+  activation body runs, the attempt is rolled back (effects/listeners/children)
+  and the fiber returns to `Pending`; the next refresh can reactivate it against
+  a live provider. Refresh-driven unloads claim the per-fiber lifecycle slot, so
+  a busy fiber is skipped for that refresh pass and retried later instead of
+  racing a user lifecycle operation.
 - **Failure semantics (v0.2.0)**: when `apply` returns `Err` **or panics**, the
   activation is failed: every effect registered during the failed activation is
   rolled back (sync cleanups immediately and async cleanups through the blocking executor
@@ -202,7 +216,9 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   nested `ctx.plugin` inside `apply` adds one level — so roughly 254 nested
   loads below a root-level plugin are accepted and the next one fails.
   Context-only nesting (`extend`/`intercept`/`extend_meta`, e.g. 300 levels)
-  consumes no budget at all.
+  consumes no budget at all. A dependency chain longer than the bound cannot be
+  constructed through `ctx.plugin`: e.g. a 300-level chain is truncated at 255
+  loaded levels, so only 255 cleanups run (XT-11).
   **Dynamic child bookkeeping is bounded (v0.4.3, R3-A4)**: a child fiber that
   disposes itself detaches its ownership effect from the parent's effect list
   (and its effect-node / weak-child-list entries), and a parent effect list that
@@ -222,16 +238,23 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   any leftover dependent stays `Active` and can be retried by a later
   dispose/refresh. This supersedes the former "deep chain dispose can overflow
   the stack" limitation.
-- **Lifecycle broadcasts (v0.5.0)**: `Context::on_lifecycle(listener)` subscribes a
-  **non-fiber-bound** listener (`LifecycleListener`) that receives one
-  `LifecycleEvent { fiber_id, name, from, to }` per fiber state transition.
+- **Lifecycle broadcasts (v0.5.0, event snapshot in v0.5.1/XT-03)**: `Context::on_lifecycle(listener)`
+  subscribes a **non-fiber-bound** listener (`LifecycleListener`) that receives one
+  `LifecycleEvent { fiber_id, name, from, to, seq }` per fiber state transition.
+  `from`/`to` are captured **under the state lock** at transition time (never
+  re-read from the live fiber when the listener runs), so a reentrant or
+  concurrent transition cannot make an event claim an impossible
+  `from`/`to` pair. `seq` is a per-fiber monotonic counter assigned in the same
+  critical section: delivery order across threads is not guaranteed, but sorting
+  a fiber's events by `seq` reconstructs the exact transition chain.
   Multiple subscribers run independently and listener panics are contained and
   logged. The subscription is **not fiber-owned**: the returned `Disposer` is its
   single owner — dropping the `Disposer` unsubscribes exactly like `dispose`
   (single-owner safety net); to keep observing across the installing fiber's
-  lifetime, store the `Disposer` and dispose it explicitly when done. It is a
-  thin wrapper over the `internal/status` hook (CORE-021) and does not alter the
-  state-machine guarantees of CORE-044/045/047.
+  lifetime, store the `Disposer` and dispose it explicitly when done. It fires
+  at the same point as the `internal/status` hook (CORE-021) from a dedicated
+  internal slot and does not alter the state-machine guarantees of
+  CORE-044/045/047.
 - **Pending-dispose finalisation (v0.4.2)**: when a parent unload flags a busy
   child for disposal, every lifecycle entry point (`restart`, `restart_async`,
   `update`, `update_async`) finalises the pending dispose on **all** exit paths —
@@ -359,6 +382,12 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   concurrently, while `serial_async` walks the **registration order** and
   runs/awaits each listener in that order (sync and async listeners interleave
   by registration).
+- **Async registration bypasses `internal/listener` (XT-06)**: `ctx.on_async` /
+  `ctx.on_async_with` are registered directly on the async lane and are **not**
+  passed through the `internal/listener` hook (sync `on`/`on_once`
+  registrations are); the async lane also has no `once`/`global` options. A host
+  that uses `internal/listener` for policy (audit, deny-list, rewriting) must
+  enforce it on the sync lane only or wrap async callbacks itself.
 - Scope filters: a listener receives an event only when the dispatching context's
   isolation map equals the listener's own, unless `global` is set (CORE-019).
 - Waterfall hooks (`src/waterfall.rs`) are **middleware around an explicit
@@ -396,8 +425,12 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   `is_idle()`/`when_idle()` when a consistent view is required.
 - **Shutdown helper (v0.3.0, panic priority v0.4.2)**: `Context::dispose_all()` /
   `Registry::dispose_all()` dispose every registered fiber and the root fiber,
-  collecting the first cleanup error after attempting all of them; after it
-  returns the registry is empty and `is_idle()` is true. This is the supported
+  collecting the first cleanup error after attempting all of them. **On
+  `Ok`** the registry is empty and `is_idle()` is true. If a fiber's lifecycle
+  operation is busy during the attempt, the call stops that fiber with the first
+  error (`Err(LifecycleBusy)`) after attempting the others; the busy fiber may
+  leave the registry non-empty or non-idle, so the caller must retry after its
+  lifecycle operation finishes (XT-10). This is the supported
   shutdown path (dispose+drop is the only path that reclaims the graph; a
   never-disposed fiber keeps its context/plugin graph alive) (CORE-051). When a
   cleanup **panics** and another fiber also returns an error, the panic wins: the
@@ -421,6 +454,11 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   nothing, so the window is non-idle for every observer). **Boundary:** two
   threads whose registrations mutually await each other's window can still
   deadlock; the kernel does not detect cyclic registration dependencies.
+  **The exemption covers only the `internal/plugin` create hook** (XT-04): while
+  `apply`/`apply_async` runs, the fiber's own activation is an in-flight
+  fiber-level operation (`pending_ops > 0`), so synchronously awaiting
+  `when_idle()` from activation code waits for itself. Do not block on
+  quiescence inside `apply`/`apply_async`; external waiters are unaffected.
 - **Cancelled-cascade recovery (v0.4.3, F1/F4/F5)**: a cancelled async unload
   cascade may temporarily park non-root dependents in `Unloading`.
   - **Recovery entries (F1)**: `Registry::when_idle()`/`Context::when_idle()`,
@@ -476,7 +514,14 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   `restart`/`update`) returns `Ok(())` while the fiber lands in `Failed`, with the
   structured error retained in `Fiber::error_detail()`; callers must check
   `Fiber::state()`/`error_detail()` rather than only the return value.
-  Validation/veto/lifecycle errors still return `Err`. Since v0.4.2 the
+  Validation/veto/lifecycle errors still return `Err`. **The same rule applies
+  to the multi-fiber `Registry::replace`/`replace_async` (XT-05)**: a reload or
+  activation failure of the new implementation is contained at the fiber level —
+  the fibers land in `Failed` and the runtime stays bound to the new plugin key —
+  and the previous implementation/service is **not restored**. Only a lifecycle
+  rejection (`LifecycleBusy`) or a validation error triggers the rollback
+  described here; hosts doing hot-swap must check `Fiber::state()` /
+  `error_detail()` and keep their own recovery path. Since v0.4.2 the
   rollback also **restores the fibers that had already been reloaded**: every
   fiber switched to the new implementation is reloaded back with the old plugin
   before `replace` returns, so a failed replace leaves no mixed
@@ -623,7 +668,8 @@ pub struct Logger;                // named facade
 pub trait Clock;                  // now_unix_ms() / now_monotonic_ms()
 pub struct SystemClock;           // default Clock (wall time + process-monotonic)
 pub struct LifecycleEvent { pub fiber_id: u64, pub name: String,
-                            pub from: FiberState, pub to: FiberState }
+                            pub from: FiberState, pub to: FiberState,
+                            pub seq: u64 }
 pub type LifecycleListener = Arc<dyn Fn(&LifecycleEvent) + Send + Sync>;
 pub struct IdleWait<'a>;          // `Registry::when_idle()` future, re-exported at the crate root
 pub struct ServiceKey<T: ?Sized + Send + Sync + 'static>;

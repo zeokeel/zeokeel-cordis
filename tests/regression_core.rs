@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use zeokeel_cordis::{
     block_on, cleanup, ConfigNext, ConfigSchema, Context, CordisError, Fiber, FiberState,
-    JsonConfigSchema, Plugin, PluginKey, Result, ServiceKey, UpdateNext,
+    JsonConfigSchema, LifecycleEvent, Plugin, PluginKey, Result, ServiceKey, UpdateNext,
 };
 
 // ---------------------------------------------------------------------------
@@ -3742,5 +3742,218 @@ fn s7_cancelled_recovery_drains_root_deferred_cleanup() {
         assert_eq!(recorded, vec!["F0", "F1", "F2", "F3"]);
         let _ = root.dispose_all();
         assert!(root.registry().keys().is_empty());
+    });
+}
+
+/// XT-01 regression: dropping the last `Fiber` handle after a cancelled
+/// `dispose_async` must not block on (or deadlock behind) reactor-backed
+/// deferred cleanups. Async cleanups are skipped unless the embedder installed
+/// a `BlockingExecutor`; sync cleanups still run.
+#[test]
+fn xt01_dropping_a_fiber_with_deferred_reactor_cleanups_does_not_hang() {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context as TaskContext, Poll};
+    use std::time::Duration;
+
+    struct TwoAsync {
+        completed: Arc<AtomicUsize>,
+    }
+    impl zeokeel_cordis::AsyncPlugin for TwoAsync {
+        fn name(&self) -> &'static str {
+            "xt01-two-async"
+        }
+        fn apply_async<'a>(
+            &'a self,
+            ctx: zeokeel_cordis::Context,
+            _config: serde_json::Value,
+        ) -> zeokeel_cordis::BoxFuture<'a, zeokeel_cordis::Result<()>> {
+            let completed = self.completed.clone();
+            Box::pin(async move {
+                let first = completed.clone();
+                ctx.effect_async(move || {
+                    vec![zeokeel_cordis::cleanup_async(move || {
+                        let first = first.clone();
+                        async move {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            first.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })]
+                })?;
+                ctx.effect_async(move || {
+                    vec![zeokeel_cordis::cleanup_async(move || async move {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    })]
+                })?;
+                Ok(())
+            })
+        }
+    }
+
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        let waker = futures_util::task::noop_waker();
+        let mut cx = TaskContext::from_waker(&waker);
+        future.poll(&mut cx)
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let root = zeokeel_cordis::Context::root();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let fiber = root
+            .plugin_async(
+                Arc::new(TwoAsync {
+                    completed: completed.clone(),
+                }),
+                serde_json::Value::Null,
+            )
+            .await
+            .unwrap();
+        let mut disposal = Box::pin(fiber.dispose_async());
+        assert!(poll_once(disposal.as_mut()).is_pending());
+        drop(disposal); // cancel while the first cleanup is in flight
+                         // The last handle is dropped here; without the fix this blocks forever
+                         // on the deferred reactor cleanup.
+        drop(fiber);
+        assert_eq!(
+            completed.load(Ordering::SeqCst),
+            0,
+            "no BlockingExecutor is installed, so async cleanups are skipped (documented XT-01 trade-off)"
+        );
+        root.dispose_all().unwrap();
+    });
+}
+
+/// XT-03/XT-08 regression: the lifecycle broadcast must carry the transition
+/// snapshot captured under the state lock, not a live `fiber.state()` read made
+/// when the listener happens to run. A raw `internal/status` hook reentrantly
+/// disposes the fiber on `Pending -> Loading`; the outer broadcast must still
+/// say `Pending -> Loading` (previously it could observe `Disposed`).
+#[test]
+fn xt03_lifecycle_event_carries_the_transition_snapshot() {
+    struct Noop;
+    impl Plugin for Noop {
+        fn name(&self) -> &'static str {
+            "xt03-noop"
+        }
+        fn apply(&self, _ctx: Context, _config: Value) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    watchdog("xt03-snapshot", Duration::from_secs(10), || {
+        let root = Context::root();
+        let events: Arc<Mutex<Vec<LifecycleEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let _sub = root
+            .on_lifecycle(Arc::new(move |event: &LifecycleEvent| {
+                sink.lock().unwrap().push(event.clone());
+            }))
+            .expect("lifecycle subscriber");
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = fired.clone();
+        let _raw = root
+            .on_internal_status(Arc::new(move |fiber: &Fiber, old: FiberState| {
+                if old == FiberState::Pending
+                    && fiber.state() == FiberState::Loading
+                    && !flag.swap(true, Ordering::SeqCst)
+                {
+                    let _ = fiber.clone().dispose();
+                }
+            }))
+            .expect("raw status hook");
+
+        let fiber = root.plugin(Arc::new(Noop), Value::Null).expect("plugin");
+        let id = fiber.id();
+        let recorded = events.lock().unwrap().clone();
+
+        assert!(
+            recorded.iter().any(|event| event.fiber_id == id
+                && event.from == FiberState::Pending
+                && event.to == FiberState::Loading),
+            "outer Pending -> Loading snapshot missing: {recorded:?}"
+        );
+        assert!(
+            !recorded.iter().any(|event| event.fiber_id == id
+                && event.from == FiberState::Pending
+                && event.to == FiberState::Disposed),
+            "lifecycle broadcast leaked the live state instead of the snapshot: {recorded:?}"
+        );
+        let mut seqs: Vec<u64> = recorded
+            .iter()
+            .filter(|event| event.fiber_id == id)
+            .map(|event| event.seq)
+            .collect();
+        seqs.sort_unstable();
+        assert!(
+            seqs.windows(2).all(|window| window[0] < window[1]),
+            "per-fiber seq must be strictly increasing: {seqs:?}"
+        );
+        root.dispose_all().expect("cleanup");
+    });
+}
+
+/// XT-03 regression: concurrent load/dispose may interleave *delivery* order,
+/// but sorting the broadcasts by their per-fiber `seq` must reconstruct the
+/// exact state-machine chain (each event's `to` is the next event's `from`).
+#[test]
+fn xt03_lifecycle_events_sorted_by_seq_form_a_valid_chain() {
+    struct Noop;
+    impl Plugin for Noop {
+        fn name(&self) -> &'static str {
+            "xt03-churn-noop"
+        }
+        fn apply(&self, _ctx: Context, _config: Value) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    watchdog("xt03-seq-chain", Duration::from_secs(30), || {
+        let root = Context::root();
+        let events: Arc<Mutex<Vec<LifecycleEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let _sub = root
+            .on_lifecycle(Arc::new(move |event: &LifecycleEvent| {
+                sink.lock().unwrap().push(event.clone());
+            }))
+            .expect("lifecycle subscriber");
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let root = root.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..25 {
+                    if let Ok(fiber) = root.plugin(Arc::new(Noop), Value::Null) {
+                        let _ = fiber.dispose();
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker");
+        }
+        root.dispose_all().expect("cleanup");
+
+        use std::collections::HashMap;
+        let mut per_fiber: HashMap<u64, Vec<LifecycleEvent>> = HashMap::new();
+        for event in events.lock().unwrap().iter().cloned() {
+            per_fiber.entry(event.fiber_id).or_default().push(event);
+        }
+        for (fiber_id, mut chain) in per_fiber {
+            chain.sort_by_key(|event| event.seq);
+            for pair in chain.windows(2) {
+                assert_eq!(
+                    pair[0].to, pair[1].from,
+                    "fiber {fiber_id}: seq-sorted chain broken: {pair:?}"
+                );
+                assert_ne!(pair[0].from, pair[0].to, "no-op transition broadcast");
+            }
+        }
     });
 }

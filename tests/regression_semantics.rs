@@ -1886,3 +1886,101 @@ fn f4_cancelled_recovery_does_not_latch_the_next_when_idle() {
     );
     cascade.root.dispose_all().expect("cleanup");
 }
+
+// ---------------------------------------------------------------------------
+// XT-02: refresh-driven unloads are serialized with lifecycle ops, and an
+// activation never publishes `Active` when an injected service was withdrawn
+// while `apply` ran.
+// ---------------------------------------------------------------------------
+
+static XT02_SERVICE: ServiceKey<u32> = ServiceKey::new("xt02.service");
+
+struct Xt02Provider {
+    self_handle: Arc<Mutex<Option<Fiber>>>,
+}
+
+impl Plugin for Xt02Provider {
+    fn name(&self) -> &'static str {
+        "xt02-provider"
+    }
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        ctx.provide(XT02_SERVICE, Arc::new(7u32))?;
+        *self.self_handle.lock().unwrap() = Some(ctx.fiber());
+        Ok(())
+    }
+}
+
+struct Xt02Consumer {
+    provider: Arc<Mutex<Option<Fiber>>>,
+    applies: Arc<AtomicUsize>,
+}
+
+impl Plugin for Xt02Consumer {
+    fn name(&self) -> &'static str {
+        "xt02-consumer"
+    }
+    fn inject(&self) -> &'static [&'static str] {
+        &["xt02.service"]
+    }
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        assert!(
+            ctx.get(XT02_SERVICE).is_some(),
+            "consumer injected dependency"
+        );
+        self.applies.fetch_add(1, Ordering::SeqCst);
+        // Withdraw the provider *during* the consumer's activation: after this
+        // apply returns, the dependency is gone and the activation must not
+        // publish `Active`.
+        if let Some(provider) = self.provider.lock().unwrap().take() {
+            provider.dispose().expect("provider dispose");
+        }
+        Ok(())
+    }
+}
+
+/// XT-02 regression: a dependency withdrawn while the consumer's `apply` runs
+/// must roll the activation back to `Pending` instead of publishing `Active`
+/// with a missing injected service.
+#[test]
+fn xt02_activation_rolls_back_when_injection_is_withdrawn_mid_apply() {
+    let root = Context::root();
+    let provider_slot: Arc<Mutex<Option<Fiber>>> = Arc::new(Mutex::new(None));
+    let applies = Arc::new(AtomicUsize::new(0));
+
+    let provider = root
+        .plugin(
+            Arc::new(Xt02Provider {
+                self_handle: provider_slot.clone(),
+            }),
+            Value::Null,
+        )
+        .expect("provider");
+    assert_eq!(provider.state(), FiberState::Active);
+    assert!(root.get(XT02_SERVICE).is_some());
+
+    let consumer = root
+        .plugin(
+            Arc::new(Xt02Consumer {
+                provider: provider_slot.clone(),
+                applies: applies.clone(),
+            }),
+            Value::Null,
+        )
+        .expect("consumer");
+
+    assert_eq!(
+        applies.load(Ordering::SeqCst),
+        1,
+        "consumer applied exactly once"
+    );
+    assert_eq!(
+        consumer.state(),
+        FiberState::Pending,
+        "XT-02: activation must roll back to Pending when an injected service disappears mid-apply"
+    );
+    assert!(
+        root.get(XT02_SERVICE).is_none(),
+        "provider withdrawal removed the service"
+    );
+    root.dispose_all().expect("cleanup");
+}

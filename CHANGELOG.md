@@ -5,6 +5,44 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **XT-01：`FiberData::drop` 不再用默认 thread-park `block_on` 排空 async cleanup**。此前在
+  tokio `current_thread` 等单线程 runtime 上，取消 `dispose_async()` 后 drop 最后一个 `Fiber`
+  句柄会死等 reactor 上的 deferred cleanup（永久挂起）。现在 Drop 只执行同步 cleanup；只有在
+  embedder 通过 `exec::set_blocking_executor` 显式安装执行器时才排空异步 cleanup，否则跳过并记录
+  `tracing::error!`（资源可能泄漏，但不会挂死线程）。回归：
+  `regression_core::xt01_dropping_a_fiber_with_deferred_reactor_cleanups_does_not_hang`。
+- **XT-02：refresh 卸载与生命周期操作串行化；激活结束前重新校验 `inject` 依赖**。
+  此前 refresh 触发的卸载不占 per-fiber lifecycle 槽，与用户 `restart`/`update` 竞争时
+  consumer 可能在注入服务缺失时被激活、`restart` 返回 `InactiveEffect` 而非
+  `LifecycleBusy`。现在 `unload_contained(_async)` claim lifecycle 槽（busy 则跳过并留待
+  下次 refresh），且 `apply`/`apply_async` 返回后若依赖已消失则回滚本次激活并回到
+  `Pending`。回归：`regression_semantics::xt02_activation_rolls_back_when_injection_is_withdrawn_mid_apply`。
+- **XT-03/XT-08：`on_lifecycle` 事件改为锁内迁移快照 + 每 fiber 单调 `seq`**。此前
+  `LifecycleEvent.to` 在 hook 执行时现读 `fiber.state()`，并发/重入迁移下会出现
+  `from == to`、`Pending -> Disposed` 之类的不自洽事件。现在 `transition()` 在状态锁内
+  捕获 `(from, to, seq)`，`LifecycleEvent` 新增 `seq: u64`；并发投递仍可能交错，按
+  `(fiber_id, seq)` 排序即可还原迁移链。回归：
+  `regression_core::xt03_lifecycle_event_carries_the_transition_snapshot` /
+  `xt03_lifecycle_events_sorted_by_seq_form_a_valid_chain`。
+- **XT-09：`LogLevel::from_u8` 对 >3 的值 clamp 到 `Error`**（此前映射到最宽的
+  `Debug`，与配置路径 `{"level":99}` 的 fail-closed clamp 相反）。回归：
+  `logger::xt09_from_u8_clamps_unknown_levels_to_error`。
+
+### Docs
+
+- `README.md` / `docs/CORDIS-RUST.md` 记录 Fiber Drop 的 XT-01 语义与 trade-off。
+- `spec/CORDIS-CORE.md` 明确 `Registry::replace`/`replace_async` 的 activation 失败语义（XT-05）：
+  `Ok` 不代表 `Active`，失败被 containment 到 fiber（`Failed`），旧实现/服务不会自动恢复；
+  只有 lifecycle 拒绝（`LifecycleBusy`）或 validation 错误才走完整回滚。
+- `spec/CORDIS-CORE.md` / `docs/CORDIS-RUST.md` 记录 `on_async*` 绕过 `internal/listener`
+  hook、async lane 无 `once`/`global` 的设计边界（XT-06）。
+- `spec/CORDIS-CORE.md` / `docs/GUIDE.md` 记录 `ctx.set` 每次写留一个逆 effect 的线性成本
+  （XT-07：高频写入建议原地修改服务，`set` 留给配置式变更）。
+- `spec/CORDIS-CORE.md` 补充 `MAX_PLUGIN_DEPTH` 的实测含义（XT-11：超深依赖链在加载期被截断，
+  如 300 层链只有 255 层 cleanup 运行）。
+
 ## [0.5.0] - 2026-10-29
 
 **内核 API 收敛 + 新扩展点 + 性能闭环（minor）**：本版按 SemVer 的 `0.y` 规则做了一次

@@ -204,6 +204,10 @@ pub(crate) struct FiberData {
     /// Generation counter of activation attempts; a stale attempt must not
     /// transition or roll back a newer one.
     pub(crate) activation_epoch: AtomicU64,
+    /// Monotonic per-fiber sequence of state transitions (XT-03): lifecycle
+    /// broadcasts carry it so observers can order events per fiber even when
+    /// delivery is interleaved by concurrent threads.
+    pub(crate) status_seq: AtomicU64,
     /// Token of the thread currently running a lifecycle operation (0 = idle).
     pub(crate) lifecycle_owner: AtomicU64,
     /// Reentrancy depth of the owning thread.
@@ -246,24 +250,63 @@ impl Drop for FiberData {
         // A fiber dropped without an explicit dispose must not leak its
         // registrations. Cleanups are arbitrary embedder code: never unwind
         // from Drop and never block while the thread is unwinding.
+        //
+        // XT-01: async cleanups must not be drained through the default
+        // thread-park `block_on` from `Drop`. A reactor-backed cleanup cannot
+        // make progress while that thread is parked (e.g. tokio
+        // `current_thread`), so a cancelled disposal followed by dropping the
+        // last handle would deadlock. Only an explicitly installed
+        // `BlockingExecutor` (the embedder opted into blocking disposal) may
+        // run async cleanups here; otherwise they are skipped with a loud
+        // error. This deliberately trades a resource leak for not hanging the
+        // caller's thread.
         let effects = std::mem::take(&mut self.effects);
         let deferred = std::mem::take(&mut self.deferred_async);
         let panicking = std::thread::panicking();
+        let allow_blocking = !panicking && crate::exec::has_blocking_executor();
+        let mut skipped_async = 0usize;
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            if panicking {
-                for effect in effects.into_iter().rev() {
-                    if let EffectKind::Sync(disposer) = effect.kind {
+            for effect in effects.into_iter().rev() {
+                match effect.kind {
+                    EffectKind::Sync(disposer) => {
                         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             disposer.dispose()
                         }));
                     }
+                    EffectKind::Async(disposer) => {
+                        if allow_blocking {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                disposer.dispose_blocking()
+                            }));
+                        } else {
+                            // Leak intentionally: dropping the disposer here would
+                            // run its own blocking `Drop` safety net and deadlock
+                            // again (XT-01).
+                            skipped_async += 1;
+                            std::mem::forget(disposer);
+                        }
+                    }
                 }
+            }
+            for disposer in deferred {
+                if allow_blocking {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        disposer.dispose_blocking()
+                    }));
+                } else {
+                    skipped_async += 1;
+                    std::mem::forget(disposer);
+                }
+            }
+            if skipped_async > 0 {
                 tracing::error!(
                     target: "zeokeel_cordis::fiber",
-                    "fiber dropped during unwinding; async cleanups were not run"
+                    skipped_async,
+                    panicking,
+                    "fiber dropped without an explicit dispose: {skipped_async} async cleanup(s) were skipped \
+                     to avoid blocking the thread; install exec::set_blocking_executor, or call \
+                     dispose()/dispose_async() explicitly"
                 );
-            } else {
-                let _ = drain_effects_blocking(effects, deferred);
             }
         }));
     }
@@ -1034,7 +1077,7 @@ pub(crate) fn dependencies_satisfied(
 ///
 /// No-op when the state does not change (Cordis only emits on transitions).
 pub(crate) fn transition(data: &FiberRef, next: FiberState) {
-    let (old, ctx) = match data.lock() {
+    let (old, ctx, seq) = match data.lock() {
         Ok(mut fiber) => {
             if fiber.state == next {
                 return;
@@ -1046,14 +1089,23 @@ pub(crate) fn transition(data: &FiberRef, next: FiberState) {
                 return;
             }
             let old = fiber.state;
+            let seq = fiber.status_seq.fetch_add(1, Ordering::SeqCst);
             fiber.state = next;
-            (old, fiber.ctx_ref())
+            (old, fiber.ctx_ref(), seq)
         }
         Err(_) => return,
     };
     if let Some(ctx) = ctx {
         let fiber = Fiber { data: data.clone() };
         ctx.events().internal().emit_status(&fiber, old);
+        // XT-03/XT-08: deliver the lifecycle broadcast with the transition
+        // snapshot captured under the state lock, so `from`/`to` can never
+        // disagree with the actual transition even if a nested/reentrant
+        // transition (or another thread) moves the fiber further before the
+        // listener runs.
+        ctx.events()
+            .internal()
+            .emit_lifecycle(&fiber, old, next, seq);
     }
     // Notify through the stored registry: a disposed fiber has no context link
     // left, but quiescence must still observe the transition.
@@ -1975,6 +2027,16 @@ pub(crate) fn activate_fiber(
                 discard_activation_effects(data, ctx);
                 return Ok(());
             }
+            // XT-02: a provider may unload while `apply` runs. Do not publish
+            // `Active` for a fiber whose injected services disappeared mid
+            // activation; roll this attempt back and stay `Pending` so the
+            // next refresh can reactivate against a live provider.
+            if !dependencies_ready(ctx, plugin.inject()) {
+                discard_activation_effects(data, ctx);
+                transition(data, FiberState::Pending);
+                ctx.refresh_dependents();
+                return Ok(());
+            }
             record_dep_versions(data, ctx, plugin.inject());
             transition(data, FiberState::Active);
             ctx.refresh_dependents();
@@ -2097,6 +2159,14 @@ pub(crate) async fn activate_fiber_async(
             }
             if activation_invalidated(data) {
                 discard_activation_effects_async(data, ctx).await;
+                return Ok(());
+            }
+            // XT-02: see the synchronous path — never publish `Active` when an
+            // injected service disappeared while `apply_async` ran.
+            if !dependencies_ready(ctx, plugin.inject()) {
+                discard_activation_effects_async(data, ctx).await;
+                transition(data, FiberState::Pending);
+                ctx.refresh_dependents();
                 return Ok(());
             }
             record_dep_versions(data, ctx, plugin.inject());
@@ -3236,18 +3306,22 @@ pub(crate) async fn unload_fiber_async(data: &FiberRef, target: FiberState) -> R
 /// stuck in `Unloading` and `when_idle` blocked forever). The panic is logged
 /// and returned so the caller can re-raise it at a point where the fiber state
 /// is already final.
-pub(crate) fn unload_contained(
-    data: &FiberRef,
-    target: FiberState,
-) -> Option<crate::exec::PanicPayload> {
+pub(crate) fn unload_contained(data: &FiberRef, target: FiberState) -> bool {
+    // XT-02: refresh-driven unloads must serialize with user lifecycle
+    // operations. Without the slot, a refresh unload could race a concurrent
+    // restart/update and leave the fiber's state machine in a torn phase (a
+    // user restart then observed `InactiveEffect` instead of `LifecycleBusy`).
+    // If the fiber is busy, skip it this round; a later refresh retries.
+    let Ok(_lifecycle) = begin_lifecycle(data) else {
+        return false;
+    };
     match catch_unwind(AssertUnwindSafe(|| unload_fiber(data, target))) {
-        Ok(Ok(())) => None,
+        Ok(Ok(())) => {}
         Ok(Err(error)) => {
             tracing::error!(
                 target: "zeokeel_cordis::fiber",
                 "contained unload failed: {error}"
             );
-            None
         }
         Err(payload) => {
             tracing::error!(
@@ -3255,26 +3329,28 @@ pub(crate) fn unload_contained(
                 "cleanup panicked during contained unload: {}",
                 panic_message(payload.as_ref())
             );
-            Some(payload)
         }
     }
+    true
 }
 
 /// Awaiting counterpart of [`unload_contained`] for the async refresh path.
-pub(crate) async fn unload_contained_async(
-    data: &FiberRef,
-    target: FiberState,
-) -> Option<crate::exec::PanicPayload> {
+pub(crate) async fn unload_contained_async(data: &FiberRef, target: FiberState) -> bool {
+    // XT-02: same lifecycle serialization as the synchronous path. The guard
+    // is held across the await so a concurrent user lifecycle call observes
+    // `LifecycleBusy` instead of racing the unload.
+    let Ok(_lifecycle) = begin_lifecycle(data) else {
+        return false;
+    };
     match futures_util::FutureExt::catch_unwind(AssertUnwindSafe(unload_fiber_async(data, target)))
         .await
     {
-        Ok(Ok(())) => None,
+        Ok(Ok(())) => {}
         Ok(Err(error)) => {
             tracing::error!(
                 target: "zeokeel_cordis::fiber",
                 "contained async unload failed: {error}"
             );
-            None
         }
         Err(payload) => {
             tracing::error!(
@@ -3282,9 +3358,9 @@ pub(crate) async fn unload_contained_async(
                 "cleanup panicked during contained async unload: {}",
                 panic_message(payload.as_ref())
             );
-            Some(payload)
         }
     }
+    true
 }
 
 /// Completes the teardown when the unload future is dropped mid-await (A-2/A-9).
@@ -3638,6 +3714,7 @@ mod regression_tests {
             clock: Arc::new(crate::clock::SystemClock),
             last_activity_ms: AtomicU64::new(0),
             activation_epoch: AtomicU64::new(0),
+            status_seq: AtomicU64::new(0),
             lifecycle_owner: AtomicU64::new(0),
             lifecycle_depth: AtomicUsize::new(0),
             pending_ops: AtomicUsize::new(0),
