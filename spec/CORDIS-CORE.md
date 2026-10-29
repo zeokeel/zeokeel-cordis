@@ -403,8 +403,12 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   `is_idle()`/`when_idle()` when a consistent view is required.
 - **Shutdown helper (v0.3.0, panic priority v0.4.2)**: `Context::dispose_all()` /
   `Registry::dispose_all()` dispose every registered fiber and the root fiber,
-  collecting the first cleanup error after attempting all of them; after it
-  returns the registry is empty and `is_idle()` is true. This is the supported
+  collecting the first cleanup error after attempting all of them. **On
+  `Ok`** the registry is empty and `is_idle()` is true. If a fiber's lifecycle
+  operation is busy during the attempt, the call stops that fiber with the first
+  error (`Err(LifecycleBusy)`) after attempting the others; the busy fiber may
+  leave the registry non-empty or non-idle, so the caller must retry after its
+  lifecycle operation finishes (XT-10). This is the supported
   shutdown path (dispose+drop is the only path that reclaims the graph; a
   never-disposed fiber keeps its context/plugin graph alive) (CORE-051). When a
   cleanup **panics** and another fiber also returns an error, the panic wins: the
@@ -428,6 +432,11 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   nothing, so the window is non-idle for every observer). **Boundary:** two
   threads whose registrations mutually await each other's window can still
   deadlock; the kernel does not detect cyclic registration dependencies.
+  **The exemption covers only the `internal/plugin` create hook** (XT-04): while
+  `apply`/`apply_async` runs, the fiber's own activation is an in-flight
+  fiber-level operation (`pending_ops > 0`), so synchronously awaiting
+  `when_idle()` from activation code waits for itself. Do not block on
+  quiescence inside `apply`/`apply_async`; external waiters are unaffected.
 - **Cancelled-cascade recovery (v0.4.3, F1/F4/F5)**: a cancelled async unload
   cascade may temporarily park non-root dependents in `Unloading`.
   - **Recovery entries (F1)**: `Registry::when_idle()`/`Context::when_idle()`,
