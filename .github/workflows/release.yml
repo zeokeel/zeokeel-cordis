@@ -7,9 +7,11 @@ on:
       - "v*"
 
 # `contents: write` is needed to attach the checksums to the GitHub release
-# after a successful crates.io publish.
+# after a successful crates.io publish; `actions: read` lets the workflow query
+# the CI result for the exact commit before publishing.
 permissions:
   contents: write
+  actions: read
 
 # Never run two publishes for the same ref at once.
 concurrency:
@@ -75,6 +77,29 @@ jobs:
               exit 1
               ;;
           esac
+      # A tag must never publish a commit whose independent CI is red or still
+      # running: this is the exact failure mode that released 0.5.1 from a
+      # commit whose CI later failed on a flaky test. The check queries the
+      # `ci.yml` results for this exact SHA and requires the latest completed
+      # run to be a success.
+      - name: require green CI for this commit
+        if: steps.existing.outputs.already != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha="${GITHUB_SHA}"
+          runs=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?head_sha=${sha}&per_page=100")
+          conclusion=$(printf '%s' "$runs" | jq -r --arg sha "$sha" '
+            [.workflow_runs[]
+             | select(.head_sha==$sha and .status=="completed")
+             | select(.event=="push" and .head_branch=="main")]
+            | sort_by(.run_number) | last | .conclusion // "missing"')
+          echo "ci.yml latest completed run for ${sha}: ${conclusion}"
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::CI for ${sha} is '${conclusion}', not success; push main and wait for CI to finish before tagging (see CONTRIBUTING)."
+            exit 1
+          fi
+
       - name: fmt
         run: cargo fmt --all -- --check
       - name: clippy

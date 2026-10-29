@@ -192,14 +192,17 @@ fiber、effect、events、registry、config schema 机制、exec 桥、logger �
 
 0. **先 push `main` 并等 CI 全绿**（含 cross-platform / coverage / Miri / cargo-deny /
    actionlint / MSRV-clippy）：发布 workflow 只重复核心硬门禁，其余平台与工具门禁以
-   `main` 的 CI 结果为准，tag 前不得跳过；
+   `main` 的 CI 结果为准，tag 前不得跳过。release workflow 会在 publish 前查询**同 SHA
+   的 `ci.yml` 运行结果**，非 success 直接失败（0.6.0 起强制）；
 1. 更新 `Cargo.toml` 的 `version` 与 `CHANGELOG.md`（把 `Unreleased` 移到对应版本段），
    提交为 `chore(release): X.Y.Z`，并确认 `Cargo.lock` 已随提交更新；
 2. 本地跑一遍与发布流水线等价的门禁（全部带 `--locked`，命令见上节「构建与测试」）：
    fmt、两种 feature 配置的 clippy/test、两种 doc 配置、examples 构建与冒烟、
    `cargo package --locked`（真实打包并 verify）、`cargo publish --dry-run --locked`
    （不上传）；
-3. 打 tag 并推送：`git tag -a vX.Y.Z -m "Cordis vX.Y.Z"` + `git push origin main --tags`；
+3. **确认第 0 步的 CI 已绿后**，再单独打 tag 并推送：
+   `git tag -a vX.Y.Z -m "Cordis vX.Y.Z"` + `git push origin vX.Y.Z`
+   （不要用 `git push origin main --tags`：main push 与 tag 同推会让 release 在 CI 完成前触发）；
 4. `release.yml` 会依次执行：
    - 校验发布来源必须是 tag、且 **tag 版本 == `Cargo.toml` version**（不一致直接失败）；
    - 重跑 fmt / clippy（两种 feature 配置）/ test（两种 feature 配置）/ doc（默认与
