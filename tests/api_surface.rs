@@ -711,10 +711,15 @@ fn api_logger_facade_snapshots_the_clock() {
         .expect("root installs the clock");
 
     // The old facade keeps its snapshot; a new facade uses the injected clock.
-    assert_eq!(
-        old_facade.clock().now_unix_ms(),
-        old_clock_before,
-        "an existing facade keeps its clock snapshot"
+    // SystemClock is a live wall clock, so compare behaviourally (it must not
+    // switch to the injected test clock) instead of requiring an identical
+    // millisecond timestamp — that assertion was timing-flaky on CI.
+    let old_clock_after = old_facade.clock().now_unix_ms();
+    assert!(
+        old_clock_after >= old_clock_before && old_clock_after != 1_234_567_890_000,
+        "an existing facade keeps its clock snapshot: before={before}, after={after}",
+        before = old_clock_before,
+        after = old_clock_after,
     );
     let new_facade = root.logger();
     assert_eq!(new_facade.clock().now_unix_ms(), 1_234_567_890_000);
