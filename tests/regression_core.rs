@@ -3957,3 +3957,455 @@ fn xt03_lifecycle_events_sorted_by_seq_form_a_valid_chain() {
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// 0.6.0 P2-A: lifecycle ownership is per-operation (async-migration safe)
+// ---------------------------------------------------------------------------
+
+static P2A_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+struct P2aProvider {
+    svc: &'static str,
+}
+
+impl Plugin for P2aProvider {
+    fn name(&self) -> &'static str {
+        "p2a-provider"
+    }
+
+    fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+        ctx.provide_checked(ServiceKey::new(self.svc), Arc::new(1u32), || true)?;
+        Ok(())
+    }
+}
+
+/// Async consumer that parks its cleanup on `latch`, then calls
+/// `fiber.dispose()` reentrantly (the audited "migrated cleanup" scenario).
+struct P2aConsumer {
+    deps: &'static [&'static str],
+    latch: Arc<AsyncLatch>,
+    logs: Arc<Mutex<Vec<String>>>,
+    runs: Arc<AtomicUsize>,
+}
+
+impl zeokeel_cordis::AsyncPlugin for P2aConsumer {
+    fn name(&self) -> &'static str {
+        "p2a-consumer"
+    }
+
+    fn inject(&self) -> &'static [&'static str] {
+        self.deps
+    }
+
+    fn apply_async<'a>(
+        &'a self,
+        ctx: Context,
+        _config: Value,
+    ) -> zeokeel_cordis::BoxFuture<'a, Result<()>> {
+        let latch = self.latch.clone();
+        let logs = self.logs.clone();
+        let runs = self.runs.clone();
+        let ctx_for_cleanup = ctx.clone();
+        Box::pin(async move {
+            ctx.effect_async_labeled("p2a-cleanup", move || {
+                vec![zeokeel_cordis::cleanup_async(move || {
+                    let latch = latch.clone();
+                    let logs = logs.clone();
+                    let runs = runs.clone();
+                    let fiber = ctx_for_cleanup.fiber();
+                    async move {
+                        latch.wait().await;
+                        let dispose_result = fiber.dispose();
+                        logs.lock().unwrap().push(format!(
+                            "cleanup on {:?} dispose -> {dispose_result:?}",
+                            std::thread::current().id()
+                        ));
+                        runs.fetch_add(1, Ordering::SeqCst);
+                    }
+                })]
+            })?;
+            Ok(())
+        })
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn p2a_fixture() -> (
+    Context,
+    Fiber,
+    Arc<AsyncLatch>,
+    Arc<Mutex<Vec<String>>>,
+    Arc<AtomicUsize>,
+) {
+    let root = Context::root();
+    let svc: &'static str =
+        Box::leak(format!("p2a.svc.{}", P2A_SEQ.fetch_add(1, Ordering::SeqCst)).into_boxed_str());
+    let provider = root
+        .plugin(Arc::new(P2aProvider { svc }), Value::Null)
+        .expect("provider");
+    let latch = Arc::new(AsyncLatch::default());
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let consumer = block_on(root.plugin_async(
+        Arc::new(P2aConsumer {
+            deps: Box::leak(vec![svc].into_boxed_slice()),
+            latch: latch.clone(),
+            logs: logs.clone(),
+            runs: runs.clone(),
+        }),
+        Value::Null,
+    ))
+    .expect("async consumer");
+    assert_eq!(consumer.state(), FiberState::Active);
+    // The synchronous refresh skips async fibers, so the consumer stays
+    // Active-unready until `refresh_async` unloads it (audited setup).
+    provider.dispose().expect("provider dispose");
+    assert_eq!(consumer.state(), FiberState::Active);
+    (root, consumer, latch, logs, runs)
+}
+
+/// P2-A: a reentrant `dispose()` from inside an async cleanup returns `Ok`
+/// regardless of which thread polls the migrated unload future, exactly like the
+/// same-thread control run.
+#[test]
+fn p2a_migrated_cleanup_reentrant_dispose_matches_same_thread() {
+    watchdog("p2a-migrated", Duration::from_secs(60), || {
+        // ---- control: the whole refresh future is polled on one thread ----
+        let (root, consumer, latch, logs, runs) = p2a_fixture();
+        let mut refresh = Box::pin({
+            let root = root.clone();
+            async move { root.refresh_async().await }
+        });
+        assert!(
+            poll_once_pin(refresh.as_mut()).is_pending(),
+            "the refresh unload parks on the gated async cleanup"
+        );
+        latch.open();
+        block_on(refresh);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(
+            logs.lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("dispose -> Ok")),
+            "same-thread control: reentrant dispose must be Ok, logs={:?}",
+            logs.lock().unwrap()
+        );
+        assert_ne!(consumer.state(), FiberState::Active);
+        let _ = consumer.dispose();
+        let _ = root.dispose_all();
+
+        // ---- migrated: poll once on this thread, finish on another ----
+        let (root, consumer, latch, logs, runs) = p2a_fixture();
+        let mut refresh = Box::pin({
+            let root = root.clone();
+            async move { root.refresh_async().await }
+        });
+        assert!(poll_once_pin(refresh.as_mut()).is_pending());
+        std::thread::scope(|scope| {
+            let mover = scope.spawn(move || block_on(refresh));
+            latch.open();
+            mover.join().expect("migration thread");
+        });
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(
+            logs.lock()
+                .unwrap()
+                .iter()
+                .any(|line| line.contains("dispose -> Ok")),
+            "migrated cleanup: reentrant dispose must be Ok on any poll thread, logs={:?}",
+            logs.lock().unwrap()
+        );
+        assert_ne!(consumer.state(), FiberState::Active);
+        // The operation token must be released on the migration thread: a later
+        // lifecycle call from the original thread is not stale-blocked.
+        assert!(
+            consumer.dispose().is_ok(),
+            "late dispose after migrated refresh must not be blocked by a stale owner"
+        );
+        let _ = root.dispose_all();
+    });
+}
+
+/// P2-A: while an async refresh unload is suspended, *any* concurrent lifecycle
+/// call (same thread as the original poller, or an external thread) is
+/// `LifecycleBusy` — never a false reentrant `Ok` / `InactiveEffect`.
+#[test]
+fn p2a_inflight_async_unload_reports_lifecycle_busy() {
+    watchdog("p2a-busy", Duration::from_secs(60), || {
+        let (root, consumer, latch, _logs, runs) = p2a_fixture();
+        let mut refresh = Box::pin({
+            let root = root.clone();
+            async move { root.refresh_async().await }
+        });
+        assert!(poll_once_pin(refresh.as_mut()).is_pending());
+
+        // Same thread that started the operation (audited false-reentrant case).
+        assert!(
+            matches!(consumer.dispose(), Err(CordisError::LifecycleBusy)),
+            "dispose from the original poller thread during a suspended unload must be LifecycleBusy"
+        );
+        assert!(
+            matches!(consumer.restart(), Err(CordisError::LifecycleBusy)),
+            "restart during a suspended unload must be LifecycleBusy (not InactiveEffect)"
+        );
+        // External thread: same answer.
+        let external = {
+            let consumer = consumer.clone();
+            std::thread::spawn(move || consumer.dispose())
+        };
+        assert!(
+            matches!(
+                external.join().expect("external thread"),
+                Err(CordisError::LifecycleBusy)
+            ),
+            "external dispose during a suspended unload must be LifecycleBusy"
+        );
+
+        latch.open();
+        block_on(refresh);
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "cleanup runs exactly once");
+        assert_ne!(consumer.state(), FiberState::Active);
+        assert!(consumer.dispose().is_ok(), "late dispose succeeds");
+        let _ = root.dispose_all();
+    });
+}
+
+/// P3 (XT-02): a refresh-driven unload is lifecycle work, so `settled()` stays
+/// pending while it runs and resolves once it finished.
+#[test]
+fn awaiting_settled_observes_refresh_unload() {
+    watchdog("p3-settled", Duration::from_secs(60), || {
+        let (root, consumer, latch, _logs, _runs) = p2a_fixture();
+        let mut refresh = Box::pin({
+            let root = root.clone();
+            async move { root.refresh_async().await }
+        });
+        assert!(poll_once_pin(refresh.as_mut()).is_pending());
+
+        let mut settled = Box::pin(consumer.settled());
+        assert!(
+            poll_once_pin(settled.as_mut()).is_pending(),
+            "settled() must observe the in-flight refresh unload"
+        );
+
+        latch.open();
+        block_on(refresh);
+        assert!(
+            poll_once_pin(settled.as_mut()).is_ready(),
+            "settled() resolves after the refresh unload completed"
+        );
+        assert_ne!(consumer.state(), FiberState::Active);
+        let _ = root.dispose_all();
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 0.6.0 XT-02: async activation whose injected service disappears mid-apply must
+// roll this attempt back to Pending (epoch-precise) instead of publishing Active.
+// ---------------------------------------------------------------------------
+
+struct Xt02SlowAsync {
+    latch: Arc<AsyncLatch>,
+}
+
+impl zeokeel_cordis::AsyncPlugin for Xt02SlowAsync {
+    fn name(&self) -> &'static str {
+        "xt02-slow-async"
+    }
+
+    fn inject(&self) -> &'static [&'static str] {
+        &["xt02-slow.provided"]
+    }
+
+    fn apply_async<'a>(
+        &'a self,
+        _ctx: Context,
+        _config: Value,
+    ) -> zeokeel_cordis::BoxFuture<'a, Result<()>> {
+        let latch = self.latch.clone();
+        Box::pin(async move {
+            latch.wait().await;
+            Ok(())
+        })
+    }
+}
+
+#[test]
+fn xt02_activation_dependency_lost_rolls_back_to_pending() {
+    watchdog("xt02-rollback", Duration::from_secs(60), || {
+        struct Xt02Provider;
+        impl Plugin for Xt02Provider {
+            fn name(&self) -> &'static str {
+                "xt02-slow-provider"
+            }
+            fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+                ctx.provide_checked(
+                    ServiceKey::new("xt02-slow.provided"),
+                    Arc::new(1u32),
+                    || true,
+                )?;
+                Ok(())
+            }
+        }
+        let root = Context::root();
+        let provider = root
+            .plugin(Arc::new(Xt02Provider), Value::Null)
+            .expect("provider");
+        let latch = Arc::new(AsyncLatch::default());
+        let activation_latch = latch.clone();
+        let mut activation = Box::pin({
+            let root = root.clone();
+            async move {
+                root.plugin_async(
+                    Arc::new(Xt02SlowAsync {
+                        latch: activation_latch,
+                    }),
+                    Value::Null,
+                )
+                .await
+            }
+        });
+        assert!(
+            poll_once_pin(activation.as_mut()).is_pending(),
+            "activation parks inside apply_async"
+        );
+        // The provider disappears while the activation body is suspended.
+        provider.dispose().expect("provider dispose");
+        latch.open();
+        let fiber = block_on(activation).expect("activation future completes");
+        assert_eq!(
+            fiber.state(),
+            FiberState::Pending,
+            "XT-02: an activation that lost its provider must roll back to Pending"
+        );
+        assert!(
+            fiber.get_effects().is_empty(),
+            "XT-02: this attempt's effects must be rolled back (epoch-precise)"
+        );
+        // The rolled-back fiber remains disposable and the registry drains.
+        assert!(fiber.dispose().is_ok());
+        let _ = root.dispose_all();
+    });
+}
+
+// ---------------------------------------------------------------------------
+// E P3-2: XT-02 rollback owns its cleanup — attempt-tagged listener and child
+// ownership effects are drained, so no orphaned child/listener survives a
+// dependency-lost rollback to Pending.
+// ---------------------------------------------------------------------------
+
+struct Xt02ChildRollback {
+    latch: Arc<AsyncLatch>,
+    child_slot: Arc<Mutex<Option<Fiber>>>,
+}
+
+impl zeokeel_cordis::AsyncPlugin for Xt02ChildRollback {
+    fn name(&self) -> &'static str {
+        "xt02-child-rollback"
+    }
+
+    fn inject(&self) -> &'static [&'static str] {
+        &["xt02-child.provided"]
+    }
+
+    fn apply_async<'a>(
+        &'a self,
+        ctx: Context,
+        _config: Value,
+    ) -> zeokeel_cordis::BoxFuture<'a, Result<()>> {
+        let latch = self.latch.clone();
+        let child_slot = self.child_slot.clone();
+        Box::pin(async move {
+            let child = ctx.plugin(
+                Arc::new(P2aProvider {
+                    svc: "xt02-child.inner",
+                }),
+                Value::Null,
+            )?;
+            *child_slot.lock().unwrap() = Some(child);
+            ctx.on("xt02-child.evt", |_args| {
+                zeokeel_cordis::EventResult::Continue
+            })?;
+            latch.wait().await;
+            Ok(())
+        })
+    }
+}
+
+#[test]
+fn xt02_rollback_releases_child_ownership_and_listeners() {
+    watchdog("xt02-ownership", Duration::from_secs(60), || {
+        struct Xt02ChildProvider;
+        impl Plugin for Xt02ChildProvider {
+            fn name(&self) -> &'static str {
+                "xt02-child-provider"
+            }
+            fn apply(&self, ctx: Context, _config: Value) -> Result<()> {
+                ctx.provide_checked(
+                    ServiceKey::new("xt02-child.provided"),
+                    Arc::new(1u32),
+                    || true,
+                )?;
+                Ok(())
+            }
+        }
+        let root = Context::root();
+        let provider = root
+            .plugin(Arc::new(Xt02ChildProvider), Value::Null)
+            .expect("provider");
+        let latch = Arc::new(AsyncLatch::default());
+        let child_slot = Arc::new(Mutex::new(None));
+        let mut activation = Box::pin({
+            let root = root.clone();
+            let latch = latch.clone();
+            let child_slot = child_slot.clone();
+            async move {
+                root.plugin_async(
+                    Arc::new(Xt02ChildRollback { latch, child_slot }),
+                    Value::Null,
+                )
+                .await
+            }
+        });
+        assert!(poll_once_pin(activation.as_mut()).is_pending());
+        // Both the child fiber and the listener were created by this attempt.
+        let child = child_slot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("child created by the attempt");
+        assert_eq!(child.state(), FiberState::Active);
+        assert_eq!(
+            root.events().listener_count(),
+            1,
+            "the attempt registered one listener"
+        );
+
+        // Lose the provider while `apply_async` is suspended -> rollback.
+        provider.dispose().expect("provider dispose");
+        latch.open();
+        let fiber = block_on(activation).expect("activation completes");
+        assert_eq!(
+            fiber.state(),
+            FiberState::Pending,
+            "dependency lost mid-activation rolls back to Pending"
+        );
+        assert!(
+            fiber.get_effects().is_empty(),
+            "this attempt's effects (listener + child ownership) are drained"
+        );
+        assert_eq!(
+            child.state(),
+            FiberState::Disposed,
+            "the attempt's child ownership effect disposes the child on rollback"
+        );
+        assert_eq!(
+            root.events().listener_count(),
+            0,
+            "the attempt's listener is removed by its own disposer"
+        );
+        assert!(fiber.dispose().is_ok());
+        let _ = root.dispose_all();
+    });
+}

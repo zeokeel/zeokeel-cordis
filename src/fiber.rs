@@ -251,6 +251,14 @@ impl Drop for FiberData {
         // registrations. Cleanups are arbitrary embedder code: never unwind
         // from Drop and never block while the thread is unwinding.
         //
+        // E P3-6: the child-*ownership* effects created by `ctx.plugin` are
+        // async effects, so when this fiber is dropped without an explicit
+        // dispose and no blocking executor is installed, they are handed to the
+        // orphan queue together with the other skipped async cleanups: child
+        // fibers are therefore released when the embedder drains the orphans
+        // (`exec::drain_orphan_async_cleanups()`), not synchronously in this
+        // `Drop`.
+        //
         // XT-01: async cleanups must not be drained through the default
         // thread-park `block_on` from `Drop`. A reactor-backed cleanup cannot
         // make progress while that thread is parked (e.g. tokio
@@ -263,6 +271,9 @@ impl Drop for FiberData {
         let effects = std::mem::take(&mut self.effects);
         let deferred = std::mem::take(&mut self.deferred_async);
         let panicking = std::thread::panicking();
+        // While the thread is unwinding, even an installed blocking executor is
+        // bypassed for async cleanups (only sync cleanups run): blocking inside
+        // `Drop` during unwind can re-enter or deadlock the panicking thread.
         let allow_blocking = !panicking && crate::exec::has_blocking_executor();
         let mut skipped_async = 0usize;
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
@@ -279,11 +290,17 @@ impl Drop for FiberData {
                                 disposer.dispose_blocking()
                             }));
                         } else {
-                            // Leak intentionally: dropping the disposer here would
-                            // run its own blocking `Drop` safety net and deadlock
-                            // again (XT-01).
+                            // P2-2: hand the disposer to the bounded orphan queue
+                            // instead of forgetting it. For a *cancelled*
+                            // disposer `Drop` logs and returns without blocking;
+                            // for a *non-cancelled* one it calls
+                            // `dispose_blocking`, which blocks on the embedder's
+                            // blocking executor and can deadlock on a reactor
+                            // thread. Neither is safe from this `Drop`; the
+                            // orphan queue is drained by the embedder with
+                            // `drain_orphan_async_cleanups()`.
                             skipped_async += 1;
-                            std::mem::forget(disposer);
+                            crate::async_effects::orphan_async_disposer(disposer);
                         }
                     }
                 }
@@ -295,7 +312,7 @@ impl Drop for FiberData {
                     }));
                 } else {
                     skipped_async += 1;
-                    std::mem::forget(disposer);
+                    crate::async_effects::orphan_async_disposer(disposer);
                 }
             }
             if skipped_async > 0 {
@@ -610,35 +627,42 @@ impl Fiber {
     /// not imply `Active`; inspect [`Fiber::state`] / [`Fiber::error_detail`].
     pub async fn replace_plugin_async(&self, plugin: Arc<dyn AsyncPlugin>) -> Result<()> {
         let _guard = begin_operation(&self.data);
-        let _lifecycle = begin_lifecycle(&self.data)?;
-        let _finalize = FinalizeGuard { data: &self.data };
-        let kind = PluginKind::Async(plugin);
-        let (old_kind, old_key, registry) = self.begin_replace(&kind)?;
-        if let Some(registry) = registry.as_ref() {
-            if let Err(error) = registry.rebind_single_fiber(self, old_key, kind.key()) {
-                self.restore_replace(old_kind, old_key, Some(registry));
-                return Err(error);
+        // P2-A: the operation token (not the poll thread) owns the fiber for the
+        // whole async replace; nested `restart_async` reuses it reentrantly.
+        let lifecycle = begin_async_lifecycle(&self.data)?;
+        let result = with_operation_token(lifecycle.token(), async {
+            let _finalize = FinalizeGuard { data: &self.data };
+            let kind = PluginKind::Async(plugin);
+            let (old_kind, old_key, registry) = self.begin_replace(&kind)?;
+            if let Some(registry) = registry.as_ref() {
+                if let Err(error) = registry.rebind_single_fiber(self, old_key, kind.key()) {
+                    self.restore_replace(old_kind, old_key, Some(registry));
+                    return Err(error);
+                }
             }
-        }
-        let outcome =
-            futures_util::FutureExt::catch_unwind(AssertUnwindSafe(self.restart_async())).await;
-        match outcome {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                self.restore_replace(old_kind, old_key, registry.as_ref());
-                self.reload_after_failed_replace_async().await;
-                Err(error)
+            let outcome =
+                futures_util::FutureExt::catch_unwind(AssertUnwindSafe(self.restart_async())).await;
+            match outcome {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => {
+                    self.restore_replace(old_kind, old_key, registry.as_ref());
+                    self.reload_after_failed_replace_async().await;
+                    Err(error)
+                }
+                Err(payload) => {
+                    let error = CordisError::PluginFailed(format!(
+                        "replace_plugin_async: reload panicked: {}",
+                        panic_message(payload.as_ref())
+                    ));
+                    self.restore_replace(old_kind, old_key, registry.as_ref());
+                    self.reload_after_failed_replace_async().await;
+                    Err(error)
+                }
             }
-            Err(payload) => {
-                let error = CordisError::PluginFailed(format!(
-                    "replace_plugin_async: reload panicked: {}",
-                    panic_message(payload.as_ref())
-                ));
-                self.restore_replace(old_kind, old_key, registry.as_ref());
-                self.reload_after_failed_replace_async().await;
-                Err(error)
-            }
-        }
+        })
+        .await;
+        drop(lifecycle);
+        result
     }
 
     /// Re-run the restored (old) implementation after a failed in-place replace
@@ -746,6 +770,11 @@ impl Fiber {
     /// Dispose the fiber: unload effects in reverse order, remove services and
     /// listeners, then mark it `Disposed`. Idempotent.
     ///
+    /// Returns [`CordisError::LifecycleBusy`] when another lifecycle operation
+    /// (including a refresh-driven unload) is in flight: the call is skipped
+    /// rather than racing, and the caller is expected to retry / let the next
+    /// refresh or recovery pass finish the fiber.
+    ///
     /// Async effects are awaited on this thread (see [`crate::block_on`]) so the
     /// call is still deterministic; use [`Fiber::dispose_async`] from async code
     /// so reactor-backed cleanups can make progress.
@@ -772,8 +801,13 @@ impl Fiber {
             recover_parked_unloads_async(&registry).await;
         }
         let _guard = begin_operation(&self.data);
-        let _lifecycle = begin_lifecycle(&self.data)?;
-        unload_fiber_async(&self.data, FiberState::Disposed).await
+        let lifecycle = begin_async_lifecycle(&self.data)?;
+        let result = with_operation_token(lifecycle.token(), async {
+            unload_fiber_async(&self.data, FiberState::Disposed).await
+        })
+        .await;
+        drop(lifecycle);
+        result
     }
 
     /// F1: blocking recovery hook used by [`Fiber::dispose`] (and indirectly by
@@ -824,16 +858,21 @@ impl Fiber {
     /// Awaiting variant of [`Fiber::restart`].
     pub async fn restart_async(&self) -> Result<()> {
         let _guard = begin_operation(&self.data);
-        let _lifecycle = begin_lifecycle(&self.data)?;
-        let _finalize = FinalizeGuard { data: &self.data };
-        let Some((ctx, plugin, config)) = self.begin_restart(true)? else {
-            return Ok(());
-        };
-        unload_fiber_async(&self.data, FiberState::Pending).await?;
-        if dependencies_ready(&ctx, plugin.inject()) {
-            let _ = activate_by_kind_async(&self.data, &ctx, &plugin, &config).await;
-        }
-        Ok(())
+        let lifecycle = begin_async_lifecycle(&self.data)?;
+        let result = with_operation_token(lifecycle.token(), async {
+            let _finalize = FinalizeGuard { data: &self.data };
+            let Some((ctx, plugin, config)) = self.begin_restart(true)? else {
+                return Ok(());
+            };
+            unload_fiber_async(&self.data, FiberState::Pending).await?;
+            if dependencies_ready(&ctx, plugin.inject()) {
+                let _ = activate_by_kind_async(&self.data, &ctx, &plugin, &config).await;
+            }
+            Ok(())
+        })
+        .await;
+        drop(lifecycle);
+        result
     }
 
     /// Validate the fiber is restartable, then announce `Unloading` through
@@ -938,12 +977,17 @@ impl Fiber {
     /// Awaiting variant of [`Fiber::update_with_no_save`].
     pub async fn update_async_with_no_save(&self, config: Value, no_save: bool) -> Result<()> {
         let _guard = begin_operation(&self.data);
-        let _lifecycle = begin_lifecycle(&self.data)?;
-        let _finalize = FinalizeGuard { data: &self.data };
-        if self.resolve_update(config, true, no_save)? {
-            self.restart_async().await?;
-        }
-        Ok(())
+        let lifecycle = begin_async_lifecycle(&self.data)?;
+        let result = with_operation_token(lifecycle.token(), async {
+            let _finalize = FinalizeGuard { data: &self.data };
+            if self.resolve_update(config, true, no_save)? {
+                self.restart_async().await?;
+            }
+            Ok(())
+        })
+        .await;
+        drop(lifecycle);
+        result
     }
 
     /// Shared config pipeline of [`Fiber::update`] / [`Fiber::update_async`].
@@ -1095,6 +1139,54 @@ pub(crate) fn transition(data: &FiberRef, next: FiberState) {
         }
         Err(_) => return,
     };
+    publish_transition(data, old, next, ctx, seq);
+}
+
+/// Atomically transition `data` to `next` only when it is still in `expected`
+/// state **and** its activation epoch is still `epoch`.
+///
+/// Check and store happen under one `FiberData` lock (no check-then-act window):
+/// used by the XT-02 activation rollback so a newer activation attempt can never
+/// be overwritten with `Pending`. Status/lifecycle events are published with the
+/// snapshot captured under that same lock (exactly like [`transition`]).
+/// Returns whether the transition happened.
+fn transition_if_epoch(
+    data: &FiberRef,
+    expected: FiberState,
+    next: FiberState,
+    epoch: u64,
+) -> bool {
+    let (old, ctx, seq) = match data.lock() {
+        Ok(mut fiber) => {
+            if fiber.state != expected
+                || fiber.state == FiberState::Disposed
+                || fiber.activation_epoch.load(Ordering::SeqCst) != epoch
+            {
+                return false;
+            }
+            if fiber.state == next {
+                return false;
+            }
+            let old = fiber.state;
+            let seq = fiber.status_seq.fetch_add(1, Ordering::SeqCst);
+            fiber.state = next;
+            (old, fiber.ctx_ref(), seq)
+        }
+        Err(_) => return false,
+    };
+    publish_transition(data, old, next, ctx, seq);
+    true
+}
+
+/// Emit the status/lifecycle events and quiescence notification for a state
+/// transition that was already committed under the `FiberData` lock.
+fn publish_transition(
+    data: &FiberRef,
+    old: FiberState,
+    next: FiberState,
+    ctx: Option<Context>,
+    seq: u64,
+) {
     if let Some(ctx) = ctx {
         let fiber = Fiber { data: data.clone() };
         ctx.events().internal().emit_status(&fiber, old);
@@ -1831,6 +1923,45 @@ async fn discard_stale_activation_async(data: &FiberRef, epoch: u64) {
     let _ = drain_effects_async(stale, Vec::new()).await;
 }
 
+/// XT-02: roll one activation attempt back to `Pending` **without stealing a
+/// newer attempt's registrations**.
+///
+/// The dependency re-check and the rollback are not atomic: another activation
+/// (a concurrent `restart`/`update`) may have completed in between. The rollback
+/// therefore (1) takes only the effects tagged with *this* attempt's epoch,
+/// (2) re-checks staleness/invalidation **after** the drain (cleanups can change
+/// the state), and (3) only transitions to `Pending` when the fiber is still the
+/// `Loading` attempt that owns `epoch`.
+fn rollback_activation_to_pending(data: &FiberRef, ctx: &Context, epoch: u64) {
+    // Epoch-precise effect rollback first: only this attempt's registrations are
+    // drained. That also performs the ownership cleanup: listener effects remove
+    // their listener when disposed, and `ctx.plugin` ownership effects dispose
+    // their child fiber (both are tagged with this attempt's epoch), so no extra
+    // `remove_owner`/`sweep_children` is needed here — doing one would tear down
+    // a concurrent newer attempt's listeners/children.
+    discard_stale_activation(data, epoch);
+    // Atomic check-then-act: the state *and* activation epoch are validated and
+    // the `Pending` transition committed under one lock, so a newer activation
+    // that completed meanwhile is never overwritten (E P3-1).
+    if transition_if_epoch(data, FiberState::Loading, FiberState::Pending, epoch) {
+        ctx.refresh_dependents();
+    }
+}
+
+/// Awaiting counterpart of [`rollback_activation_to_pending`]: the epoch is
+/// re-read after the discard await, because a newer activation may have finished
+/// while the async cleanups were running.
+async fn rollback_activation_to_pending_async(data: &FiberRef, ctx: &Context, epoch: u64) {
+    // See `rollback_activation_to_pending`: epoch-precise drain (which performs
+    // the listener/child-ownership cleanup through the tagged effects), then an
+    // atomic `(state, epoch)`-checked transition. The epoch/state are re-read
+    // after the discard await inside `transition_if_epoch` itself.
+    discard_stale_activation_async(data, epoch).await;
+    if transition_if_epoch(data, FiberState::Loading, FiberState::Pending, epoch) {
+        ctx.refresh_dependents();
+    }
+}
+
 /// Roll back the effects registered by a failed **synchronous** activation.
 ///
 /// Sync cleanups run immediately (each panic isolated); async cleanups cannot
@@ -2029,12 +2160,13 @@ pub(crate) fn activate_fiber(
             }
             // XT-02: a provider may unload while `apply` runs. Do not publish
             // `Active` for a fiber whose injected services disappeared mid
-            // activation; roll this attempt back and stay `Pending` so the
-            // next refresh can reactivate against a live provider.
+            // activation; roll this attempt back (epoch-precise) and stay
+            // `Pending` so the next refresh can reactivate against a live
+            // provider. `rollback_activation_to_pending` re-checks the epoch
+            // after the drain so a concurrent newer activation is never
+            // clobbered.
             if !dependencies_ready(ctx, plugin.inject()) {
-                discard_activation_effects(data, ctx);
-                transition(data, FiberState::Pending);
-                ctx.refresh_dependents();
+                rollback_activation_to_pending(data, ctx, epoch);
                 return Ok(());
             }
             record_dep_versions(data, ctx, plugin.inject());
@@ -2162,11 +2294,11 @@ pub(crate) async fn activate_fiber_async(
                 return Ok(());
             }
             // XT-02: see the synchronous path — never publish `Active` when an
-            // injected service disappeared while `apply_async` ran.
+            // injected service disappeared while `apply_async` ran. The epoch is
+            // re-read after the async discard, so a newer activation that
+            // completed during the drain is not overwritten with `Pending`.
             if !dependencies_ready(ctx, plugin.inject()) {
-                discard_activation_effects_async(data, ctx).await;
-                transition(data, FiberState::Pending);
-                ctx.refresh_dependents();
+                rollback_activation_to_pending_async(data, ctx, epoch).await;
                 return Ok(());
             }
             record_dep_versions(data, ctx, plugin.inject());
@@ -3307,6 +3439,10 @@ pub(crate) async fn unload_fiber_async(data: &FiberRef, target: FiberState) -> R
 /// and returned so the caller can re-raise it at a point where the fiber state
 /// is already final.
 pub(crate) fn unload_contained(data: &FiberRef, target: FiberState) -> bool {
+    // P3: a refresh-driven unload is lifecycle work; `await_settled`/`settled`
+    // must observe it (same as dispose/restart). The guard is RAII, so the busy
+    // early return below still releases the count.
+    let _operation = begin_operation(data);
     // XT-02: refresh-driven unloads must serialize with user lifecycle
     // operations. Without the slot, a refresh unload could race a concurrent
     // restart/update and leave the fiber's state machine in a torn phase (a
@@ -3336,15 +3472,23 @@ pub(crate) fn unload_contained(data: &FiberRef, target: FiberState) -> bool {
 
 /// Awaiting counterpart of [`unload_contained`] for the async refresh path.
 pub(crate) async fn unload_contained_async(data: &FiberRef, target: FiberState) -> bool {
-    // XT-02: same lifecycle serialization as the synchronous path. The guard
-    // is held across the await so a concurrent user lifecycle call observes
-    // `LifecycleBusy` instead of racing the unload.
-    let Ok(_lifecycle) = begin_lifecycle(data) else {
+    // P3: the refresh unload counts as an in-flight operation so
+    // `await_settled`/`settled` does not resolve while the fiber is being
+    // unloaded by a refresh pass.
+    let _operation = begin_operation(data);
+    // XT-02/P2-A: same lifecycle serialization as the synchronous path, claimed
+    // with an operation token that is installed while the future is polled, so
+    // cleanup reentrancy behaves identically on any executor thread.
+    let Ok(lifecycle) = begin_async_lifecycle(data) else {
         return false;
     };
-    match futures_util::FutureExt::catch_unwind(AssertUnwindSafe(unload_fiber_async(data, target)))
-        .await
-    {
+    let outcome = with_operation_token(lifecycle.token(), async {
+        futures_util::FutureExt::catch_unwind(AssertUnwindSafe(unload_fiber_async(data, target)))
+            .await
+    })
+    .await;
+    drop(lifecycle);
+    match outcome {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
             tracing::error!(
@@ -3502,25 +3646,74 @@ impl CancelSafeUnload<'_> {
 // Lifecycle serialization (`dispose`/`restart`/`update` are exclusive)
 // ---------------------------------------------------------------------------
 
-static NEXT_THREAD_TOKEN: AtomicU64 = AtomicU64::new(1);
+/// Unique-token generator for lifecycle ownership.
+///
+/// Tokens identify the **operation**, not the thread: an async lifecycle
+/// operation keeps its token across `.await` points (and across executor thread
+/// migration), while synchronous nested calls on the same thread reuse their
+/// thread token. This is what makes "is this call reentrant?" independent of
+/// which thread happens to poll the future (P2-A / XT-02).
+static NEXT_LIFECYCLE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
-    static THREAD_TOKEN: u64 = NEXT_THREAD_TOKEN.fetch_add(1, Ordering::Relaxed);
+    /// Token of the enclosing *synchronous* lifecycle operation on this thread.
+    static THREAD_TOKEN: u64 = NEXT_LIFECYCLE_TOKEN.fetch_add(1, Ordering::Relaxed);
+    /// Token of the async lifecycle operation currently being polled on this
+    /// thread (installed by [`with_operation_token`]; 0 = none).
+    static CURRENT_OP_TOKEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Token a new lifecycle call on this thread must claim with: the operation
+/// being polled if there is one (reentrant async call), else this thread's
+/// synchronous token.
 fn current_lifecycle_token() -> u64 {
-    THREAD_TOKEN.with(|token| *token)
+    let operation = CURRENT_OP_TOKEN.with(std::cell::Cell::get);
+    if operation != 0 {
+        operation
+    } else {
+        THREAD_TOKEN.with(|token| *token)
+    }
 }
 
-/// Released when the lifecycle operation (including its reentrant nested calls)
-/// finishes.
+/// Releases one lifecycle claim when the operation (including its reentrant
+/// nested calls) finishes.
 pub(crate) struct LifecycleGuard<'a> {
     data: &'a FiberRef,
+    /// Operation token that owns this claim (P2-A).
+    token: u64,
+}
+
+impl LifecycleGuard<'_> {
+    /// The operation token this guard claimed with. Async entry points install it
+    /// via [`with_operation_token`] while the future is polled.
+    pub(crate) fn token(&self) -> u64 {
+        self.token
+    }
 }
 
 impl Drop for LifecycleGuard<'_> {
     fn drop(&mut self) {
         if let Ok(fiber) = self.data.lock() {
+            // Only the owner may release the slot: a guard that lost its claim
+            // (should not happen, but be defensive) must not clear someone
+            // else's owner. E P3-4: never fail silently — a mismatch means the
+            // slot may leak and all later lifecycle calls would report
+            // `LifecycleBusy`.
+            let owner = fiber.lifecycle_owner.load(Ordering::SeqCst);
+            if owner != self.token {
+                tracing::error!(
+                    target: "zeokeel_cordis::fiber",
+                    token = self.token,
+                    owner,
+                    "lifecycle guard released without owning the slot; \
+                     the lifecycle slot may leak (owner/token mismatch)"
+                );
+                debug_assert!(
+                    owner == self.token,
+                    "lifecycle guard owner/token mismatch (slot leak)"
+                );
+                return;
+            }
             if fiber.lifecycle_depth.load(Ordering::SeqCst) > 1 {
                 fiber.lifecycle_depth.fetch_sub(1, Ordering::SeqCst);
             } else {
@@ -3531,26 +3724,116 @@ impl Drop for LifecycleGuard<'_> {
     }
 }
 
-/// Claim the fiber's lifecycle slot.
+/// Claim the fiber's lifecycle slot with `token`.
 ///
-/// Concurrent calls from **other** threads fail with `LifecycleBusy` instead of
-/// racing; reentrant calls on the owning thread (a cleanup disposing its own
-/// fiber, `update` calling `restart`) are allowed.
-fn begin_lifecycle(data: &FiberRef) -> Result<LifecycleGuard<'_>> {
-    let token = current_lifecycle_token();
+/// Concurrent calls from **other operations** fail with `LifecycleBusy` instead
+/// of racing; reentrant calls of the same operation token (a cleanup disposing
+/// its own fiber, `update` calling `restart`) are allowed.
+///
+/// Busy callers must retry later: a refresh/recovery pass re-evaluates the fiber,
+/// and the kernel never blocks or spins on the slot.
+///
+/// The slot is owned by the **operation**, not by the poll thread: while an async
+/// lifecycle operation is suspended inside an `.await`, a synchronous
+/// `dispose`/`restart`/`update` from *any* thread (including the thread that last
+/// polled the future) gets [`CordisError::LifecycleBusy`] instead of being
+/// mistaken for a reentrant call or returning `InactiveEffect`. Only code
+/// executed while that operation is being polled (e.g. inside one of its
+/// cleanups) re-enters with the same token.
+fn claim_lifecycle<'a>(data: &'a FiberRef, token: u64) -> Result<LifecycleGuard<'a>> {
     let fiber = data.lock().map_err(|_| CordisError::Disposed)?;
     let owner = fiber.lifecycle_owner.load(Ordering::SeqCst);
     if owner == 0 {
         fiber.lifecycle_owner.store(token, Ordering::SeqCst);
         fiber.lifecycle_depth.store(1, Ordering::SeqCst);
         drop(fiber);
-        Ok(LifecycleGuard { data })
+        Ok(LifecycleGuard { data, token })
     } else if owner == token {
         fiber.lifecycle_depth.fetch_add(1, Ordering::SeqCst);
         drop(fiber);
-        Ok(LifecycleGuard { data })
+        Ok(LifecycleGuard { data, token })
     } else {
         Err(CordisError::LifecycleBusy)
+    }
+}
+
+/// Claim the lifecycle slot from a **synchronous** lifecycle entry point.
+///
+/// Uses the operation token if this call is nested inside an async lifecycle
+/// (so a cleanup that calls `dispose` reentrantly works even when the future
+/// was migrated to another thread), else the thread token.
+fn begin_lifecycle(data: &FiberRef) -> Result<LifecycleGuard<'_>> {
+    claim_lifecycle(data, current_lifecycle_token())
+}
+
+/// Claim the lifecycle slot from an **async** lifecycle entry point (P2-A).
+///
+/// - nested inside an async operation (`CURRENT_OP_TOKEN != 0`): reuse that
+///   operation token (reentrant);
+/// - an enclosing *synchronous* lifecycle owns this fiber on this thread: reuse
+///   the thread token (sync cleanup calling an async lifecycle);
+/// - otherwise claim a **fresh operation token** (distinct from every thread
+///   token), so a later call from the original thread while this operation is
+///   suspended is correctly reported as `LifecycleBusy` instead of being
+///   mistaken for a reentrant call.
+fn begin_async_lifecycle(data: &FiberRef) -> Result<LifecycleGuard<'_>> {
+    let operation = CURRENT_OP_TOKEN.with(std::cell::Cell::get);
+    if operation != 0 {
+        return claim_lifecycle(data, operation);
+    }
+    let thread_token = THREAD_TOKEN.with(|token| *token);
+    let owner = data
+        .lock()
+        .map(|fiber| fiber.lifecycle_owner.load(Ordering::SeqCst))
+        .unwrap_or(0);
+    let token = if owner == thread_token {
+        thread_token
+    } else {
+        NEXT_LIFECYCLE_TOKEN.fetch_add(1, Ordering::Relaxed)
+    };
+    claim_lifecycle(data, token)
+}
+
+/// Future adapter that installs `token` as the current operation token while the
+/// inner future is being polled (P2-A).
+///
+/// The previous token is restored by an RAII guard, so the installation is
+/// panic-safe and nests correctly. `Pin<Box<F>>` keeps the adapter `Unpin`
+/// without `unsafe`, and it stays `Send` when the inner future is `Send`.
+pub(crate) struct WithOperationToken<F> {
+    token: u64,
+    inner: std::pin::Pin<Box<F>>,
+}
+
+impl<F: std::future::Future> std::future::Future for WithOperationToken<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        struct Restore(u64);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                CURRENT_OP_TOKEN.with(|cell| cell.set(self.0));
+            }
+        }
+        let this = self.get_mut();
+        let previous = CURRENT_OP_TOKEN.with(|cell| cell.replace(this.token));
+        let _restore = Restore(previous);
+        this.inner.as_mut().poll(cx)
+    }
+}
+
+/// Wrap `future` so it is polled with `token` as the current lifecycle operation
+/// token (see [`begin_async_lifecycle`]).
+pub(crate) fn with_operation_token<F: std::future::Future>(
+    token: u64,
+    future: F,
+) -> WithOperationToken<F> {
+    WithOperationToken {
+        token,
+        inner: Box::pin(future),
     }
 }
 
@@ -3905,5 +4188,160 @@ mod regression_tests {
         assert!(root.registry().is_idle());
         let _ = root.dispose_all();
         assert!(root.registry().keys().is_empty());
+    }
+    /// XT-02: the async rollback must only discard effects tagged with *this*
+    /// attempt's epoch, so a newer activation that completed concurrently keeps
+    /// its registrations.
+    #[test]
+    fn xt02_stale_effect_rollback_is_epoch_precise() {
+        let data = bare_fiber(77, FiberState::Loading);
+        let epoch_seven = Arc::new(AtomicUsize::new(0));
+        let epoch_eight = Arc::new(AtomicUsize::new(0));
+        let seven = epoch_seven.clone();
+        let eight = epoch_eight.clone();
+        if let Ok(mut fiber) = data.lock() {
+            fiber.effects.push(FiberEffect {
+                kind: EffectKind::Sync(Disposer::new(vec![crate::cleanup(move || {
+                    seven.fetch_add(1, Ordering::SeqCst);
+                })])),
+                meta: EffectNode::new("xt02-epoch-7"),
+                activation: 7,
+                internal: false,
+            });
+            fiber.effects.push(FiberEffect {
+                kind: EffectKind::Sync(Disposer::new(vec![crate::cleanup(move || {
+                    eight.fetch_add(1, Ordering::SeqCst);
+                })])),
+                meta: EffectNode::new("xt02-epoch-8"),
+                activation: 8,
+                internal: false,
+            });
+        }
+        let stale = take_stale_effects(&data, 7);
+        assert_eq!(stale.len(), 1, "only this attempt's effect is taken");
+        let _ = drain_effects_blocking(stale, Vec::new());
+        assert_eq!(epoch_seven.load(Ordering::SeqCst), 1);
+        assert_eq!(epoch_eight.load(Ordering::SeqCst), 0);
+        let remaining = data
+            .lock()
+            .map(|fiber| fiber.effects.len())
+            .unwrap_or_default();
+        assert_eq!(remaining, 1, "the newer attempt's effect is preserved");
+    }
+
+    /// P2-A: `with_operation_token` installs the token for every poll (nested
+    /// wrappers restore correctly) and restores the previous state afterwards.
+    #[test]
+    fn with_operation_token_installs_and_restores_the_token() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let inner_seen = seen.clone();
+        let outer_seen = seen.clone();
+        crate::block_on(with_operation_token(4242, async move {
+            outer_seen
+                .lock()
+                .expect("seen")
+                .push(current_lifecycle_token());
+            let nested_seen = inner_seen.clone();
+            with_operation_token(5555, async move {
+                nested_seen
+                    .lock()
+                    .expect("nested seen")
+                    .push(current_lifecycle_token());
+            })
+            .await;
+            outer_seen
+                .lock()
+                .expect("seen")
+                .push(current_lifecycle_token());
+        }));
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec![4242, 5555, 4242],
+            "the token is installed while polling and restored after each wrapper"
+        );
+        // After the wrapper finished, the thread is back to its own token.
+        assert_ne!(current_lifecycle_token(), 4242);
+    }
+
+    /// P2-A: an async lifecycle claim uses a fresh operation token, so a call
+    /// from the same thread while the operation is suspended is *not* accepted
+    /// as reentrant (it must claim with the owner token explicitly).
+    #[test]
+    fn async_lifecycle_claim_rejects_a_same_thread_false_reentrant() {
+        let data = bare_fiber(78, FiberState::Active);
+        let guard = begin_async_lifecycle(&data).expect("claim async lifecycle");
+        let owner_token = guard.token();
+        assert_ne!(
+            owner_token,
+            THREAD_TOKEN.with(|token| *token),
+            "the operation token must be distinct from the poller thread token"
+        );
+        assert!(
+            matches!(begin_lifecycle(&data), Err(CordisError::LifecycleBusy)),
+            "a same-thread call outside the operation token is not reentrant"
+        );
+        assert!(
+            claim_lifecycle(&data, owner_token).is_ok(),
+            "the owning operation may re-enter"
+        );
+        drop(guard);
+    }
+    /// E P3-1: the XT-02 rollback transition validates `(state, epoch)` and
+    /// commits atomically, so it never overwrites a newer activation or a final
+    /// state.
+    #[test]
+    fn transition_if_epoch_requires_matching_epoch_and_state() {
+        let data = bare_fiber(90, FiberState::Loading);
+        if let Ok(fiber) = data.lock() {
+            fiber.activation_epoch.store(5, Ordering::SeqCst);
+        }
+        assert!(
+            !transition_if_epoch(&data, FiberState::Loading, FiberState::Pending, 4),
+            "an epoch mismatch must not transition"
+        );
+        assert_eq!(data.lock().expect("fiber").state, FiberState::Loading);
+        let seq_before = data
+            .lock()
+            .expect("fiber")
+            .status_seq
+            .load(Ordering::SeqCst);
+        assert!(transition_if_epoch(
+            &data,
+            FiberState::Loading,
+            FiberState::Pending,
+            5
+        ));
+        let fiber = data.lock().expect("fiber");
+        assert_eq!(fiber.state, FiberState::Pending);
+        assert!(
+            fiber.status_seq.load(Ordering::SeqCst) > seq_before,
+            "a committed transition bumps status_seq"
+        );
+        drop(fiber);
+
+        // A fiber that already completed a newer activation (`Active`) must not
+        // be pushed back to `Pending` by a stale rollback.
+        let newer = bare_fiber(91, FiberState::Active);
+        if let Ok(fiber) = newer.lock() {
+            fiber.activation_epoch.store(9, Ordering::SeqCst);
+        }
+        assert!(
+            !transition_if_epoch(&newer, FiberState::Loading, FiberState::Pending, 9),
+            "an Active fiber is not Loading: no overwrite"
+        );
+        assert_eq!(newer.lock().expect("fiber").state, FiberState::Active);
+
+        // A final `Disposed` fiber is never resurrected/regressed.
+        let disposed = bare_fiber(92, FiberState::Disposed);
+        if let Ok(fiber) = disposed.lock() {
+            fiber.activation_epoch.store(3, Ordering::SeqCst);
+        }
+        assert!(!transition_if_epoch(
+            &disposed,
+            FiberState::Loading,
+            FiberState::Pending,
+            3
+        ));
+        assert_eq!(disposed.lock().expect("fiber").state, FiberState::Disposed);
     }
 }

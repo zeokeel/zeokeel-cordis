@@ -72,7 +72,11 @@ pub mod registry;
 pub mod service;
 pub mod waterfall;
 
-pub use async_effects::{cleanup_async, AsyncCleanup, AsyncDisposer, AsyncEffect};
+pub use async_effects::{
+    cleanup_async, drain_orphan_async_cleanups, orphan_async_cleanup_count,
+    orphan_async_cleanup_failure_count, orphan_async_cleanups_pending, AsyncCleanup, AsyncDisposer,
+    AsyncEffect,
+};
 pub use clock::{Clock, SystemClock};
 pub use config::{ConfigSchema, JsonConfigSchema, JsonType, ValidationError};
 pub use context::Context;

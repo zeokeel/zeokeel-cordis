@@ -194,9 +194,52 @@ pub type SetHook =
 /// (see [`crate::Context::on_lifecycle`]).
 ///
 /// Transitions are reported for the whole context tree the observer was
-/// installed on (the internal hook bus is shared by the root context), including
-/// the terminal `* -> Disposed` transition.
+/// installed on (the lifecycle bus is shared by the root context), including
+/// the terminal `* -> Disposed` transition. Every field is a **snapshot** taken
+/// at transition time under the fiber state lock (XT-03): the event does not
+/// change later and never reflects a newer state, even if the listener runs
+/// late.
+///
+/// # Constructing an event (0.6.0)
+///
+/// The struct is `#[non_exhaustive]`: downstream crates construct it with
+/// [`LifecycleEvent::new`] and must use a `..` rest pattern when matching
+/// (future fields are additive, so exhaustive matches would break on a minor
+/// release):
+///
+/// ```
+/// # use zeokeel_cordis::{FiberState, LifecycleEvent};
+/// let event = LifecycleEvent::new(7, "my-plugin".to_string(), FiberState::Pending, FiberState::Active, 3);
+/// assert_eq!(event.fiber_id, 7);
+/// assert_eq!(event.seq, 3);
+/// match event {
+///     LifecycleEvent { fiber_id: 7, to: FiberState::Active, .. } => {}
+///     _ => panic!("unexpected transition"),
+/// }
+/// ```
+///
+/// A struct literal is rejected for downstream crates:
+///
+/// ```compile_fail,E0639
+/// # use zeokeel_cordis::{FiberState, LifecycleEvent};
+/// let event = LifecycleEvent {
+///     fiber_id: 7,
+///     name: "p".to_string(),
+///     from: FiberState::Pending,
+///     to: FiberState::Active,
+///     seq: 1,
+/// };
+/// # let _ = event;
+/// ```
+///
+/// # Ordering
+///
+/// `seq` is a monotonic per-fiber transition counter. Delivery can interleave
+/// across threads, and a listener that re-enters the kernel on the same thread
+/// may observe later transitions first; order events by `(fiber_id, seq)` when
+/// the exact sequence matters.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LifecycleEvent {
     /// Id of the fiber whose state changed (`0` is the root fiber).
     pub fiber_id: u64,
@@ -213,7 +256,35 @@ pub struct LifecycleEvent {
     pub seq: u64,
 }
 
+impl LifecycleEvent {
+    /// Build a lifecycle event (the only constructor downstream crates can use;
+    /// the struct is `#[non_exhaustive]`).
+    ///
+    /// The kernel uses this for every transition; embedder test doubles and
+    /// wrappers can build events too.
+    pub fn new(fiber_id: u64, name: String, from: FiberState, to: FiberState, seq: u64) -> Self {
+        Self {
+            fiber_id,
+            name,
+            from,
+            to,
+            seq,
+        }
+    }
+
+    /// The monotonic per-fiber transition sequence (same as the [`seq`] field).
+    ///
+    /// [`seq`]: Self::seq
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
 /// A lifecycle subscriber (see [`crate::Context::on_lifecycle`]).
+///
+/// Events are immutable snapshots (see [`LifecycleEvent`]); delivery can
+/// interleave across threads and re-entrant listeners may observe later
+/// transitions first, so sort by `(fiber_id, seq)` when exact order matters.
 ///
 /// The listener is **not** owned by a fiber: it keeps receiving events after the
 /// fiber (or context) that installed it unloads, until its [`Disposer`] is

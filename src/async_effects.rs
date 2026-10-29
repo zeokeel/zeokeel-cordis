@@ -22,11 +22,12 @@
 //! [`AsyncDisposer::dispose`], `Fiber::dispose_async`, or the blocking mirror
 //! [`AsyncDisposer::dispose_blocking`]). Nothing is spawned or fire-and-forget.
 
+use std::any::Any;
 use std::cell::RefCell;
 use std::future::Future;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
@@ -53,8 +54,21 @@ where
 /// Calling [`dispose`](AsyncDisposer::dispose) awaits the effect's cleanup
 /// callbacks in reverse order exactly once; repeated calls are no-ops. The
 /// fiber that owns the effect also holds a clone of this handle, so dropping
-/// it does not cancel the effect (only an unreferenced handle, e.g. a detached
-/// effect, is drained on drop — same contract as the sync [`Disposer`]).
+/// it does not cancel the effect. Only the **last** handle runs the [`Drop`]
+/// safety net (same contract as the sync [`Disposer`]), and that net is
+/// deliberately conservative:
+///
+/// - a **cancelled** teardown does **not** block or run restored cleanups from
+///   `Drop` — it logs and leaves them for an explicit retry
+///   ([`dispose`](AsyncDisposer::dispose) / [`dispose_blocking`](AsyncDisposer::dispose_blocking));
+/// - during unwinding the cleanups are dropped without running (never unwinds
+///   out of `Drop`);
+/// - otherwise `Drop` calls [`dispose_blocking`](AsyncDisposer::dispose_blocking),
+///   i.e. it blocks the calling thread on the embedder's blocking executor. If
+///   that would deadlock (reactor thread), dispose explicitly or install a
+///   suitable blocking executor — the kernel's fiber `Drop` skips async
+///   cleanups in that situation and hands them to
+///   [`drain_orphan_async_cleanups`].
 ///
 /// [`Disposer`]: crate::Disposer
 #[derive(Clone)]
@@ -251,6 +265,165 @@ impl Drop for CancelSafeDrain<'_> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// XT-01: bounded recovery of async cleanups the Drop safety net could not run
+// ---------------------------------------------------------------------------
+
+/// Maximum number of unrecovered async effects retained for an embedder drain.
+///
+/// Keeping the list bounded means a pathological process cannot grow memory
+/// without bound; sets beyond the cap are forgotten (leaked) and counted.
+const ORPHAN_CAPACITY: usize = 256;
+
+/// Async effects the kernel could not dispose from `FiberData::drop` (no
+/// blocking executor / unwinding thread). Recoverable through
+/// [`drain_orphan_async_cleanups`].
+static ORPHANS: Mutex<Vec<AsyncDisposer>> = Mutex::new(Vec::new());
+
+/// Cumulative number of orphaned async effects that were **leaked** because the
+/// bounded queue was full or its lock was poisoned (XT-01).
+static ORPHAN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative number of drained orphan effects whose `dispose_blocking` panicked
+/// (E P2-1: a panic must be observable, not silently swallowed).
+static ORPHAN_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// Current number of effects waiting in [`ORPHANS`] (recoverable by
+/// [`drain_orphan_async_cleanups`]); a cheap gauge, never blocked on the queue
+/// lock.
+static ORPHAN_PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// Hand an async effect to the orphan queue instead of dropping it.
+///
+/// Called by the kernel's `Drop` paths when running the cleanup is unsafe (no
+/// blocking executor installed, or the thread is unwinding): the effect is
+/// retained up to [`ORPHAN_CAPACITY`] so an embedder can recover it with
+/// [`drain_orphan_async_cleanups`]; beyond the cap (or when the queue lock is
+/// poisoned) it is forgotten and counted in [`orphan_async_cleanup_count`].
+///
+/// Never blocks, never unwinds; safe to call from `Drop`.
+pub(crate) fn orphan_async_disposer(disposer: AsyncDisposer) {
+    match ORPHANS.lock() {
+        Ok(mut orphans) => {
+            if orphans.len() < ORPHAN_CAPACITY {
+                orphans.push(disposer);
+                ORPHAN_PENDING.fetch_add(1, Ordering::SeqCst);
+            } else {
+                // Queue is full: do NOT drop the disposer here — its `Drop`
+                // safety net may block on async cleanups. Leak it and count it.
+                std::mem::forget(disposer);
+                ORPHAN_COUNT.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        Err(_) => {
+            // Poisoned queue: leaking is safer than running `Drop` inline.
+            std::mem::forget(disposer);
+            ORPHAN_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Cumulative number of async effects the kernel had to leak (XT-01).
+///
+/// These are effects dropped outside an explicit dispose while no blocking
+/// executor was installed (or while unwinding): the bounded orphan queue was
+/// full, so they could not even be retained for
+/// [`drain_orphan_async_cleanups`]. `0` in a healthy process — a non-zero value
+/// means the host should install a blocking executor and/or dispose fibers
+/// explicitly, and should call [`drain_orphan_async_cleanups`] while draining.
+pub fn orphan_async_cleanup_count() -> u64 {
+    ORPHAN_COUNT.load(Ordering::SeqCst)
+}
+
+/// Cumulative number of drained orphan async effects whose cleanup **panicked**.
+///
+/// A panicking async cleanup is contained (the remaining effects are still
+/// drained) but no longer silent: every failure is logged and counted here.
+/// `0` in a healthy process; a rising value usually means a cleanup needs a
+/// blocking executor it did not get (see [`drain_orphan_async_cleanups`]) or an
+/// embedder cleanup is genuinely broken.
+pub fn orphan_async_cleanup_failure_count() -> u64 {
+    ORPHAN_FAILED.load(Ordering::SeqCst)
+}
+
+/// Current number of orphaned async effects waiting for
+/// [`drain_orphan_async_cleanups`] (queue length gauge).
+///
+/// The value is sampled without taking the queue lock; it can change
+/// concurrently. `0` means no recoverable effect is queued (effects leaked at
+/// the capacity boundary are counted by [`orphan_async_cleanup_count`] instead).
+pub fn orphan_async_cleanups_pending() -> usize {
+    ORPHAN_PENDING.load(Ordering::SeqCst)
+}
+
+/// Run every async cleanup the kernel orphaned during `Drop` (XT-01).
+///
+/// Returns how many effects were **processed** (taken from the queue and
+/// attempted), not how many succeeded: a panicking cleanup still counts as
+/// processed. Observe failures with [`orphan_async_cleanup_failure_count`] (each
+/// panic is also logged with its payload).
+///
+/// Each effect runs its remaining cleanups in reverse registration order,
+/// joining/retrying exactly like [`AsyncDisposer::dispose_blocking`]; one broken
+/// cleanup can never strand the remaining effects.
+///
+/// # Threading and executors
+///
+/// **Call this from a non-reactor thread that may block.** Disposal goes through
+/// [`AsyncDisposer::dispose_blocking`], which blocks the calling thread; calling
+/// it from a reactor worker (e.g. inside a tokio task) can deadlock. Typical call
+/// sites: embedder shutdown, a dedicated drain thread, or a test.
+///
+/// Without an installed blocking executor
+/// ([`crate::exec::set_blocking_executor`]) `dispose_blocking` falls back to the
+/// thread-park [`crate::block_on`] executor, which cannot drive reactor-bound
+/// futures: such a cleanup can fail to make progress and surface as a panic. If
+/// your cleanups may await runtime I/O, install a blocking executor or call this
+/// from a thread that can drive them; failures are contained, logged and counted
+/// in [`orphan_async_cleanup_failure_count`], so a non-zero count is the signal
+/// that the drain environment was not suitable.
+///
+/// Effects currently queued are removed from the queue before they run (the
+/// pending gauge drops to zero first), so a concurrent orphan hand-off or a
+/// second drain cannot double-run them; the queue capacity (256) and the
+/// cumulative leak accounting are unchanged.
+pub fn drain_orphan_async_cleanups() -> usize {
+    let taken: Vec<AsyncDisposer> = match ORPHANS.lock() {
+        Ok(mut orphans) => std::mem::take(&mut *orphans),
+        // Poisoned queue: recover what is there (better than leaking it).
+        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+    };
+    // Saturating: the gauge is advisory and the queue is drained concurrently.
+    let _ = ORPHAN_PENDING.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
+        Some(pending.saturating_sub(taken.len()))
+    });
+    let count = taken.len();
+    for disposer in taken {
+        match catch_unwind(AssertUnwindSafe(|| disposer.dispose_blocking())) {
+            Ok(()) => {}
+            Err(payload) => {
+                ORPHAN_FAILED.fetch_add(1, Ordering::SeqCst);
+                tracing::error!(
+                    target: "zeokeel_cordis::async_effects",
+                    "orphan async cleanup panicked during drain: {}",
+                    panic_payload_message(payload.as_ref())
+                );
+            }
+        }
+    }
+    count
+}
+
+/// Best-effort message from a panic payload (matching the kernel's
+/// `log_cleanup_panic` style).
+fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
 impl AsyncDisposer {
     pub fn new(cleanups: Vec<AsyncCleanup>) -> Self {
         Self {
@@ -443,5 +616,109 @@ impl Drop for AsyncDisposer {
         }
         // A cleanup panic must not escape Drop; `dispose_blocking` re-raises.
         let _ = catch_unwind(AssertUnwindSafe(|| self.dispose_blocking()));
+    }
+}
+
+#[cfg(test)]
+mod orphan_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// The orphan queue is process-global; serialize these tests so one drain
+    /// cannot race another test's enqueues (lib unit tests run in parallel).
+    static ORPHAN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn counting_disposer(counter: Arc<AtomicUsize>) -> AsyncDisposer {
+        AsyncDisposer::new(vec![cleanup_async(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        })])
+    }
+
+    /// XT-01: orphaned async effects are recoverable via the public drain
+    /// (exactly once), and the bounded queue leaks+counts beyond its capacity.
+    #[test]
+    fn orphan_queue_recovers_cleanups_and_is_bounded() {
+        let _serial = ORPHAN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Drain anything a previous test/process left behind for a clean slate.
+        let _ = drain_orphan_async_cleanups();
+        let baseline_leaks = orphan_async_cleanup_count();
+        let pending_before = orphan_async_cleanups_pending();
+        assert!(
+            crate::exec::has_blocking_executor() || !crate::exec::has_blocking_executor(),
+            "the default park executor must be able to drive a pure async cleanup"
+        );
+
+        // Real recovery: one orphaned effect, drained exactly once.
+        let runs = Arc::new(AtomicUsize::new(0));
+        orphan_async_disposer(counting_disposer(runs.clone()));
+        assert!(
+            orphan_async_cleanups_pending() > pending_before,
+            "the pending gauge reflects a newly queued orphan"
+        );
+        let processed = drain_orphan_async_cleanups();
+        assert!(
+            orphan_async_cleanups_pending() <= pending_before,
+            "draining lowers the pending gauge"
+        );
+        assert!(processed >= 1, "the queued orphan is drained");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            orphan_async_cleanup_count(),
+            baseline_leaks,
+            "queued (recoverable) effects are not counted as leaks"
+        );
+
+        // Bounded queue: beyond the cap, effects are forgotten and counted.
+        let leaks_before = orphan_async_cleanup_count();
+        for _ in 0..(ORPHAN_CAPACITY + 3) {
+            orphan_async_disposer(counting_disposer(Arc::new(AtomicUsize::new(0))));
+        }
+        assert!(
+            orphan_async_cleanup_count() >= leaks_before + 3,
+            "effects beyond the bounded queue are leaked and counted"
+        );
+        let drained = drain_orphan_async_cleanups();
+        assert!(
+            drained <= ORPHAN_CAPACITY,
+            "the bounded queue never holds more than its capacity (drained {drained})"
+        );
+    }
+
+    /// A panicking embedder cleanup must not strand the remaining orphans, and
+    /// the failure must be observable (E P2-1) instead of silently swallowed.
+    #[test]
+    fn drain_contains_and_counts_cleanup_panics() {
+        let _serial = ORPHAN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = drain_orphan_async_cleanups();
+        let failures_before = orphan_async_cleanup_failure_count();
+        let runs = Arc::new(AtomicUsize::new(0));
+        orphan_async_disposer(AsyncDisposer::new(vec![cleanup_async(|| async {
+            panic!("orphan cleanup boom");
+        })]));
+        orphan_async_disposer(counting_disposer(runs.clone()));
+        assert_eq!(
+            drain_orphan_async_cleanups(),
+            2,
+            "the drain returns the processed count (failures included)"
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "a panicking cleanup does not stop the following effects"
+        );
+        assert_eq!(
+            orphan_async_cleanup_failure_count(),
+            failures_before + 1,
+            "a drain-time panic increments the failure counter"
+        );
+        assert_eq!(drain_orphan_async_cleanups(), 0, "drain is idempotent");
+        assert_eq!(
+            orphan_async_cleanup_failure_count(),
+            failures_before + 1,
+            "a no-op drain does not change the failure counter"
+        );
     }
 }

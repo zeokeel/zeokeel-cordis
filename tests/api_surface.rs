@@ -19,9 +19,10 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use zeokeel_cordis::{
-    block_on, cleanup, cleanup_async, AsyncPlugin, Clock, ConfigSchema, Context, CordisError,
-    Disposer, FiberState, InternalBus, JsonConfigSchema, LifecycleEvent, LogExporter, LogLevel,
-    LogRecord, LoggerService, Plugin, Result, SystemClock,
+    block_on, cleanup, cleanup_async, drain_orphan_async_cleanups, orphan_async_cleanup_count,
+    orphan_async_cleanup_failure_count, orphan_async_cleanups_pending, AsyncPlugin, Clock,
+    ConfigSchema, Context, CordisError, Disposer, FiberState, InternalBus, JsonConfigSchema,
+    LifecycleEvent, LogExporter, LogLevel, LogRecord, LoggerService, Plugin, Result, SystemClock,
 };
 
 // ---------------------------------------------------------------------------
@@ -739,4 +740,91 @@ fn api_logger_facade_snapshots_the_clock() {
         "the new facade stamps with the injected clock"
     );
     root.dispose_all().expect("cleanup");
+}
+
+// ---------------------------------------------------------------------------
+// LifecycleEvent 0.6.0: constructor + pattern matching contract
+// ---------------------------------------------------------------------------
+
+#[test]
+fn api_lifecycle_event_new_snapshots_fields_and_supports_ordering() {
+    let event = LifecycleEvent::new(
+        42,
+        "api-lifecycle".to_string(),
+        FiberState::Pending,
+        FiberState::Active,
+        7,
+    );
+    assert_eq!(event.fiber_id, 42);
+    assert_eq!(event.name, "api-lifecycle");
+    assert_eq!(event.from, FiberState::Pending);
+    assert_eq!(event.to, FiberState::Active);
+    assert_eq!(event.seq, 7);
+    assert_eq!(event.seq(), 7, "the convenience accessor mirrors the field");
+    assert_eq!(event.clone(), event, "events are plain snapshots");
+
+    // Downstream matching must use `..` (the struct is non_exhaustive); this
+    // pattern is what embedders are expected to write.
+    assert!(matches!(
+        event,
+        LifecycleEvent {
+            fiber_id: 42,
+            to: FiberState::Active,
+            ..
+        }
+    ));
+
+    // Events are ordered by (fiber_id, seq) if a listener needs replay order.
+    let mut events = [
+        LifecycleEvent::new(1, "a".into(), FiberState::Pending, FiberState::Loading, 2),
+        LifecycleEvent::new(1, "a".into(), FiberState::Pending, FiberState::Active, 3),
+        LifecycleEvent::new(1, "a".into(), FiberState::Pending, FiberState::Loading, 1),
+    ];
+    events.sort_by_key(|event| (event.fiber_id, event.seq));
+    assert_eq!(
+        events.iter().map(LifecycleEvent::seq).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// XT-01: public orphan-cleanup recovery API
+// ---------------------------------------------------------------------------
+
+#[test]
+fn api_orphan_cleanup_recovery_observability_api_is_exported() {
+    // Three counters are cumulative/monotonic gauges the embedder can sample:
+    // leaked-at-cap, drain-time failures, and the current pending queue length.
+    let leaks_before = orphan_async_cleanup_count();
+    let failures_before = orphan_async_cleanup_failure_count();
+    let pending_before = orphan_async_cleanups_pending();
+    assert!(
+        pending_before <= 256,
+        "the bounded orphan queue never reports more than its capacity ({pending_before})"
+    );
+
+    let drained = drain_orphan_async_cleanups();
+    assert!(
+        drained <= 256,
+        "a bounded orphan queue cannot process more than its capacity ({drained})"
+    );
+    assert!(
+        orphan_async_cleanup_count() >= leaks_before,
+        "the cumulative leak counter never decreases"
+    );
+    assert!(
+        orphan_async_cleanup_failure_count() >= failures_before,
+        "the cumulative failure counter never decreases"
+    );
+    assert!(
+        orphan_async_cleanups_pending() <= 256,
+        "the pending gauge stays bounded after a drain"
+    );
+
+    // Draining twice is safe (the queue is consumed before cleanups run).
+    assert_eq!(
+        drain_orphan_async_cleanups(),
+        0,
+        "a second immediate drain has nothing left to do"
+    );
 }

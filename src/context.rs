@@ -2210,9 +2210,25 @@ impl Context {
     /// The listener receives one [`crate::internal::LifecycleEvent`] per state
     /// transition
     /// (`Pending -> Loading -> Active`, `Active -> Unloading -> Disposed`,
-    /// failure paths, …) for **every fiber** whose events flow through this
-    /// tree's internal hook bus (install it on the root context to observe the
-    /// whole kernel).
+    /// failure paths, …) for **every fiber** whose transitions flow through this
+    /// tree (install it on the root context to observe the whole kernel).
+    ///
+    /// # Independent lifecycle bus (not the raw status hook)
+    ///
+    /// This is a dedicated lifecycle broadcast, **not** a wrapper around
+    /// [`Context::on_internal_status`]: each subscriber runs in registration
+    /// order and receives an immutable snapshot constructed at transition time
+    /// (`fiber_id`, `name`, `from`, `to`, `seq` all captured under the fiber
+    /// state lock; XT-03). The raw status hook instead hands out `&Fiber` and
+    /// the old state, and its `to` is whatever the fiber reports *while the hook
+    /// runs* — a late hook can see a torn/later view. Prefer this API whenever
+    /// the observer needs a stable record.
+    ///
+    /// **Ordering:** delivery can interleave across threads, and a listener that
+    /// re-enters the kernel on the same thread may observe later transitions
+    /// first. Events carry a monotonic per-fiber `seq`; sort by
+    /// `(fiber_id, seq)` when the exact transition order matters (e.g. metrics
+    /// replay, audit logs).
     ///
     /// Unlike [`Context::on_internal_status`], the subscription is **not owned
     /// by the calling fiber**: it keeps firing after that fiber unloads, so
@@ -2231,19 +2247,13 @@ impl Context {
     /// Listener panics are contained and logged; other subscribers still run, and
     /// multiple listeners are supported.
     ///
-    /// This is a thin, general wrapper over the `internal/status` hook: it adds
-    /// none of the fiber-bound lifecycle semantics, see
-    /// [`Context::on_internal_status`] for the raw hook.
+    /// The lifecycle bus is independent of the raw `internal/status` hook list;
+    /// see [`Context::on_internal_status`] if you need the raw `&Fiber` view.
     pub fn on_lifecycle(&self, listener: crate::internal::LifecycleListener) -> Result<Disposer> {
         let hook: Arc<crate::internal::LifecycleHookDyn> = Arc::new(
             move |fiber: &Fiber, from: FiberState, to: FiberState, seq: u64| {
-                let event = crate::internal::LifecycleEvent {
-                    fiber_id: fiber.id(),
-                    name: fiber.name(),
-                    from,
-                    to,
-                    seq,
-                };
+                let event =
+                    crate::internal::LifecycleEvent::new(fiber.id(), fiber.name(), from, to, seq);
                 crate::internal::contained(
                     "zeokeel_cordis::context",
                     "lifecycle listener",
@@ -2258,6 +2268,19 @@ impl Context {
     }
 
     /// Register an `internal/status` hook owned by the current fiber.
+    ///
+    /// This is the **raw** status hook: it receives `&Fiber` plus the previous
+    /// state, and it runs at a point where the fiber may already have moved on.
+    /// Reading `fiber.state()` inside the hook can therefore return a *later*
+    /// state than the transition the hook was notified about, and two hooks can
+    /// observe different intermediate views (a "torn" view). If you need a
+    /// stable, immutable record of the transition, use
+    /// [`Context::on_lifecycle`] instead — it snapshots `from`/`to`/`seq` under
+    /// the state lock at transition time.
+    ///
+    /// The hook is owned by the calling fiber and removed with it (unlike
+    /// [`Context::on_lifecycle`], which is not fiber-bound). Panics are contained
+    /// and logged; other hooks still run.
     pub fn on_internal_status(&self, hook: StatusHook) -> Result<Disposer> {
         let disposer = self.inner.events.internal().on_status(hook);
         self.register_effect_labeled(disposer.clone(), "ctx.on_internal_status")?;

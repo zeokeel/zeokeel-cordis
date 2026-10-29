@@ -27,9 +27,27 @@ pub enum CordisError {
     Cancelled,
     /// A per-fiber resource quota was exceeded (see `FiberQuota`).
     QuotaExceeded(String),
-    /// Another thread is already running a lifecycle operation on this fiber
-    /// (`dispose`/`restart`/`update` are mutually exclusive; kernel-grade
-    /// stability prefers a safe error over a data race).
+    /// Another thread (or a re-entrant call on the same thread) is already
+    /// running a lifecycle operation on this fiber.
+    ///
+    /// Lifecycle operations are mutually exclusive: `dispose`/`dispose_all`,
+    /// `restart`, `update` and `replace` (including their `*_async` mirrors)
+    /// cannot overlap, and a refresh that is unloading a fiber also owns its
+    /// lifecycle slot. A re-entrant call from inside a cleanup/hook receives
+    /// this error instead of deadlocking.
+    ///
+    /// A skipped operation is **not** queued: the caller must retry it later
+    /// (for example after the in-flight unload finishes — `refresh()` /
+    /// `when_idle()` completes the in-flight teardown) if it still has to take
+    /// effect.
+    ///
+    /// The lifecycle slot belongs to the **operation**, not to the thread that
+    /// polls it: while an async lifecycle operation (`dispose_async`,
+    /// `restart_async`, `update_async*`, `replace_plugin_async`, or a
+    /// refresh-driven unload) is suspended inside an `.await`, a synchronous
+    /// `dispose`/`restart`/`update` from **any** thread — including the thread
+    /// that last polled the future — returns this variant rather than being
+    /// treated as reentrant (or returning [`CordisError::InactiveEffect`]).
     LifecycleBusy,
     /// `ctx.set()`/`ctx.set_any()` tried to replace an existing service with a
     /// value of a different type. The message contains the service name (and,
