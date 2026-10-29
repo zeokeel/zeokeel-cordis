@@ -492,7 +492,14 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   `restart`/`update`) returns `Ok(())` while the fiber lands in `Failed`, with the
   structured error retained in `Fiber::error_detail()`; callers must check
   `Fiber::state()`/`error_detail()` rather than only the return value.
-  Validation/veto/lifecycle errors still return `Err`. Since v0.4.2 the
+  Validation/veto/lifecycle errors still return `Err`. **The same rule applies
+  to the multi-fiber `Registry::replace`/`replace_async` (XT-05)**: a reload or
+  activation failure of the new implementation is contained at the fiber level —
+  the fibers land in `Failed` and the runtime stays bound to the new plugin key —
+  and the previous implementation/service is **not restored**. Only a lifecycle
+  rejection (`LifecycleBusy`) or a validation error triggers the rollback
+  described here; hosts doing hot-swap must check `Fiber::state()` /
+  `error_detail()` and keep their own recovery path. Since v0.4.2 the
   rollback also **restores the fibers that had already been reloaded**: every
   fiber switched to the new implementation is reloaded back with the old plugin
   before `replace` returns, so a failed replace leaves no mixed

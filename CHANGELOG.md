@@ -27,6 +27,9 @@
 ### Docs
 
 - `README.md` / `docs/CORDIS-RUST.md` 记录 Fiber Drop 的 XT-01 语义与 trade-off。
+- `spec/CORDIS-CORE.md` 明确 `Registry::replace`/`replace_async` 的 activation 失败语义（XT-05）：
+  `Ok` 不代表 `Active`，失败被 containment 到 fiber（`Failed`），旧实现/服务不会自动恢复；
+  只有 lifecycle 拒绝（`LifecycleBusy`）或 validation 错误才走完整回滚。
 
 ## [0.5.0] - 2026-10-29
 
