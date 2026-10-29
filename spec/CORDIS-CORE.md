@@ -366,6 +366,12 @@ plugin() ──► Loading ──(apply ok)──► Active ──(dep missing)�
   concurrently, while `serial_async` walks the **registration order** and
   runs/awaits each listener in that order (sync and async listeners interleave
   by registration).
+- **Async registration bypasses `internal/listener` (XT-06)**: `ctx.on_async` /
+  `ctx.on_async_with` are registered directly on the async lane and are **not**
+  passed through the `internal/listener` hook (sync `on`/`on_once`
+  registrations are); the async lane also has no `once`/`global` options. A host
+  that uses `internal/listener` for policy (audit, deny-list, rewriting) must
+  enforce it on the sync lane only or wrap async callbacks itself.
 - Scope filters: a listener receives an event only when the dispatching context's
   isolation map equals the listener's own, unless `global` is set (CORE-019).
 - Waterfall hooks (`src/waterfall.rs`) are **middleware around an explicit

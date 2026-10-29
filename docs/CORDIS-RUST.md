@@ -33,7 +33,9 @@ language-driven and permanent unless the spec says otherwise:
   `serial_async` / `waterfall_async`. Sync dispatch never polls async listeners.
   Listeners return `EventResult` instead of raising exceptions, and events carry
   `serde_json::Value` payloads — there is no typed event map and no
-  `AggregateError` channel.
+  `AggregateError` channel. Async registrations (`on_async*`) bypass the
+  `internal/listener` hook that sync registrations pass through, and the async
+  lane has no `once`/`global` options (XT-06).
 - **`inject` is a name list** (`&'static [&'static str]`), not a name → intercept
   config map.
 - **Event scope filtering is isolate-map equality**, not a subtree walk: a listener

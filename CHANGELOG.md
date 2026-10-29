@@ -30,6 +30,8 @@
 - `spec/CORDIS-CORE.md` 明确 `Registry::replace`/`replace_async` 的 activation 失败语义（XT-05）：
   `Ok` 不代表 `Active`，失败被 containment 到 fiber（`Failed`），旧实现/服务不会自动恢复；
   只有 lifecycle 拒绝（`LifecycleBusy`）或 validation 错误才走完整回滚。
+- `spec/CORDIS-CORE.md` / `docs/CORDIS-RUST.md` 记录 `on_async*` 绕过 `internal/listener`
+  hook、async lane 无 `once`/`global` 的设计边界（XT-06）。
 
 ## [0.5.0] - 2026-10-29
 
